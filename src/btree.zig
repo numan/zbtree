@@ -1,13 +1,12 @@
 const std = @import("std");
 const mem = std.mem;
+const testing = std.testing;
 
 pub fn Tree(
     comptime K: type,
     comptime V: type,
     comptime compare: fn (K, V, K, V) i32,
 ) type {
-    _ = compare;
-
     return struct {
         const Self = @This();
 
@@ -41,6 +40,15 @@ pub fn Tree(
 
             fn init() BranchSelf {
                 return .{};
+            }
+        };
+
+        const SearchResult = struct {
+            index: usize,
+            found: bool,
+
+            fn init(index: usize, found: bool) SearchResult {
+                return .{ .index = index, .found = found };
             }
         };
 
@@ -83,6 +91,49 @@ pub fn Tree(
             gpa.destroy(node);
         }
 
+        fn searchNode(node: *const Node, key: K, value: V) SearchResult {
+            var i: usize = 0;
+            while (i < node.len) : (i += 1) {
+                const c = compare(node.keys[i], node.values[i], key, value);
+                if (c >= 0) return SearchResult.init(i, c == 0);
+            }
+            return SearchResult.init(i, false);
+        }
+
+        fn insertItemAt(node: *Node, index: usize, key: K, value: V) void {
+            std.debug.assert(node.len < max_items);
+
+            var i = node.len;
+            while (i > index) : (i -= 1) {
+                node.keys[i] = node.keys[i - 1];
+                node.values[i] = node.values[i - 1];
+            }
+
+            node.keys[index] = key;
+            node.values[index] = value;
+            node.len += 1;
+        }
+
+        fn insertChildAt(node: *Node, index: u8, child: *Node) void {
+            const branch = node.branch.?;
+            var i = node.len;
+            while (i > index) : (i -= 1) {
+                branch.children[i + 1] = branch.children[i];
+                branch.counts[i + 1] = branch.counts[i];
+            }
+            branch.children[index] = child;
+            branch.counts[index] = subtreeCount(node);
+        }
+
+        fn subtreeCount(node: ?*const Node) usize {
+            const n = node orelse return 0;
+            var total: usize = n.len;
+            if (n.branch) |branch| {
+                for (0..n.len + 1) |i| total += branch.counts[i];
+            }
+            return total;
+        }
+
         pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             if (self.root) |root| self.destroyNode(gpa, root);
             self.root = null;
@@ -98,10 +149,50 @@ fn compareTestIntKey(a_key: isize, _: isize, b_key: isize, _: isize) i32 {
 test "core nodes allocate and deallocate" {
     const IntTree = Tree(isize, isize, compareTestIntKey);
     var tree = IntTree.init();
-    defer tree.deinit(std.testing.allocator);
+    defer tree.deinit(testing.allocator);
 
     const leaf = try tree.newNode(std.testing.allocator, true);
-    tree.destroyNode(std.testing.allocator, leaf);
+    tree.destroyNode(testing.allocator, leaf);
 
     tree.root = try tree.newNode(std.testing.allocator, false);
+}
+
+test "node local search returns lower bound" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const node = try tree.newNode(std.testing.allocator, true);
+    defer tree.destroyNode(std.testing.allocator, node);
+
+    node.keys[0] = 10;
+    node.values[0] = -10;
+    node.keys[1] = 20;
+    node.values[1] = -20;
+    node.keys[2] = 30;
+    node.values[2] = -30;
+    node.len = 3;
+
+    try testing.expectEqual(0, IntTree.searchNode(node, 5, 0).index);
+    try testing.expect(IntTree.searchNode(node, 10, 0).found);
+    try testing.expectEqual(1, IntTree.searchNode(node, 15, 0).index);
+    try testing.expectEqual(3, IntTree.searchNode(node, 40, 0).index);
+}
+
+test "insertItemAt shifts items inside a leaf" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const node = try tree.newNode(testing.allocator, true);
+    defer tree.destroyNode(testing.allocator, node);
+
+    IntTree.insertItemAt(node, 0, 20, -20);
+    IntTree.insertItemAt(node, 0, 10, -10);
+    IntTree.insertItemAt(node, 2, 30, -30);
+
+    try std.testing.expectEqual(3, node.len);
+    try std.testing.expectEqual(10, node.keys[0]);
+    try std.testing.expectEqual(20, node.keys[1]);
+    try std.testing.expectEqual(30, node.keys[2]);
 }
