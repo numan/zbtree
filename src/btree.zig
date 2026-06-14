@@ -52,6 +52,16 @@ pub fn Tree(
             }
         };
 
+        const Split = struct {
+            right: *Node,
+            key: K,
+            value: V,
+
+            fn init(right: *Node, key: K, value: V) Split {
+                return .{ .right = right, .key = key, .value = value };
+            }
+        };
+
         root: ?*Node = null,
         len: usize = 0,
 
@@ -89,6 +99,55 @@ pub fn Tree(
                 gpa.destroy(branch);
             }
             gpa.destroy(node);
+        }
+
+        fn splitNode(self: *Self, gpa: mem.Allocator, node: *Node) !Split {
+            const median: usize = max_items - min_items - 1;
+            const right = try self.newNode(gpa, node.isLeaf());
+
+            const middle_key = node.keys[median];
+            const middle_value = node.values[median];
+
+            right.len = @intCast(max_items - median - 1);
+            var i: usize = 0;
+            while (i < right.len) : (i += 1) {
+                const idx = i + median + 1;
+                right.keys[i] = node.keys[idx];
+                right.values[i] = node.values[idx];
+            }
+
+            if (node.branch) |left_branch| {
+                const right_branch = right.branch.?;
+                i = 0;
+                while (i <= right.len) : (i += 1) {
+                    const from = median + i + 1;
+                    right_branch.children[i] = left_branch.children[from];
+                    right_branch.counts[i] = left_branch.counts[from];
+                    left_branch.children[from] = null;
+                    left_branch.counts[from] = 0;
+                }
+            }
+
+            node.len = @intCast(median);
+            return Split.init(right, middle_key, middle_value);
+        }
+
+        fn splitRoot(self: *Self, gpa: mem.Allocator) !void {
+            const old_root = self.root.?;
+            const split = try self.splitNode(gpa, old_root);
+            const new_root = try self.newNode(gpa, false);
+
+            new_root.keys[0] = split.key;
+            new_root.values[0] = split.value;
+            new_root.len = 1;
+
+            const branch = new_root.branch.?;
+            branch.children[0] = old_root;
+            branch.counts[0] = subtreeCount(old_root);
+            branch.children[1] = split.right;
+            branch.counts[1] = subtreeCount(split.right);
+
+            self.root = new_root;
         }
 
         fn searchNode(node: *const Node, key: K, value: V) SearchResult {
@@ -195,4 +254,51 @@ test "insertItemAt shifts items inside a leaf" {
     try std.testing.expectEqual(10, node.keys[0]);
     try std.testing.expectEqual(20, node.keys[1]);
     try std.testing.expectEqual(30, node.keys[2]);
+}
+
+test "splitNode promotes the median" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const node = try tree.newNode(testing.allocator, true);
+    tree.root = node;
+    for (0..IntTree.max_items) |i| {
+        node.keys[i] = @intCast(i);
+        node.values[i] = -@as(isize, @intCast(i));
+    }
+    node.len = IntTree.max_items;
+
+    const split = try tree.splitNode(testing.allocator, node);
+    defer tree.destroyNode(testing.allocator, split.right);
+
+    try std.testing.expectEqual(31, node.len);
+    try std.testing.expectEqual(31, split.key);
+    try std.testing.expectEqual(31, split.right.len);
+    try std.testing.expectEqual(32, split.right.keys[0]);
+}
+
+test "splitRoot promotes the median into a new root" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const node = try tree.newNode(testing.allocator, true);
+    tree.root = node;
+    for (0..IntTree.max_items) |i| {
+        node.keys[i] = @intCast(i);
+        node.values[i] = -@as(isize, @intCast(i));
+    }
+    node.len = IntTree.max_items;
+
+    try tree.splitRoot(testing.allocator);
+
+    const root = tree.root.?;
+    const branch = root.branch.?;
+    try testing.expectEqual(1, root.len);
+    try testing.expectEqual(31, root.keys[0]);
+    try testing.expectEqual(node, branch.children[0].?);
+    try testing.expectEqual(31, branch.counts[0]);
+    try testing.expectEqual(32, branch.children[1].?.keys[0]);
+    try testing.expectEqual(31, branch.counts[1]);
 }
