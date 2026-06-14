@@ -173,15 +173,17 @@ pub fn Tree(
             node.len += 1;
         }
 
-        fn insertChildAt(node: *Node, index: u8, child: *Node) void {
+        fn insertChildAt(node: *Node, index: usize, child: *Node) void {
             const branch = node.branch.?;
+            std.debug.assert(index <= node.len);
+
             var i = node.len;
             while (i > index) : (i -= 1) {
-                branch.children[i + 1] = branch.children[i];
-                branch.counts[i + 1] = branch.counts[i];
+                branch.children[i] = branch.children[i - 1];
+                branch.counts[i] = branch.counts[i - 1];
             }
             branch.children[index] = child;
-            branch.counts[index] = subtreeCount(node);
+            branch.counts[index] = subtreeCount(child);
         }
 
         fn subtreeCount(node: ?*const Node) usize {
@@ -191,6 +193,57 @@ pub fn Tree(
                 for (0..n.len + 1) |i| total += branch.counts[i];
             }
             return total;
+        }
+
+        fn splitChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
+            const branch = parent.branch.?;
+            const split = try self.splitNode(gpa, branch.children[child_index].?);
+
+            insertItemAt(parent, child_index, split.key, split.value);
+            insertChildAt(parent, child_index + 1, split.right);
+            branch.counts[child_index] = subtreeCount(branch.children[child_index]);
+        }
+
+        fn insertIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V) !bool {
+            const found = searchNode(node, key, value);
+            if (found.found) return false;
+
+            if (node.isLeaf()) {
+                insertItemAt(node, found.index, key, value);
+                return true;
+            }
+
+            const branch = node.branch.?;
+            var child_index = found.index;
+            if (branch.children[child_index].?.len == max_items) {
+                try self.splitChild(gpa, node, child_index);
+                const cmp = compare(node.keys[child_index], node.values[child_index], key, value);
+                if (cmp == 0) return false;
+                if (cmp < 0) child_index += 1;
+            }
+
+            const inserted = try self.insertIntoNonFull(gpa, branch.children[child_index].?, key, value);
+            if (inserted) branch.counts[child_index] += 1;
+            return inserted;
+        }
+
+        pub fn insert(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
+            if (self.root == null) self.root = try self.newNode(gpa, true);
+            if (self.root.?.len == max_items) try self.splitRoot(gpa);
+
+            const inserted = try self.insertIntoNonFull(gpa, self.root.?, key, value);
+
+            if (inserted) self.len += 1;
+            return inserted;
+        }
+
+        pub fn get(self: *const Self, key: K, value: V) ?V {
+            var node = self.root orelse return null;
+            while (true) {
+                const found = searchNode(node, key, value);
+                if (found.found) return node.values[found.index];
+                if (node.branch) |branch| node = branch.children[found.index].? else return null;
+            }
         }
 
         pub fn deinit(self: *Self, gpa: mem.Allocator) void {

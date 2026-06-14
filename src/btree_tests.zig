@@ -15,3 +15,37 @@ test "empty btree has expected constants" {
     try testing.expectEqual(0, tree.len);
     try testing.expect(tree.root == null);
 }
+
+test "insert rejects duplicate keys" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.insert(testing.allocator, 42, 100));
+    try testing.expect(!try tree.insert(testing.allocator, 42, 200));
+
+    try testing.expectEqual(1, tree.len);
+    try testing.expectEqual(100, tree.get(42, 0).?);
+}
+
+test "insert and get random keys" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var prng = std.Random.DefaultPrng.init(12345);
+    var keys: [5000]isize = undefined;
+    for (&keys, 0..) |*key, i| key.* = @intCast(i);
+    prng.random().shuffle(isize, &keys);
+
+    for (keys) |key| {
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    for (0..5000) |i| {
+        const key: isize = @intCast(i);
+        try testing.expectEqual(-key, tree.get(key, -key).?);
+    }
+
+    try testing.expectEqual(5000, tree.len);
+}
