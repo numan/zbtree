@@ -84,12 +84,21 @@ pub fn Tree(
             key: K,
             value: V,
 
-            pub fn init(key: K, value: V) Bound {
+            pub fn init(key: K, value: V) @This() {
                 return .{ .key = key, .value = value };
             }
         };
 
         const Entry = Bound;
+
+        const Slot = struct {
+            node: *Node,
+            index: usize,
+
+            fn init(node: *Node, index: usize) Slot {
+                return .{ .node = node, .index = index };
+            }
+        };
 
         root: ?*Node = null,
         len: usize = 0,
@@ -230,8 +239,7 @@ pub fn Tree(
         }
 
         // Counts all items reachable from a node. Hot insertion paths maintain
-        // counts incrementally; this helper is used after structural changes and
-        // by invariant checks.
+        // counts incrementally.
         fn subtreeCount(node: ?*const Node) usize {
             const n = node orelse return 0;
             var total: usize = n.len;
@@ -507,6 +515,44 @@ pub fn Tree(
                 if (i == 0) break;
                 i -= 1;
             }
+        }
+
+        // Finds the node slot containing an item equal to `key`/`val`.
+        fn findSlot(self: *Self, key: K, val: V) ?Slot {
+            var node = self.root orelse return null;
+            while (true) {
+                const found = searchNode(node, key, val);
+                if (found.found) return Slot.init(node, found.index);
+                if (node.branch) |branch| node = branch.children[found.index].? else return null;
+            }
+        }
+
+        /// Replaces the stored value for an item equal to `key`/`val`.
+        ///
+        /// Returns the old value when an equal item exists, or `null` when no
+        /// matching item is present. The tree length and sort position are
+        /// unchanged.
+        pub fn replace(self: *Self, key: K, val: V) ?V {
+            const slot = self.findSlot(key, val) orelse return null;
+            const old = slot.node.values[slot.index];
+            slot.node.values[slot.index] = val;
+            return old;
+        }
+
+        /// Inserts `key`/`val` or replaces the value of an equal existing item.
+        ///
+        /// Returns the old value when an item was replaced, or `null` when a new
+        /// item was inserted. Allocation is only needed when inserting.
+        pub fn set(self: *Self, gpa: mem.Allocator, key: K, val: V) !?V {
+            if (self.findSlot(key, val)) |slot| {
+                const old = slot.node.values[slot.index];
+                slot.node.keys[slot.index] = key;
+                slot.node.values[slot.index] = val;
+                return old;
+            }
+
+            _ = try self.insert(gpa, key, val);
+            return null;
         }
 
         // Converts a failed internal consistency check into a testable error.
