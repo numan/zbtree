@@ -280,6 +280,41 @@ pub fn Tree(
             try visitAsc(CtxType, branch.children[node.len].?, ctx, yield);
         }
 
+        pub fn descent(
+            self: *const Self,
+            comptime CtxType: type,
+            context: CtxType,
+            comptime yield: fn (CtxType, K, V) anyerror!void,
+        ) !void {
+            if (self.root) |root| try visitDesc(CtxType, root, context, yield);
+        }
+
+        fn visitDesc(
+            comptime CtxType: type,
+            node: *const Node,
+            ctx: CtxType,
+            comptime yield: fn (CtxType, K, V) anyerror!void,
+        ) !void {
+            if (node.isLeaf()) {
+                var i = node.len;
+                while (i > 0) {
+                    i -= 1;
+                    try yield(ctx, node.keys[i], node.values[i]);
+                }
+                return;
+            }
+
+            const branch = node.branch.?;
+            try visitDesc(CtxType, branch.children[node.len].?, ctx, yield);
+
+            var i = node.len;
+            while (i > 0) {
+                i -= 1;
+                try yield(ctx, node.keys[i], node.values[i]);
+                try visitDesc(CtxType, branch.children[i].?, ctx, yield);
+            }
+        }
+
         fn expectInvariant(ok: bool) !void {
             if (!ok) return error.InvariantViolation;
         }

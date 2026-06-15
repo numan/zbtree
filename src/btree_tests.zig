@@ -144,3 +144,56 @@ test "ascent propagates yield errors and stops traversal" {
     try testing.expectError(error.StopTraversal, tree.ascent(*StopAfterContext, &ctx, stopAfter));
     try testing.expectEqual(17, ctx.seen);
 }
+
+test "descent visits an empty tree without yielding" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const tree = IntTree.init();
+
+    var seen = CollectContext{};
+
+    try tree.descent(*CollectContext, &seen, collectPair);
+
+    try testing.expectEqual(0, seen.len);
+}
+
+test "descent yields every item in reverse sorted order" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var prng = std.Random.DefaultPrng.init(456);
+    var keys: [256]isize = undefined;
+    for (&keys, 0..) |*key, i| key.* = @intCast(i);
+    prng.random().shuffle(isize, &keys);
+
+    for (keys) |key| {
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    var seen = CollectContext{};
+
+    try tree.descent(*CollectContext, &seen, collectPair);
+
+    try testing.expectEqual(keys.len, seen.len);
+    for (seen.items[0..seen.len], 0..) |pair, i| {
+        const key: isize = @intCast(keys.len - 1 - i);
+        try testing.expectEqual(key, pair.key);
+        try testing.expectEqual(key * 10, pair.value);
+    }
+}
+
+test "descent propagates yield errors and stops traversal" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..100) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    var ctx = StopAfterContext{ .stop_after = 17 };
+
+    try testing.expectError(error.StopTraversal, tree.descent(*StopAfterContext, &ctx, stopAfter));
+    try testing.expectEqual(17, ctx.seen);
+}
