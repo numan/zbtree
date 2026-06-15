@@ -251,6 +251,35 @@ pub fn Tree(
             }
         }
 
+        pub fn ascent(
+            self: *const Self,
+            comptime CtxType: type,
+            context: CtxType,
+            comptime yield: fn (CtxType, K, V) anyerror!void,
+        ) !void {
+            if (self.root) |root| try visitAsc(CtxType, root, context, yield);
+        }
+
+        fn visitAsc(
+            comptime CtxType: type,
+            node: *const Node,
+            ctx: CtxType,
+            comptime yield: fn (CtxType, K, V) anyerror!void,
+        ) !void {
+            if (node.isLeaf()) {
+                for (0..node.len) |i| try yield(ctx, node.keys[i], node.values[i]);
+                return;
+            }
+
+            const branch = node.branch.?;
+            for (0..node.len) |i| {
+                try visitAsc(CtxType, branch.children[i].?, ctx, yield);
+                try yield(ctx, node.keys[i], node.values[i]);
+            }
+
+            try visitAsc(CtxType, branch.children[node.len].?, ctx, yield);
+        }
+
         fn expectInvariant(ok: bool) !void {
             if (!ok) return error.InvariantViolation;
         }
