@@ -21,6 +21,18 @@ fn collectPair(ctx: *CollectContext, key: isize, value: isize) !void {
     ctx.len += 1;
 }
 
+const CollectLimitContext = struct {
+    items: [300]Pair = undefined,
+    len: usize = 0,
+    limit: usize,
+};
+
+fn collectPairUntilLimit(ctx: *CollectLimitContext, key: isize, value: isize) !bool {
+    ctx.items[ctx.len] = .{ .key = key, .value = value };
+    ctx.len += 1;
+    return ctx.len < ctx.limit;
+}
+
 const StopAfterContext = struct {
     seen: usize = 0,
     stop_after: usize,
@@ -196,4 +208,98 @@ test "descent propagates yield errors and stops traversal" {
 
     try testing.expectError(error.StopTraversal, tree.descent(*StopAfterContext, &ctx, stopAfter));
     try testing.expectEqual(17, ctx.seen);
+}
+
+test "seek functions handle empty trees and edge positions" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(tree.seek(10, 0) == null);
+    try testing.expect(tree.seekNext(10, 0) == null);
+    try testing.expect(tree.seekPrev(10, 0) == null);
+
+    try testing.expect(try tree.insert(testing.allocator, 10, 100));
+    try testing.expect(try tree.insert(testing.allocator, 20, 200));
+    try testing.expect(try tree.insert(testing.allocator, 30, 300));
+
+    try testing.expectEqual(10, tree.seek(5, 0).?.key);
+    try testing.expectEqual(10, tree.seek(10, 0).?.key);
+    try testing.expectEqual(20, tree.seek(15, 0).?.key);
+    try testing.expectEqual(30, tree.seek(30, 0).?.key);
+    try testing.expect(tree.seek(31, 0) == null);
+
+    try testing.expectEqual(10, tree.seekNext(5, 0).?.key);
+    try testing.expectEqual(20, tree.seekNext(10, 0).?.key);
+    try testing.expectEqual(30, tree.seekNext(20, 0).?.key);
+    try testing.expect(tree.seekNext(30, 0) == null);
+
+    try testing.expect(tree.seekPrev(5, 0) == null);
+    try testing.expect(tree.seekPrev(10, 0) == null);
+    try testing.expectEqual(10, tree.seekPrev(15, 0).?.key);
+    try testing.expectEqual(10, tree.seekPrev(20, 0).?.key);
+    try testing.expectEqual(30, tree.seekPrev(31, 0).?.key);
+}
+
+test "getAt and indexOf use subtree counts" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var prng = std.Random.DefaultPrng.init(9876);
+    var keys: [8000]isize = undefined;
+    for (&keys, 0..) |*key, i| key.* = @intCast(i * 2);
+    prng.random().shuffle(isize, &keys);
+
+    for (keys) |key| {
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    for (0..8000) |i| {
+        const key: isize = @intCast(i * 2);
+        const entry = tree.getAt(i).?;
+        try testing.expectEqual(key, entry.key);
+        try testing.expectEqual(-key, entry.value);
+        try testing.expectEqual(i, tree.indexOf(entry.key, entry.value).?);
+    }
+
+    try testing.expect(tree.getAt(8000) == null);
+    try testing.expect(tree.indexOf(-2, 0) == null);
+    try testing.expect(tree.indexOf(1, 0) == null);
+    try testing.expect(tree.indexOf(16_000, 0) == null);
+    try tree.checkInvariants();
+}
+
+test "ascendAt and descendAt start at an index and stop when yield returns false" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..100) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    var asc = CollectLimitContext{ .limit = 5 };
+    try tree.ascendAt(*CollectLimitContext, 40, &asc, collectPairUntilLimit);
+    try testing.expectEqual(5, asc.len);
+    for (asc.items[0..asc.len], 0..) |pair, i| {
+        const key: isize = @intCast(40 + i);
+        try testing.expectEqual(key, pair.key);
+        try testing.expectEqual(key * 10, pair.value);
+    }
+
+    var desc = CollectLimitContext{ .limit = 5 };
+    try tree.descendAt(*CollectLimitContext, 40, &desc, collectPairUntilLimit);
+    try testing.expectEqual(5, desc.len);
+    for (desc.items[0..desc.len], 0..) |pair, i| {
+        const key: isize = @intCast(40 - i);
+        try testing.expectEqual(key, pair.key);
+        try testing.expectEqual(key * 10, pair.value);
+    }
+
+    var out_of_range = CollectLimitContext{ .limit = 5 };
+    try tree.ascendAt(*CollectLimitContext, 100, &out_of_range, collectPairUntilLimit);
+    try tree.descendAt(*CollectLimitContext, 100, &out_of_range, collectPairUntilLimit);
+    try testing.expectEqual(0, out_of_range.len);
 }
