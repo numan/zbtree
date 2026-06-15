@@ -129,6 +129,79 @@ test "set replaces values after node splits without changing counts" {
     try tree.checkInvariants();
 }
 
+test "delete returns null for empty and missing keys" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.delete(testing.allocator, 10, 0) == null);
+
+    try testing.expect(try tree.insert(testing.allocator, 10, 100));
+    try testing.expect(try tree.insert(testing.allocator, 20, 200));
+
+    try testing.expect(try tree.delete(testing.allocator, 30, 0) == null);
+    try testing.expectEqual(2, tree.len);
+    try testing.expectEqual(100, tree.get(10, 0).?);
+    try testing.expectEqual(200, tree.get(20, 0).?);
+    try tree.checkInvariants();
+}
+
+test "delete removes leaf keys and resets an empty root" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.insert(testing.allocator, 10, 100));
+    try testing.expect(try tree.insert(testing.allocator, 20, 200));
+    try testing.expect(try tree.insert(testing.allocator, 30, 300));
+
+    try testing.expectEqual(200, (try tree.delete(testing.allocator, 20, 0)).?);
+    try testing.expectEqual(2, tree.len);
+    try testing.expect(tree.get(20, 0) == null);
+    try testing.expectEqual(100, tree.get(10, 0).?);
+    try testing.expectEqual(300, tree.get(30, 0).?);
+    try tree.checkInvariants();
+
+    try testing.expectEqual(100, (try tree.delete(testing.allocator, 10, 0)).?);
+    try testing.expectEqual(300, (try tree.delete(testing.allocator, 30, 0)).?);
+    try testing.expectEqual(0, tree.len);
+    try testing.expect(tree.root == null);
+    try tree.checkInvariants();
+}
+
+test "delete removes internal keys and preserves indexed order" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..150) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    try testing.expectEqual(310, (try tree.delete(testing.allocator, 31, 0)).?);
+    try testing.expectEqual(640, (try tree.delete(testing.allocator, 64, 0)).?);
+    try testing.expectEqual(0, (try tree.delete(testing.allocator, 0, 0)).?);
+    try testing.expectEqual(147, tree.len);
+    try testing.expect(tree.get(31, 0) == null);
+    try testing.expect(tree.get(64, 0) == null);
+    try testing.expect(tree.get(0, 0) == null);
+
+    var expected: usize = 0;
+    var index: usize = 0;
+    while (expected < 150) : (expected += 1) {
+        if (expected == 0 or expected == 31 or expected == 64) continue;
+        const key: isize = @intCast(expected);
+        const entry = tree.getAt(index).?;
+        try testing.expectEqual(key, entry.key);
+        try testing.expectEqual(key * 10, entry.value);
+        try testing.expectEqual(index, tree.indexOf(key, 0).?);
+        index += 1;
+    }
+    try testing.expectEqual(tree.len, index);
+    try tree.checkInvariants();
+}
+
 test "insert and get random keys" {
     const IntTree = btree.Tree(isize, isize, compareIntKey);
     var tree = IntTree.init();

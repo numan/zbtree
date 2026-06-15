@@ -555,6 +555,137 @@ pub fn Tree(
             return null;
         }
 
+        fn removeItemAt(node: *Node, index: usize) Entry {
+            const removed = Entry.init(node.keys[index], node.values[index]);
+            var i = index;
+
+            while (i + 1 < node.len) : (i += 1) {
+                node.keys[i] = node.keys[i + 1];
+                node.values[i] = node.values[i + 1];
+            }
+            node.len -= 1;
+            return removed;
+        }
+
+        fn maxEntry(node: *const Node) Entry {
+            var current = node;
+            while (current.branch) |branch| current = branch.children[current.len].?;
+            return Entry.init(current.keys[current.len - 1], current.values[current.len - 1]);
+        }
+
+        pub fn delete(self: *Self, gpa: mem.Allocator, key: K, val: V) !?V {
+            const old = if (self.root) |root| try self.deleteFromNode(gpa, root, key, val) else return null;
+            if (old != null) self.len -= 1;
+
+            if (self.root) |root| {
+                if (root.len == 0) {
+                    if (root.branch) |branch| {
+                        self.root = branch.children[0];
+                        branch.children[0] = null;
+                        self.destroyNode(gpa, root);
+                    } else {
+                        self.destroyNode(gpa, root);
+                        self.root = null;
+                    }
+                }
+            }
+            return old;
+        }
+
+        fn deleteFromNode(self: *Self, gpa: mem.Allocator, node: *Node, key: K, val: V) !?V {
+            const found = searchNode(node, key, val);
+            if (node.isLeaf()) return if (found.found) removeItemAt(node, found.index).value else null;
+
+            const branch = node.branch.?;
+            if (found.found) {
+                const replacement = maxEntry(branch.children[found.index].?);
+                const old = node.values[found.index];
+                node.keys[found.index] = replacement.key;
+                node.values[found.index] = replacement.value;
+                _ = try self.deleteFromNode(gpa, branch.children[found.index].?, replacement.key, replacement.value);
+                branch.counts[found.index] -= 1;
+                try self.rebalanceChild(gpa, node, found.index);
+                return old;
+            }
+
+            const old = try self.deleteFromNode(gpa, branch.children[found.index].?, key, val);
+            if (old != null) {
+                branch.counts[found.index] -= 1;
+                try self.rebalanceChild(gpa, node, found.index);
+            }
+
+            return old;
+        }
+
+        fn rebalanceChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
+            const branch = parent.branch.?;
+            const child = branch.children[child_index].?;
+
+            if (child.len >= min_items) return;
+
+            if (child_index > 0 and branch.children[child_index - 1].?.len > min_items) {
+                rotateFromLeft(parent, child_index);
+            } else if (child_index < parent.len and branch.children[child_index + 1].?.len > min_items) {
+                rotateFromRight(parent, child_index);
+            } else if (child_index > 0) {
+                self.mergeChildren(gpa, parent, child_index - 1);
+            } else {
+                self.mergeChildren(gpa, parent, child_index);
+            }
+        }
+
+        fn rotateFromLeft(parent: *Node, child_index: usize) void {
+            const branch = parent.branch.?;
+            const left = branch.children[child_index - 1].?;
+            const child = branch.children[child_index].?;
+
+            insertItemAt(child, 0, parent.keys[child_index - 1], parent.values[child_index - 1]);
+            parent.keys[child_index - 1] = left.keys[left.len - 1];
+            parent.values[child_index - 1] = left.values[left.len - 1];
+            left.len -= 1;
+            branch.counts[child_index - 1] = subtreeCount(left);
+            branch.counts[child_index] = subtreeCount(child);
+        }
+
+        fn rotateFromRight(parent: *Node, child_index: usize) void {
+            const branch = parent.branch.?;
+            const child = branch.children[child_index].?;
+            const right = branch.children[child_index + 1].?;
+
+            insertItemAt(child, child.len, parent.keys[child_index], parent.values[child_index]);
+            parent.keys[child_index] = right.keys[0];
+            parent.values[child_index] = right.values[0];
+            _ = removeItemAt(right, 0);
+            branch.counts[child_index] = subtreeCount(child);
+            branch.counts[child_index + 1] = subtreeCount(right);
+        }
+
+        fn mergeChildren(self: *Self, gpa: mem.Allocator, parent: *Node, left_index: usize) void {
+            const branch = parent.branch.?;
+            const left = branch.children[left_index].?;
+            const right = branch.children[left_index + 1].?;
+
+            insertItemAt(left, left.len, parent.keys[left_index], parent.values[left_index]);
+            for (0..right.len) |i| insertItemAt(left, left.len, right.keys[i], right.values[i]);
+            if (right.branch) |right_branch| {
+                const left_branch = left.branch.?;
+                for (0..right.len + 1) |i| {
+                    left_branch.children[left.len - right.len + i] = right_branch.children[i];
+                    left_branch.counts[left.len - right.len + i] = right_branch.counts[i];
+                    right_branch.children[i] = null;
+                }
+            }
+
+            _ = removeItemAt(parent, left_index);
+            var i = left_index + 1;
+            while (i <= parent.len + 1) : (i += 1) {
+                branch.children[i] = branch.children[i + 1];
+                branch.counts[i] = branch.counts[i + 1];
+            }
+            branch.counts[left_index] = subtreeCount(left);
+            self.destroyNode(gpa, right);
+        }
+
         // Converts a failed internal consistency check into a testable error.
         fn expectInvariant(ok: bool) !void {
             if (!ok) return error.InvariantViolation;
@@ -683,6 +814,42 @@ test "insertItemAt shifts items inside a leaf" {
     try std.testing.expectEqual(30, node.keys[2]);
 }
 
+test "removeItemAt shifts later items left and returns removed entry" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const node = try tree.newNode(testing.allocator, true);
+    defer tree.destroyNode(testing.allocator, node);
+
+    node.keys[0] = 10;
+    node.values[0] = -10;
+    node.keys[1] = 20;
+    node.values[1] = -20;
+    node.keys[2] = 30;
+    node.values[2] = -30;
+    node.keys[3] = 40;
+    node.values[3] = -40;
+    node.len = 4;
+
+    const removed = IntTree.removeItemAt(node, 1);
+
+    try testing.expectEqual(20, removed.key);
+    try testing.expectEqual(-20, removed.value);
+    try testing.expectEqual(3, node.len);
+    try testing.expectEqual(10, node.keys[0]);
+    try testing.expectEqual(30, node.keys[1]);
+    try testing.expectEqual(40, node.keys[2]);
+
+    const tail = IntTree.removeItemAt(node, 2);
+
+    try testing.expectEqual(40, tail.key);
+    try testing.expectEqual(-40, tail.value);
+    try testing.expectEqual(2, node.len);
+    try testing.expectEqual(10, node.keys[0]);
+    try testing.expectEqual(30, node.keys[1]);
+}
+
 test "splitNode promotes the median" {
     const IntTree = Tree(isize, isize, compareTestIntKey);
     var tree = IntTree.init();
@@ -728,4 +895,201 @@ test "splitRoot promotes the median into a new root" {
     try testing.expectEqual(31, branch.counts[0]);
     try testing.expectEqual(32, branch.children[1].?.keys[0]);
     try testing.expectEqual(31, branch.counts[1]);
+}
+
+test "maxEntry returns greatest entry from leaf and internal nodes" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..150) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    const root = tree.root.?;
+    const max_from_root = IntTree.maxEntry(root);
+    try testing.expect(!root.isLeaf());
+    try testing.expectEqual(149, max_from_root.key);
+    try testing.expectEqual(-149, max_from_root.value);
+
+    const leaf = root.branch.?.children[0].?;
+    const max_from_leaf = IntTree.maxEntry(leaf);
+    try testing.expect(leaf.isLeaf());
+    try testing.expectEqual(30, max_from_leaf.key);
+    try testing.expectEqual(-30, max_from_leaf.value);
+}
+
+test "deleteFromNode removes matching leaf entries" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const node = try tree.newNode(testing.allocator, true);
+    tree.root = node;
+    for (0..4) |i| {
+        node.keys[i] = @intCast((i + 1) * 10);
+        node.values[i] = -@as(isize, @intCast((i + 1) * 10));
+    }
+    node.len = 4;
+
+    try testing.expectEqual(-20, (try tree.deleteFromNode(testing.allocator, node, 20, 0)).?);
+    try testing.expectEqual(3, node.len);
+    try testing.expectEqual(10, node.keys[0]);
+    try testing.expectEqual(30, node.keys[1]);
+    try testing.expectEqual(40, node.keys[2]);
+    try testing.expect(try tree.deleteFromNode(testing.allocator, node, 50, 0) == null);
+}
+
+test "rotateFromLeft borrows the left sibling maximum through the parent" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const parent = try tree.newNode(testing.allocator, false);
+    const left = try tree.newNode(testing.allocator, true);
+    const child = try tree.newNode(testing.allocator, true);
+    tree.root = parent;
+
+    for (0..32) |i| {
+        left.keys[i] = @intCast(i);
+        left.values[i] = -@as(isize, @intCast(i));
+    }
+    left.len = 32;
+    for (0..30) |i| {
+        child.keys[i] = @intCast(40 + i);
+        child.values[i] = -@as(isize, @intCast(40 + i));
+    }
+    child.len = 30;
+    parent.keys[0] = 32;
+    parent.values[0] = -32;
+    parent.len = 1;
+    parent.branch.?.children[0] = left;
+    parent.branch.?.children[1] = child;
+    parent.branch.?.counts[0] = IntTree.subtreeCount(left);
+    parent.branch.?.counts[1] = IntTree.subtreeCount(child);
+
+    IntTree.rotateFromLeft(parent, 1);
+
+    try testing.expectEqual(31, left.len);
+    try testing.expectEqual(31, parent.keys[0]);
+    try testing.expectEqual(31, child.len);
+    try testing.expectEqual(32, child.keys[0]);
+    try testing.expectEqual(40, child.keys[1]);
+    try testing.expectEqual(IntTree.subtreeCount(left), parent.branch.?.counts[0]);
+    try testing.expectEqual(IntTree.subtreeCount(child), parent.branch.?.counts[1]);
+}
+
+test "rotateFromRight borrows the right sibling minimum through the parent" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const parent = try tree.newNode(testing.allocator, false);
+    const child = try tree.newNode(testing.allocator, true);
+    const right = try tree.newNode(testing.allocator, true);
+    tree.root = parent;
+
+    for (0..30) |i| {
+        child.keys[i] = @intCast(i);
+        child.values[i] = -@as(isize, @intCast(i));
+    }
+    child.len = 30;
+    for (0..32) |i| {
+        right.keys[i] = @intCast(31 + i);
+        right.values[i] = -@as(isize, @intCast(31 + i));
+    }
+    right.len = 32;
+    parent.keys[0] = 30;
+    parent.values[0] = -30;
+    parent.len = 1;
+    parent.branch.?.children[0] = child;
+    parent.branch.?.children[1] = right;
+    parent.branch.?.counts[0] = IntTree.subtreeCount(child);
+    parent.branch.?.counts[1] = IntTree.subtreeCount(right);
+
+    IntTree.rotateFromRight(parent, 0);
+
+    try testing.expectEqual(31, child.len);
+    try testing.expectEqual(30, child.keys[30]);
+    try testing.expectEqual(31, parent.keys[0]);
+    try testing.expectEqual(31, right.len);
+    try testing.expectEqual(32, right.keys[0]);
+    try testing.expectEqual(IntTree.subtreeCount(child), parent.branch.?.counts[0]);
+    try testing.expectEqual(IntTree.subtreeCount(right), parent.branch.?.counts[1]);
+}
+
+test "mergeChildren joins adjacent leaves and removes the separator" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const parent = try tree.newNode(testing.allocator, false);
+    const left = try tree.newNode(testing.allocator, true);
+    const right = try tree.newNode(testing.allocator, true);
+    tree.root = parent;
+
+    for (0..31) |i| {
+        left.keys[i] = @intCast(i);
+        left.values[i] = -@as(isize, @intCast(i));
+        right.keys[i] = @intCast(32 + i);
+        right.values[i] = -@as(isize, @intCast(32 + i));
+    }
+    left.len = 31;
+    right.len = 31;
+    parent.keys[0] = 31;
+    parent.values[0] = -31;
+    parent.len = 1;
+    parent.branch.?.children[0] = left;
+    parent.branch.?.children[1] = right;
+    parent.branch.?.counts[0] = IntTree.subtreeCount(left);
+    parent.branch.?.counts[1] = IntTree.subtreeCount(right);
+
+    tree.mergeChildren(testing.allocator, parent, 0);
+
+    try testing.expectEqual(0, parent.len);
+    try testing.expectEqual(left, parent.branch.?.children[0].?);
+    try testing.expect(parent.branch.?.children[1] == null);
+    try testing.expectEqual(63, left.len);
+    for (0..63) |i| {
+        try testing.expectEqual(@as(isize, @intCast(i)), left.keys[i]);
+        try testing.expectEqual(-@as(isize, @intCast(i)), left.values[i]);
+    }
+    try testing.expectEqual(63, parent.branch.?.counts[0]);
+}
+
+test "rebalanceChild borrows from a left sibling when possible" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const parent = try tree.newNode(testing.allocator, false);
+    const left = try tree.newNode(testing.allocator, true);
+    const child = try tree.newNode(testing.allocator, true);
+    tree.root = parent;
+
+    for (0..32) |i| {
+        left.keys[i] = @intCast(i);
+        left.values[i] = -@as(isize, @intCast(i));
+    }
+    left.len = 32;
+    for (0..30) |i| {
+        child.keys[i] = @intCast(40 + i);
+        child.values[i] = -@as(isize, @intCast(40 + i));
+    }
+    child.len = 30;
+    parent.keys[0] = 32;
+    parent.values[0] = -32;
+    parent.len = 1;
+    parent.branch.?.children[0] = left;
+    parent.branch.?.children[1] = child;
+    parent.branch.?.counts[0] = IntTree.subtreeCount(left);
+    parent.branch.?.counts[1] = IntTree.subtreeCount(child);
+
+    try tree.rebalanceChild(testing.allocator, parent, 1);
+
+    try testing.expectEqual(31, left.len);
+    try testing.expectEqual(31, parent.keys[0]);
+    try testing.expectEqual(31, child.len);
+    try testing.expectEqual(32, child.keys[0]);
 }
