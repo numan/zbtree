@@ -49,3 +49,20 @@ test "insert and get random keys" {
 
     try testing.expectEqual(5000, tree.len);
 }
+
+test "random insertion preserves invariants" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var prng = std.Random.DefaultPrng.init(7);
+    var keys: [10_000]isize = undefined;
+    for (&keys, 0..) |*key, i| key.* = @intCast(i);
+    prng.random().shuffle(isize, &keys);
+
+    for (keys, 0..) |key, i| {
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+        if (i % 137 == 0) try tree.checkInvariants();
+    }
+    try tree.checkInvariants();
+}

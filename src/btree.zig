@@ -62,6 +62,11 @@ pub fn Tree(
             }
         };
 
+        const Bound = struct {
+            key: K,
+            value: V,
+        };
+
         root: ?*Node = null,
         len: usize = 0,
 
@@ -244,6 +249,63 @@ pub fn Tree(
                 if (found.found) return node.values[found.index];
                 if (node.branch) |branch| node = branch.children[found.index].? else return null;
             }
+        }
+
+        fn expectInvariant(ok: bool) !void {
+            if (!ok) return error.InvariantViolation;
+        }
+
+        fn checkNode(
+            self: *const Self,
+            node: *const Node,
+            is_root: bool,
+            depth: usize,
+            leaf_depth: *?usize,
+            lower: ?Bound,
+            upper: ?Bound,
+        ) !usize {
+            try expectInvariant(node.len <= max_items);
+            try expectInvariant(is_root or node.len >= min_items);
+
+            for (0..node.len) |i| {
+                const item = Bound{ .key = node.keys[i], .value = node.values[i] };
+                if (i > 0) {
+                    try expectInvariant(compare(node.keys[i - 1], node.values[i - 1], item.key, item.value) < 0);
+                }
+                if (lower) |bound| try expectInvariant(compare(bound.key, bound.value, item.key, item.value) < 0);
+                if (upper) |bound| try expectInvariant(compare(item.key, item.value, bound.key, bound.value) < 0);
+            }
+
+            const branch = node.branch orelse {
+                if (leaf_depth.*) |expected| {
+                    try expectInvariant(depth == expected);
+                } else {
+                    leaf_depth.* = depth;
+                }
+                return node.len;
+            };
+
+            var total: usize = node.len;
+            for (0..node.len + 1) |i| {
+                const child = branch.children[i] orelse return error.InvariantViolation;
+                const child_lower = if (i == 0) lower else Bound{ .key = node.keys[i - 1], .value = node.values[i - 1] };
+                const child_upper = if (i == node.len) upper else Bound{ .key = node.keys[i], .value = node.values[i] };
+                const count = try self.checkNode(child, false, depth + 1, leaf_depth, child_lower, child_upper);
+                try expectInvariant(branch.counts[i] == count);
+                total += count;
+            }
+            return total;
+        }
+
+        pub fn checkInvariants(self: *const Self) !void {
+            const root = self.root orelse {
+                try expectInvariant(self.len == 0);
+                return;
+            };
+
+            var leaf_depth: ?usize = null;
+            const count = try self.checkNode(root, true, 0, &leaf_depth, null, null);
+            try expectInvariant(count == self.len);
         }
 
         pub fn deinit(self: *Self, gpa: mem.Allocator) void {
