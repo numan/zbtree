@@ -31,6 +31,7 @@ pub fn Tree(
             values: [max_items]V = undefined,
             len: u8 = 0,
             branch: ?*Branch = null,
+            rc: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
             fn init() NodeSelf {
                 return .{};
@@ -130,9 +131,7 @@ pub fn Tree(
             if (node.branch) |branch| {
                 var i: usize = 0;
                 while (i <= node.len) : (i += 1) {
-                    if (branch.children[i]) |child| {
-                        self.destroyNode(gpa, child);
-                    }
+                    self.releaseNode(gpa, branch.children[i]);
                 }
 
                 if (branch.prefixes) |prefixes| {
@@ -273,6 +272,7 @@ pub fn Tree(
 
             const branch = node.branch.?;
             var child_index = found.index;
+            try self.makeUniqueChild(gpa, node, child_index);
             if (branch.children[child_index].?.len == max_items) {
                 try self.splitChild(gpa, node, child_index);
                 const cmp = compare(node.keys[child_index], node.values[child_index], key, value);
@@ -290,6 +290,7 @@ pub fn Tree(
         /// Returns `true` when a new item was inserted and `false` for a
         /// duplicate according to `compare`.
         pub fn insert(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
+            try self.makeUniqueRoot(gpa);
             if (self.root == null) self.root = try self.newNode(gpa, true);
             if (self.root.?.len == max_items) try self.splitRoot(gpa);
 
@@ -581,6 +582,13 @@ pub fn Tree(
         /// Returns `null` when no equal item exists. Deletion may free merged
         /// nodes and may collapse an empty internal root back to its only child.
         pub fn delete(self: *Self, gpa: mem.Allocator, key: K, val: V) !?V {
+            try self.makeUniqueRoot(gpa);
+            return self.deleteUnique(gpa, key, val);
+        }
+
+        // Deletes from a tree whose root has already been made unique for a
+        // copy-on-write mutation. Handles length updates and root collapse.
+        fn deleteUnique(self: *Self, gpa: mem.Allocator, key: K, val: V) !?V {
             const old = if (self.root) |root| try self.deleteFromNode(gpa, root, key, val) else return null;
             if (old != null) self.len -= 1;
 
@@ -608,6 +616,7 @@ pub fn Tree(
 
             const branch = node.branch.?;
             if (found.found) {
+                try self.makeUniqueChild(gpa, node, found.index);
                 const replacement = maxEntry(branch.children[found.index].?);
                 const old = node.values[found.index];
                 node.keys[found.index] = replacement.key;
@@ -618,6 +627,7 @@ pub fn Tree(
                 return old;
             }
 
+            try self.makeUniqueChild(gpa, node, found.index);
             const old = try self.deleteFromNode(gpa, branch.children[found.index].?, key, val);
             if (old != null) {
                 branch.counts[found.index] -= 1;
@@ -704,30 +714,46 @@ pub fn Tree(
             self.destroyNode(gpa, right);
         }
 
+        /// Returns the smallest item in sort order.
+        ///
+        /// Returns `null` when the tree is empty.
         pub fn front(self: *const Self) ?Entry {
             var node = self.root orelse return null;
             while (node.branch) |branch| node = branch.children[0].?;
             return Entry.init(node.keys[0], node.values[0]);
         }
 
+        /// Returns the greatest item in sort order.
+        ///
+        /// Returns `null` when the tree is empty.
         pub fn back(self: *const Self) ?Entry {
             var node = self.root orelse return null;
             while (node.branch) |branch| node = branch.children[node.len].?;
             return Entry.init(node.keys[node.len - 1], node.values[node.len - 1]);
         }
 
+        /// Removes and returns the smallest item in sort order.
+        ///
+        /// Returns `null` when the tree is empty.
         pub fn popFront(self: *Self, gpa: mem.Allocator) !?Entry {
             const item = self.front() orelse return null;
             _ = try self.delete(gpa, item.key, item.value);
             return item;
         }
 
+        /// Removes and returns the greatest item in sort order.
+        ///
+        /// Returns `null` when the tree is empty.
         pub fn popBack(self: *Self, gpa: mem.Allocator) !?Entry {
             const item = self.back() orelse return null;
             _ = try self.delete(gpa, item.key, item.value);
             return item;
         }
 
+        /// Inserts `key`/`value` before the current first item.
+        ///
+        /// Returns `false` if the item does not sort strictly before the
+        /// current first item or if an equal item already exists.
         pub fn pushFront(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
             if (self.front()) |first| {
                 if (compare(key, value, first.key, first.value) >= 0) return false;
@@ -735,6 +761,10 @@ pub fn Tree(
             return self.insert(gpa, key, value);
         }
 
+        /// Inserts `key`/`value` after the current last item.
+        ///
+        /// Returns `false` if the item does not sort strictly after the
+        /// current last item or if an equal item already exists.
         pub fn pushBack(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
             if (self.back()) |last| {
                 if (compare(last.key, last.value, key, value) >= 0) return false;
@@ -742,6 +772,8 @@ pub fn Tree(
             return self.insert(gpa, key, value);
         }
 
+        // Returns whether `key`/`value` can occupy sorted position `index`
+        // without violating its neighboring items.
         fn fitsBetween(self: *const Self, index: usize, key: K, value: V) bool {
             if (index > 0) {
                 const previous = self.getAt(index - 1).?;
@@ -754,12 +786,20 @@ pub fn Tree(
             return true;
         }
 
+        /// Inserts `key`/`value` at sorted position `index`.
+        ///
+        /// Returns `false` when `index` is out of range, when the item does not
+        /// fit between its neighbors, or when an equal item already exists.
         pub fn insertAt(self: *Self, gpa: mem.Allocator, index: usize, key: K, value: V) !bool {
             if (index > self.len) return false;
             if (!self.fitsBetween(index, key, value)) return false;
             return self.insert(gpa, key, value);
         }
 
+        /// Replaces the item at sorted position `index`.
+        ///
+        /// Returns the old entry on success, or `null` if `index` is out of
+        /// range or the replacement does not fit between its neighbors.
         pub fn replaceAt(self: *Self, gpa: mem.Allocator, index: usize, key: K, value: V) !?Entry {
             if (index >= self.len) return null;
             const old = self.getAt(index).?;
@@ -773,12 +813,19 @@ pub fn Tree(
             return old;
         }
 
+        /// Removes and returns the item at sorted position `index`.
+        ///
+        /// Returns `null` when `index` is out of range.
         pub fn deleteAt(self: *Self, gpa: mem.Allocator, index: usize) !?Entry {
             const item = self.getAt(index) orelse return null;
             _ = try self.delete(gpa, item.key, item.value);
             return item;
         }
 
+        /// Removes up to `count` items starting at sorted position `index`.
+        ///
+        /// Returns the number of items removed. Ranges past the end are
+        /// clamped, and empty or out-of-range requests remove nothing.
         pub fn deleteRangeAt(self: *Self, gpa: mem.Allocator, index: usize, count: usize) !usize {
             if (index >= self.len or count == 0) return 0;
 
@@ -790,12 +837,16 @@ pub fn Tree(
             return removed;
         }
 
+        /// Removes every item and releases all nodes owned by this tree.
         pub fn clear(self: *Self, gpa: mem.Allocator) void {
-            if (self.root) |root| self.destroyNode(gpa, root);
+            self.releaseNode(gpa, self.root);
             self.root = null;
             self.len = 0;
         }
 
+        /// Removes every item from sorted position `index` through the end.
+        ///
+        /// Returns the number of items removed.
         pub fn deleteAllAt(self: *Self, gpa: mem.Allocator, index: usize) !usize {
             return self.deleteRangeAt(gpa, index, self.len - @min(index, self.len));
         }
@@ -849,6 +900,72 @@ pub fn Tree(
             return total;
         }
 
+        // Adds one shared owner reference to a node for copy-on-write sharing.
+        fn retainNode(node: ?*Node) void {
+            if (node) |n| _ = n.rc.fetchAdd(1, .monotonic);
+        }
+
+        // Releases one owner reference. If no shared owner remains, destroys
+        // the node and recursively releases its children.
+        fn releaseNode(self: *Self, gpa: mem.Allocator, node: ?*Node) void {
+            const n = node orelse return;
+            if (n.rc.load(.monotonic) > 0) {
+                _ = n.rc.fetchSub(1, .acq_rel);
+                return;
+            }
+            self.destroyNode(gpa, n);
+        }
+
+        /// Returns an O(1) copy-on-write snapshot of this tree.
+        ///
+        /// The copy shares nodes until either tree mutates, at which point the
+        /// mutating path is cloned lazily.
+        pub fn copy(self: *Self) Self {
+            retainNode(self.root);
+            return .{ .root = self.root, .len = self.len };
+        }
+
+        // Allocates a private copy of one node. Internal-node children remain
+        // shared and have their reference counts incremented.
+        fn cloneNode(self: *Self, gpa: mem.Allocator, node: *Node) !*Node {
+            const clone = try self.newNode(gpa, node.isLeaf());
+            clone.len = node.len;
+
+            for (0..node.len) |i| {
+                clone.keys[i] = node.keys[i];
+                clone.values[i] = node.values[i];
+            }
+
+            if (node.branch) |branch| {
+                const clone_branch = clone.branch.?;
+                for (0..node.len + 1) |i| {
+                    clone_branch.children[i] = branch.children[i];
+                    clone_branch.counts[i] = branch.counts[i];
+                    retainNode(branch.children[i]);
+                }
+            }
+
+            return clone;
+        }
+
+        // Clones the root when it is shared with another copy-on-write tree.
+        fn makeUniqueRoot(self: *Self, gpa: mem.Allocator) !void {
+            const root = self.root orelse return;
+            if (root.rc.load(.monotonic) == 0) return;
+            _ = root.rc.fetchSub(1, .acq_rel);
+            self.root = try self.cloneNode(gpa, root);
+        }
+
+        // Clones an internal child when it is shared with another
+        // copy-on-write tree.
+        fn makeUniqueChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
+            const branch = parent.branch.?;
+            const child = branch.children[child_index].?;
+            if (child.rc.load(.monotonic) == 0) return;
+            _ = child.rc.fetchSub(1, .acq_rel);
+            branch.children[child_index] = try self.cloneNode(gpa, child);
+        }
+
         /// Verifies the tree's internal structure.
         ///
         /// Useful in tests and debug checks. It validates sorted order, B-tree
@@ -866,7 +983,7 @@ pub fn Tree(
 
         /// Frees every node owned by the tree and resets it to empty.
         pub fn deinit(self: *Self, gpa: mem.Allocator) void {
-            if (self.root) |root| self.destroyNode(gpa, root);
+            self.releaseNode(gpa, self.root);
             self.root = null;
             self.len = 0;
         }
@@ -1226,4 +1343,71 @@ test "fitsBetween validates index neighbors" {
     try testing.expect(!tree.fitsBetween(1, 30, 3000));
     try testing.expect(tree.fitsBetween(3, 40, 400));
     try testing.expect(!tree.fitsBetween(3, 25, 250));
+}
+
+test "copy retains the root until both trees release it" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.insert(testing.allocator, 10, 100));
+    const root = tree.root.?;
+    try testing.expectEqual(0, root.rc.load(.monotonic));
+
+    var copy = tree.copy();
+    defer copy.deinit(testing.allocator);
+
+    try testing.expectEqual(root, copy.root.?);
+    try testing.expectEqual(1, root.rc.load(.monotonic));
+
+    copy.clear(testing.allocator);
+    try testing.expectEqual(0, root.rc.load(.monotonic));
+    try testing.expectEqual(100, tree.get(10, 0).?);
+}
+
+test "makeUniqueRoot clones a retained root" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.insert(testing.allocator, 10, 100));
+    const original_root = tree.root.?;
+
+    var copy = tree.copy();
+    defer copy.deinit(testing.allocator);
+
+    try copy.makeUniqueRoot(testing.allocator);
+
+    try testing.expectEqual(original_root, tree.root.?);
+    try testing.expect(copy.root.? != original_root);
+    try testing.expectEqual(0, original_root.rc.load(.monotonic));
+    try testing.expectEqual(100, tree.get(10, 0).?);
+    try testing.expectEqual(100, copy.get(10, 0).?);
+}
+
+test "makeUniqueChild clones a retained child" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..150) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    const original_root = tree.root.?;
+    const original_child = original_root.branch.?.children[0].?;
+
+    var copy = tree.copy();
+    defer copy.deinit(testing.allocator);
+    try copy.makeUniqueRoot(testing.allocator);
+
+    try testing.expectEqual(original_child, copy.root.?.branch.?.children[0].?);
+    try testing.expect(original_child.rc.load(.monotonic) > 0);
+
+    try copy.makeUniqueChild(testing.allocator, copy.root.?, 0);
+
+    try testing.expectEqual(original_child, tree.root.?.branch.?.children[0].?);
+    try testing.expect(copy.root.?.branch.?.children[0].? != original_child);
+    try testing.expectEqual(0, original_child.rc.load(.monotonic));
 }

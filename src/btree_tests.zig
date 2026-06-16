@@ -422,6 +422,80 @@ test "clear removes all entries and permits reuse" {
     try tree.checkInvariants();
 }
 
+test "copy shares reads and diverges after insert" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var original = IntTree.init();
+    defer original.deinit(testing.allocator);
+
+    for (0..150) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try original.insert(testing.allocator, key, -key));
+    }
+
+    var copy = original.copy();
+    defer copy.deinit(testing.allocator);
+
+    try testing.expectEqual(original.len, copy.len);
+    try testing.expectEqual(-42, copy.get(42, 0).?);
+
+    try testing.expect(try copy.insert(testing.allocator, 200, -200));
+
+    try testing.expectEqual(150, original.len);
+    try testing.expectEqual(151, copy.len);
+    try testing.expect(original.get(200, 0) == null);
+    try testing.expectEqual(-200, copy.get(200, 0).?);
+    try original.checkInvariants();
+    try copy.checkInvariants();
+}
+
+test "copy diverges after delete without changing original" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var original = IntTree.init();
+    defer original.deinit(testing.allocator);
+
+    for (0..150) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try original.insert(testing.allocator, key, key * 10));
+    }
+
+    var copy = original.copy();
+    defer copy.deinit(testing.allocator);
+
+    try testing.expectEqual(310, (try copy.delete(testing.allocator, 31, 0)).?);
+    try testing.expectEqual(149, copy.len);
+    try testing.expect(copy.get(31, 0) == null);
+
+    try testing.expectEqual(150, original.len);
+    try testing.expectEqual(310, original.get(31, 0).?);
+    try testing.expectEqual(31, original.getAt(31).?.key);
+    try original.checkInvariants();
+    try copy.checkInvariants();
+}
+
+test "clearing one copy leaves the other usable" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var original = IntTree.init();
+    defer original.deinit(testing.allocator);
+
+    for (0..100) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try original.insert(testing.allocator, key, -key));
+    }
+
+    var copy = original.copy();
+    defer copy.deinit(testing.allocator);
+
+    copy.clear(testing.allocator);
+
+    try testing.expectEqual(0, copy.len);
+    try testing.expect(copy.root == null);
+    try testing.expectEqual(100, original.len);
+    try testing.expectEqual(0, original.front().?.key);
+    try testing.expectEqual(99, original.back().?.key);
+    try original.checkInvariants();
+    try copy.checkInvariants();
+}
+
 test "insert and get random keys" {
     const IntTree = btree.Tree(isize, isize, compareIntKey);
     var tree = IntTree.init();
