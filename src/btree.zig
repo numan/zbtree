@@ -779,6 +779,27 @@ pub fn Tree(
             return item;
         }
 
+        pub fn deleteRangeAt(self: *Self, gpa: mem.Allocator, index: usize, count: usize) !usize {
+            if (index >= self.len or count == 0) return 0;
+
+            var removed: usize = 0;
+            const limit = @min(count, self.len - index);
+            while (removed < limit) : (removed += 1) {
+                _ = try self.deleteAt(gpa, index);
+            }
+            return removed;
+        }
+
+        pub fn clear(self: *Self, gpa: mem.Allocator) void {
+            if (self.root) |root| self.destroyNode(gpa, root);
+            self.root = null;
+            self.len = 0;
+        }
+
+        pub fn deleteAllAt(self: *Self, gpa: mem.Allocator, index: usize) !usize {
+            return self.deleteRangeAt(gpa, index, self.len - @min(index, self.len));
+        }
+
         // Converts a failed internal consistency check into a testable error.
         fn expectInvariant(ok: bool) !void {
             if (!ok) return error.InvariantViolation;

@@ -356,6 +356,72 @@ test "deleteAt removes by sorted index" {
     try tree.checkInvariants();
 }
 
+test "deleteRangeAt removes bounded index ranges" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..120) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    try testing.expectEqual(0, try tree.deleteRangeAt(testing.allocator, 10, 0));
+    try testing.expectEqual(0, try tree.deleteRangeAt(testing.allocator, 120, 5));
+    try testing.expectEqual(10, try tree.deleteRangeAt(testing.allocator, 20, 10));
+    try testing.expectEqual(110, tree.len);
+    try testing.expectEqual(19, tree.getAt(19).?.key);
+    try testing.expectEqual(30, tree.getAt(20).?.key);
+    for (20..30) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(tree.get(key, 0) == null);
+    }
+
+    try testing.expectEqual(5, try tree.deleteRangeAt(testing.allocator, 105, 50));
+    try testing.expectEqual(105, tree.len);
+    try testing.expectEqual(114, tree.back().?.key);
+    try tree.checkInvariants();
+}
+
+test "deleteAllAt removes everything from an index" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..50) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    try testing.expectEqual(25, try tree.deleteAllAt(testing.allocator, 25));
+    try testing.expectEqual(25, tree.len);
+    try testing.expectEqual(0, tree.front().?.key);
+    try testing.expectEqual(24, tree.back().?.key);
+    try testing.expect(try tree.deleteAllAt(testing.allocator, 25) == 0);
+    try tree.checkInvariants();
+}
+
+test "clear removes all entries and permits reuse" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..100) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    tree.clear(testing.allocator);
+    try testing.expectEqual(0, tree.len);
+    try testing.expect(tree.root == null);
+    try tree.checkInvariants();
+
+    try testing.expect(try tree.insert(testing.allocator, 7, 70));
+    try testing.expectEqual(1, tree.len);
+    try testing.expectEqual(70, tree.get(7, 0).?);
+    try tree.checkInvariants();
+}
+
 test "insert and get random keys" {
     const IntTree = btree.Tree(isize, isize, compareIntKey);
     var tree = IntTree.init();
