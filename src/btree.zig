@@ -555,6 +555,7 @@ pub fn Tree(
             return null;
         }
 
+        // Removes and returns the item at `index`, shifting later items left.
         fn removeItemAt(node: *Node, index: usize) Entry {
             const removed = Entry.init(node.keys[index], node.values[index]);
             var i = index;
@@ -567,12 +568,18 @@ pub fn Tree(
             return removed;
         }
 
+        // Returns the greatest item reachable from `node` by following the
+        // rightmost child pointers down to a leaf.
         fn maxEntry(node: *const Node) Entry {
             var current = node;
             while (current.branch) |branch| current = branch.children[current.len].?;
             return Entry.init(current.keys[current.len - 1], current.values[current.len - 1]);
         }
 
+        /// Removes an item equal to `key`/`val` and returns its stored value.
+        ///
+        /// Returns `null` when no equal item exists. Deletion may free merged
+        /// nodes and may collapse an empty internal root back to its only child.
         pub fn delete(self: *Self, gpa: mem.Allocator, key: K, val: V) !?V {
             const old = if (self.root) |root| try self.deleteFromNode(gpa, root, key, val) else return null;
             if (old != null) self.len -= 1;
@@ -592,6 +599,9 @@ pub fn Tree(
             return old;
         }
 
+        // Recursive deletion implementation. It removes directly from leaves,
+        // replaces internal matches with their left-subtree predecessor, and
+        // rebalances any child that drops below the minimum size.
         fn deleteFromNode(self: *Self, gpa: mem.Allocator, node: *Node, key: K, val: V) !?V {
             const found = searchNode(node, key, val);
             if (node.isLeaf()) return if (found.found) removeItemAt(node, found.index).value else null;
@@ -617,6 +627,8 @@ pub fn Tree(
             return old;
         }
 
+        // Restores the minimum size rule for `parent`'s child at `child_index`
+        // by borrowing from a sibling when possible or merging siblings.
         fn rebalanceChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
             const branch = parent.branch.?;
             const child = branch.children[child_index].?;
@@ -634,6 +646,8 @@ pub fn Tree(
             }
         }
 
+        // Borrows the left sibling's maximum item by moving it through the
+        // parent separator into the front of the underfull child.
         fn rotateFromLeft(parent: *Node, child_index: usize) void {
             const branch = parent.branch.?;
             const left = branch.children[child_index - 1].?;
@@ -647,6 +661,8 @@ pub fn Tree(
             branch.counts[child_index] = subtreeCount(child);
         }
 
+        // Borrows the right sibling's minimum item by moving it through the
+        // parent separator into the end of the underfull child.
         fn rotateFromRight(parent: *Node, child_index: usize) void {
             const branch = parent.branch.?;
             const child = branch.children[child_index].?;
@@ -660,6 +676,8 @@ pub fn Tree(
             branch.counts[child_index + 1] = subtreeCount(right);
         }
 
+        // Merges the child at `left_index`, the parent separator, and the right
+        // sibling into one left child, then removes the empty right sibling.
         fn mergeChildren(self: *Self, gpa: mem.Allocator, parent: *Node, left_index: usize) void {
             const branch = parent.branch.?;
             const left = branch.children[left_index].?;
