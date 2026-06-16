@@ -704,6 +704,44 @@ pub fn Tree(
             self.destroyNode(gpa, right);
         }
 
+        pub fn front(self: *const Self) ?Entry {
+            var node = self.root orelse return null;
+            while (node.branch) |branch| node = branch.children[0].?;
+            return Entry.init(node.keys[0], node.values[0]);
+        }
+
+        pub fn back(self: *const Self) ?Entry {
+            var node = self.root orelse return null;
+            while (node.branch) |branch| node = branch.children[node.len].?;
+            return Entry.init(node.keys[node.len - 1], node.values[node.len - 1]);
+        }
+
+        pub fn popFront(self: *Self, gpa: mem.Allocator) !?Entry {
+            const item = self.front() orelse return null;
+            _ = try self.delete(gpa, item.key, item.value);
+            return item;
+        }
+
+        pub fn popBack(self: *Self, gpa: mem.Allocator) !?Entry {
+            const item = self.back() orelse return null;
+            _ = try self.delete(gpa, item.key, item.value);
+            return item;
+        }
+
+        pub fn pushFront(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
+            if (self.front()) |first| {
+                if (compare(key, value, first.key, first.value) >= 0) return false;
+            }
+            return self.insert(gpa, key, value);
+        }
+
+        pub fn pushBack(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
+            if (self.back()) |last| {
+                if (compare(last.key, last.value, key, value) >= 0) return false;
+            }
+            return self.insert(gpa, key, value);
+        }
+
         // Converts a failed internal consistency check into a testable error.
         fn expectInvariant(ok: bool) !void {
             if (!ok) return error.InvariantViolation;

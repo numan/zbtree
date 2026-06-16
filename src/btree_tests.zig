@@ -202,6 +202,88 @@ test "delete removes internal keys and preserves indexed order" {
     try tree.checkInvariants();
 }
 
+test "front and back return null for an empty tree" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(tree.front() == null);
+    try testing.expect(tree.back() == null);
+    try testing.expect(try tree.popFront(testing.allocator) == null);
+    try testing.expect(try tree.popBack(testing.allocator) == null);
+}
+
+test "front and back find edge entries after splits" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var prng = std.Random.DefaultPrng.init(2024);
+    var keys: [300]isize = undefined;
+    for (&keys, 0..) |*key, i| key.* = @intCast(i);
+    prng.random().shuffle(isize, &keys);
+
+    for (keys) |key| {
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    try testing.expectEqual(0, tree.front().?.key);
+    try testing.expectEqual(0, tree.front().?.value);
+    try testing.expectEqual(299, tree.back().?.key);
+    try testing.expectEqual(2990, tree.back().?.value);
+    try tree.checkInvariants();
+}
+
+test "pushFront and pushBack enforce edge ordering" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.pushFront(testing.allocator, 10, 100));
+    try testing.expect(try tree.pushFront(testing.allocator, 5, 50));
+    try testing.expect(!try tree.pushFront(testing.allocator, 7, 70));
+    try testing.expect(!try tree.pushFront(testing.allocator, 5, 500));
+
+    try testing.expect(try tree.pushBack(testing.allocator, 20, 200));
+    try testing.expect(try tree.pushBack(testing.allocator, 30, 300));
+    try testing.expect(!try tree.pushBack(testing.allocator, 25, 250));
+    try testing.expect(!try tree.pushBack(testing.allocator, 30, 3000));
+
+    try testing.expectEqual(4, tree.len);
+    try testing.expectEqual(5, tree.front().?.key);
+    try testing.expectEqual(30, tree.back().?.key);
+    try tree.checkInvariants();
+}
+
+test "popFront and popBack remove edge entries" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..100) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    try testing.expectEqual(0, (try tree.popFront(testing.allocator)).?.key);
+    try testing.expectEqual(99, (try tree.popBack(testing.allocator)).?.key);
+    try testing.expectEqual(98, tree.len);
+    try testing.expectEqual(1, tree.front().?.key);
+    try testing.expectEqual(98, tree.back().?.key);
+    try testing.expect(tree.get(0, 0) == null);
+    try testing.expect(tree.get(99, 0) == null);
+    try tree.checkInvariants();
+
+    var expected_front: isize = 1;
+    while (try tree.popFront(testing.allocator)) |entry| : (expected_front += 1) {
+        try testing.expectEqual(expected_front, entry.key);
+    }
+
+    try testing.expectEqual(99, expected_front);
+    try testing.expectEqual(0, tree.len);
+    try testing.expect(tree.root == null);
+}
+
 test "insert and get random keys" {
     const IntTree = btree.Tree(isize, isize, compareIntKey);
     var tree = IntTree.init();
