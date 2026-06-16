@@ -742,6 +742,43 @@ pub fn Tree(
             return self.insert(gpa, key, value);
         }
 
+        fn fitsBetween(self: *const Self, index: usize, key: K, value: V) bool {
+            if (index > 0) {
+                const previous = self.getAt(index - 1).?;
+                if (compare(previous.key, previous.value, key, value) >= 0) return false;
+            }
+            if (index < self.len) {
+                const next = self.getAt(index).?;
+                if (compare(key, value, next.key, next.value) >= 0) return false;
+            }
+            return true;
+        }
+
+        pub fn insertAt(self: *Self, gpa: mem.Allocator, index: usize, key: K, value: V) !bool {
+            if (index > self.len) return false;
+            if (!self.fitsBetween(index, key, value)) return false;
+            return self.insert(gpa, key, value);
+        }
+
+        pub fn replaceAt(self: *Self, gpa: mem.Allocator, index: usize, key: K, value: V) !?Entry {
+            if (index >= self.len) return null;
+            const old = self.getAt(index).?;
+            _ = try self.delete(gpa, old.key, old.value);
+            if (!self.fitsBetween(index, key, value)) {
+                _ = try self.insert(gpa, old.key, old.value);
+                return null;
+            }
+
+            _ = try self.insert(gpa, key, value);
+            return old;
+        }
+
+        pub fn deleteAt(self: *Self, gpa: mem.Allocator, index: usize) !?Entry {
+            const item = self.getAt(index) orelse return null;
+            _ = try self.delete(gpa, item.key, item.value);
+            return item;
+        }
+
         // Converts a failed internal consistency check into a testable error.
         fn expectInvariant(ok: bool) !void {
             if (!ok) return error.InvariantViolation;
@@ -1148,4 +1185,24 @@ test "rebalanceChild borrows from a left sibling when possible" {
     try testing.expectEqual(31, parent.keys[0]);
     try testing.expectEqual(31, child.len);
     try testing.expectEqual(32, child.keys[0]);
+}
+
+test "fitsBetween validates index neighbors" {
+    const IntTree = Tree(isize, isize, compareTestIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(tree.fitsBetween(0, 10, 100));
+
+    try testing.expect(try tree.insert(testing.allocator, 10, 100));
+    try testing.expect(try tree.insert(testing.allocator, 20, 200));
+    try testing.expect(try tree.insert(testing.allocator, 30, 300));
+
+    try testing.expect(tree.fitsBetween(0, 5, 50));
+    try testing.expect(!tree.fitsBetween(0, 10, 1000));
+    try testing.expect(tree.fitsBetween(1, 15, 150));
+    try testing.expect(!tree.fitsBetween(1, 5, 50));
+    try testing.expect(!tree.fitsBetween(1, 30, 3000));
+    try testing.expect(tree.fitsBetween(3, 40, 400));
+    try testing.expect(!tree.fitsBetween(3, 25, 250));
 }

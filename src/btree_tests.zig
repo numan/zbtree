@@ -284,6 +284,78 @@ test "popFront and popBack remove edge entries" {
     try testing.expect(tree.root == null);
 }
 
+test "insertAt inserts only when the item fits at the index" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.insertAt(testing.allocator, 0, 10, 100));
+    try testing.expect(try tree.insertAt(testing.allocator, 0, 5, 50));
+    try testing.expect(try tree.insertAt(testing.allocator, 2, 20, 200));
+    try testing.expect(try tree.insertAt(testing.allocator, 2, 15, 150));
+
+    try testing.expect(!try tree.insertAt(testing.allocator, 10, 30, 300));
+    try testing.expect(!try tree.insertAt(testing.allocator, 1, 30, 300));
+    try testing.expect(!try tree.insertAt(testing.allocator, 2, 5, 500));
+
+    try testing.expectEqual(4, tree.len);
+    for ([_]isize{ 5, 10, 15, 20 }, 0..) |key, index| {
+        try testing.expectEqual(key, tree.getAt(index).?.key);
+        try testing.expectEqual(index, tree.indexOf(key, 0).?);
+    }
+    try tree.checkInvariants();
+}
+
+test "replaceAt replaces only when the new item fits" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for ([_]isize{ 10, 20, 30, 40 }) |key| {
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    const old = (try tree.replaceAt(testing.allocator, 1, 25, 250)).?;
+    try testing.expectEqual(20, old.key);
+    try testing.expectEqual(200, old.value);
+    try testing.expectEqual(4, tree.len);
+    try testing.expect(tree.get(20, 0) == null);
+    try testing.expectEqual(250, tree.get(25, 0).?);
+
+    try testing.expect(try tree.replaceAt(testing.allocator, 1, 35, 350) == null);
+    try testing.expectEqual(4, tree.len);
+    try testing.expectEqual(250, tree.get(25, 0).?);
+    try testing.expect(tree.get(35, 0) == null);
+
+    try testing.expect(try tree.replaceAt(testing.allocator, 4, 50, 500) == null);
+    try tree.checkInvariants();
+}
+
+test "deleteAt removes by sorted index" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..80) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    try testing.expectEqual(0, (try tree.deleteAt(testing.allocator, 0)).?.key);
+    try testing.expectEqual(40, (try tree.deleteAt(testing.allocator, 39)).?.key);
+    try testing.expectEqual(79, (try tree.deleteAt(testing.allocator, tree.len - 1)).?.key);
+    try testing.expect(try tree.deleteAt(testing.allocator, tree.len) == null);
+
+    try testing.expectEqual(77, tree.len);
+    try testing.expect(tree.get(0, 0) == null);
+    try testing.expect(tree.get(40, 0) == null);
+    try testing.expect(tree.get(79, 0) == null);
+    try testing.expectEqual(1, tree.getAt(0).?.key);
+    try testing.expectEqual(41, tree.getAt(39).?.key);
+    try testing.expectEqual(78, tree.getAt(tree.len - 1).?.key);
+    try tree.checkInvariants();
+}
+
 test "insert and get random keys" {
     const IntTree = btree.Tree(isize, isize, compareIntKey);
     var tree = IntTree.init();
