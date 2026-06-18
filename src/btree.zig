@@ -2,6 +2,10 @@ const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
 
+pub const TreeConfig = struct {
+    use_string_prefix: bool = true,
+};
+
 /// Creates a B-tree type for the given key/value types.
 ///
 /// `compare` defines the sort order. It receives both key and value for each
@@ -11,7 +15,13 @@ pub fn Tree(
     comptime K: type,
     comptime V: type,
     comptime compare: fn (K, V, K, V) i32,
+    comptime config: TreeConfig,
 ) type {
+    comptime {
+        if (config.use_string_prefix and K != []const u8) {
+            @compileError("config.use_string_prefix requires key type to be []const u8 (string)");
+        }
+    }
     return struct {
         const Self = @This();
 
@@ -50,7 +60,7 @@ pub fn Tree(
 
             children: [fanout]?*Node = [_]?*Node{null} ** fanout,
             counts: [fanout]usize = [_]usize{0} ** fanout,
-            prefixes: ?*[max_items]u64 = null,
+            prefixes: if (config.use_string_prefix) [max_items]u64 else void = if (config.use_string_prefix) [_]u64{0} ** max_items else {},
 
             fn init() BranchSelf {
                 return .{};
@@ -104,6 +114,12 @@ pub fn Tree(
         root: ?*Node = null,
         len: usize = 0,
 
+        fn setPrefix(node: *Node, index: usize) void {
+            if (config.use_string_prefix) {
+                if (node.branch) |branch| branch.prefixes[index] = stringPrefix(node.keys[index]);
+            }
+        }
+
         /// Returns an empty tree. The allocator is passed to operations that
         /// allocate or free nodes instead of being stored in the tree itself.
         pub fn init() Self {
@@ -134,9 +150,6 @@ pub fn Tree(
                     self.releaseNode(gpa, branch.children[i]);
                 }
 
-                if (branch.prefixes) |prefixes| {
-                    gpa.destroy(prefixes);
-                }
                 gpa.destroy(branch);
             }
             gpa.destroy(node);
@@ -158,6 +171,10 @@ pub fn Tree(
                 const idx = i + median + 1;
                 right.keys[i] = node.keys[idx];
                 right.values[i] = node.values[idx];
+            }
+
+            if (config.use_string_prefix and right.branch != null) {
+                for (0..right.len) |prefix_index| setPrefix(right, prefix_index);
             }
 
             if (node.branch) |left_branch| {
@@ -186,6 +203,7 @@ pub fn Tree(
             new_root.keys[0] = split.key;
             new_root.values[0] = split.value;
             new_root.len = 1;
+            setPrefix(new_root, 0);
 
             const branch = new_root.branch.?;
             branch.children[0] = old_root;
@@ -199,6 +217,28 @@ pub fn Tree(
         // Finds the first item in `node` that is greater than or equal to the
         // requested key/value pair.
         fn searchNode(node: *const Node, key: K, value: V) SearchResult {
+            if (config.use_string_prefix and !node.isLeaf()) return seachBranchWithPrefixes(node, key, value);
+            return searchNodeFull(node, key, value);
+        }
+
+        fn seachBranchWithPrefixes(node: *const Node, key: []const u8, value: V) SearchResult {
+            const wanted = stringPrefix(key);
+            const branch = node.branch.?;
+
+            var i: usize = 0;
+            while (i < node.len) : (i += 1) {
+                const prefix = branch.prefixes[i];
+                if (prefix < wanted) continue;
+                if (prefix > wanted) return SearchResult.init(i, false);
+
+                const c = compare(node.keys[i], node.values[i], key, value);
+                if (c >= 0) return SearchResult.init(i, c == 0);
+            }
+
+            return SearchResult.init(i, false);
+        }
+
+        fn searchNodeFull(node: *const Node, key: K, value: V) SearchResult {
             var i: usize = 0;
             while (i < node.len) : (i += 1) {
                 const c = compare(node.keys[i], node.values[i], key, value);
@@ -215,11 +255,15 @@ pub fn Tree(
             while (i > index) : (i -= 1) {
                 node.keys[i] = node.keys[i - 1];
                 node.values[i] = node.values[i - 1];
+                if (config.use_string_prefix) {
+                    if (node.branch) |b| b.prefixes[i] = b.prefixes[i - 1];
+                }
             }
 
             node.keys[index] = key;
             node.values[index] = value;
             node.len += 1;
+            setPrefix(node, index);
         }
 
         // Inserts a child pointer into an internal node and records that child's
@@ -549,6 +593,7 @@ pub fn Tree(
                 const old = slot.node.values[slot.index];
                 slot.node.keys[slot.index] = key;
                 slot.node.values[slot.index] = val;
+                setPrefix(slot.node, slot.index);
                 return old;
             }
 
@@ -564,6 +609,9 @@ pub fn Tree(
             while (i + 1 < node.len) : (i += 1) {
                 node.keys[i] = node.keys[i + 1];
                 node.values[i] = node.values[i + 1];
+                if (config.use_string_prefix) {
+                    if (node.branch) |b| b.prefixes[i] = b.prefixes[i + 1];
+                }
             }
             node.len -= 1;
             return removed;
@@ -621,6 +669,7 @@ pub fn Tree(
                 const old = node.values[found.index];
                 node.keys[found.index] = replacement.key;
                 node.values[found.index] = replacement.value;
+                setPrefix(node, found.index);
                 _ = try self.deleteFromNode(gpa, branch.children[found.index].?, replacement.key, replacement.value);
                 branch.counts[found.index] -= 1;
                 try self.rebalanceChild(gpa, node, found.index);
@@ -666,6 +715,7 @@ pub fn Tree(
             insertItemAt(child, 0, parent.keys[child_index - 1], parent.values[child_index - 1]);
             parent.keys[child_index - 1] = left.keys[left.len - 1];
             parent.values[child_index - 1] = left.values[left.len - 1];
+            setPrefix(parent, child_index - 1);
             left.len -= 1;
             branch.counts[child_index - 1] = subtreeCount(left);
             branch.counts[child_index] = subtreeCount(child);
@@ -681,6 +731,7 @@ pub fn Tree(
             insertItemAt(child, child.len, parent.keys[child_index], parent.values[child_index]);
             parent.keys[child_index] = right.keys[0];
             parent.values[child_index] = right.values[0];
+            setPrefix(parent, child_index);
             _ = removeItemAt(right, 0);
             branch.counts[child_index] = subtreeCount(child);
             branch.counts[child_index + 1] = subtreeCount(right);
@@ -890,6 +941,9 @@ pub fn Tree(
 
             var total: usize = node.len;
             for (0..node.len + 1) |i| {
+                if (i < node.len and config.use_string_prefix) {
+                    try expectInvariant(branch.prefixes[i] == stringPrefix(node.keys[i]));
+                }
                 const child = branch.children[i] orelse return error.InvariantViolation;
                 const child_lower = if (i == 0) lower else Bound{ .key = node.keys[i - 1], .value = node.values[i - 1] };
                 const child_upper = if (i == node.len) upper else Bound{ .key = node.keys[i], .value = node.values[i] };
@@ -938,6 +992,9 @@ pub fn Tree(
 
             if (node.branch) |branch| {
                 const clone_branch = clone.branch.?;
+                if (config.use_string_prefix) {
+                    for (0..node.len) |i| clone_branch.prefixes[i] = branch.prefixes[i];
+                }
                 for (0..node.len + 1) |i| {
                     clone_branch.children[i] = branch.children[i];
                     clone_branch.counts[i] = branch.counts[i];
@@ -981,6 +1038,13 @@ pub fn Tree(
             try expectInvariant(count == self.len);
         }
 
+        fn stringPrefix(key: []const u8) u64 {
+            var bytes: [8]u8 = [_]u8{0} ** 8;
+            const n = @min(bytes.len, key.len);
+            @memcpy(bytes[0..n], key[0..n]);
+            return mem.readInt(u64, &bytes, .big);
+        }
+
         /// Frees every node owned by the tree and resets it to empty.
         pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             self.releaseNode(gpa, self.root);
@@ -995,7 +1059,7 @@ fn compareTestIntKey(a_key: isize, _: isize, b_key: isize, _: isize) i32 {
 }
 
 test "core nodes allocate and deallocate" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1006,7 +1070,7 @@ test "core nodes allocate and deallocate" {
 }
 
 test "node local search returns lower bound" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1028,7 +1092,7 @@ test "node local search returns lower bound" {
 }
 
 test "insertItemAt shifts items inside a leaf" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1046,7 +1110,7 @@ test "insertItemAt shifts items inside a leaf" {
 }
 
 test "removeItemAt shifts later items left and returns removed entry" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1082,7 +1146,7 @@ test "removeItemAt shifts later items left and returns removed entry" {
 }
 
 test "splitNode promotes the median" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1104,7 +1168,7 @@ test "splitNode promotes the median" {
 }
 
 test "splitRoot promotes the median into a new root" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1129,7 +1193,7 @@ test "splitRoot promotes the median into a new root" {
 }
 
 test "maxEntry returns greatest entry from leaf and internal nodes" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1152,7 +1216,7 @@ test "maxEntry returns greatest entry from leaf and internal nodes" {
 }
 
 test "deleteFromNode removes matching leaf entries" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1173,7 +1237,7 @@ test "deleteFromNode removes matching leaf entries" {
 }
 
 test "rotateFromLeft borrows the left sibling maximum through the parent" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1212,7 +1276,7 @@ test "rotateFromLeft borrows the left sibling maximum through the parent" {
 }
 
 test "rotateFromRight borrows the right sibling minimum through the parent" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1251,7 +1315,7 @@ test "rotateFromRight borrows the right sibling minimum through the parent" {
 }
 
 test "mergeChildren joins adjacent leaves and removes the separator" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1290,7 +1354,7 @@ test "mergeChildren joins adjacent leaves and removes the separator" {
 }
 
 test "rebalanceChild borrows from a left sibling when possible" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1326,7 +1390,7 @@ test "rebalanceChild borrows from a left sibling when possible" {
 }
 
 test "fitsBetween validates index neighbors" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1346,7 +1410,7 @@ test "fitsBetween validates index neighbors" {
 }
 
 test "copy retains the root until both trees release it" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1366,7 +1430,7 @@ test "copy retains the root until both trees release it" {
 }
 
 test "makeUniqueRoot clones a retained root" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -1386,7 +1450,7 @@ test "makeUniqueRoot clones a retained root" {
 }
 
 test "makeUniqueChild clones a retained child" {
-    const IntTree = Tree(isize, isize, compareTestIntKey);
+    const IntTree = Tree(isize, isize, compareTestIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 

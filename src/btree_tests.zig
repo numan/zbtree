@@ -6,6 +6,14 @@ fn compareIntKey(a_key: isize, _: isize, b_key: isize, _: isize) i32 {
     return if (a_key < b_key) -1 else if (a_key > b_key) 1 else 0;
 }
 
+fn compareStringKey(a_key: []const u8, _: usize, b_key: []const u8, _: usize) i32 {
+    return switch (std.mem.order(u8, a_key, b_key)) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+}
+
 const Pair = struct {
     key: isize,
     value: isize,
@@ -43,7 +51,7 @@ fn stopAfter(ctx: *StopAfterContext, _: isize, _: isize) !void {
     ctx.seen += 1;
 }
 test "empty btree has expected constants" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     const tree = IntTree.init();
 
     try testing.expectEqual(64, IntTree.fanout);
@@ -53,8 +61,96 @@ test "empty btree has expected constants" {
     try testing.expect(tree.root == null);
 }
 
+test "string btree can enable prefixes" {
+    const StringTree = btree.Tree([]const u8, usize, compareStringKey, .{ .use_string_prefix = true });
+    var tree = StringTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var buffers: [80][7]u8 = undefined;
+    var keys: [80][]const u8 = undefined;
+    for (&buffers, 0..) |*buffer, i| {
+        buffer.* = .{ 'k', 'e', 'y', '-', @intCast('0' + i / 100), @intCast('0' + i / 10 % 10), @intCast('0' + i % 10) };
+        keys[i] = buffer[0..];
+        try testing.expect(try tree.insert(testing.allocator, keys[i], i));
+    }
+
+    try testing.expectEqual(keys.len, tree.len);
+    try testing.expectEqual(42, tree.get("key-042", 0).?);
+    try testing.expectEqualStrings("key-079", tree.back().?.key);
+    try tree.checkInvariants();
+}
+
+fn fillKey(buffer: []u8, prefix: []const u8, i: usize) []const u8 {
+    std.mem.copyForwards(u8, buffer[0..prefix.len], prefix);
+    buffer[prefix.len] = '-';
+    buffer[prefix.len + 1] = @intCast('0' + i / 100);
+    buffer[prefix.len + 2] = @intCast('0' + i / 10 % 10);
+    buffer[prefix.len + 3] = @intCast('0' + i % 10);
+    return buffer[0 .. prefix.len + 4];
+}
+
+fn insertStringKeys(comptime count: usize, tree: anytype, buffers: *[count][12]u8, prefix: []const u8) !void {
+    for (buffers, 0..) |*buffer, i| {
+        try testing.expect(try tree.insert(testing.allocator, fillKey(buffer[0..], prefix, i), i));
+    }
+}
+
+test "string prefixes route searches across split root" {
+    const StringTree = btree.Tree([]const u8, usize, compareStringKey, .{ .use_string_prefix = true });
+    var tree = StringTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var buffers: [80][12]u8 = undefined;
+    try insertStringKeys(80, &tree, &buffers, "key");
+
+    try testing.expectEqual(0, tree.get("key-000", 0).?);
+    try testing.expectEqual(30, tree.get("key-030", 0).?);
+    try testing.expectEqual(31, tree.get("key-031", 0).?);
+    try testing.expectEqual(32, tree.get("key-032", 0).?);
+    try testing.expectEqual(79, tree.get("key-079", 0).?);
+    try testing.expectEqual(15, tree.indexOf("key-015", 0).?);
+    try testing.expectEqualStrings("key-016", tree.seekNext("key-015", 0).?.key);
+    try tree.checkInvariants();
+}
+
+test "string prefix search falls back to full key on prefix collision" {
+    const StringTree = btree.Tree([]const u8, usize, compareStringKey, .{ .use_string_prefix = true });
+    var tree = StringTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var buffers: [90][12]u8 = undefined;
+    try insertStringKeys(90, &tree, &buffers, "abcdefgh");
+
+    try testing.expectEqual(0, tree.get("abcdefgh-000", 0).?);
+    try testing.expectEqual(44, tree.get("abcdefgh-044", 0).?);
+    try testing.expectEqual(89, tree.get("abcdefgh-089", 0).?);
+    try testing.expectEqualStrings("abcdefgh-045", tree.seek("abcdefgh-045", 0).?.key);
+    try testing.expect(tree.get("abcdefgh-999", 0) == null);
+    try tree.checkInvariants();
+}
+
+test "string prefixes survive copy on write cloning" {
+    const StringTree = btree.Tree([]const u8, usize, compareStringKey, .{ .use_string_prefix = true });
+    var original = StringTree.init();
+    defer original.deinit(testing.allocator);
+
+    var buffers: [81][12]u8 = undefined;
+    try insertStringKeys(80, &original, buffers[0..80], "key");
+
+    var snapshot = original.copy();
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expect(try snapshot.insert(testing.allocator, fillKey(buffers[80][0..], "key", 80), 80));
+
+    try testing.expectEqual(0, snapshot.get("key-000", 0).?);
+    try testing.expectEqual(79, original.get("key-079", 0).?);
+    try testing.expect(original.get("key-080", 0) == null);
+    try snapshot.checkInvariants();
+    try original.checkInvariants();
+}
+
 test "insert rejects duplicate keys" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -66,7 +162,7 @@ test "insert rejects duplicate keys" {
 }
 
 test "replace updates existing value without inserting" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -86,7 +182,7 @@ test "replace updates existing value without inserting" {
 }
 
 test "set inserts missing keys and replaces existing values" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -102,7 +198,7 @@ test "set inserts missing keys and replaces existing values" {
 }
 
 test "set replaces values after node splits without changing counts" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -130,7 +226,7 @@ test "set replaces values after node splits without changing counts" {
 }
 
 test "delete returns null for empty and missing keys" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -147,7 +243,7 @@ test "delete returns null for empty and missing keys" {
 }
 
 test "delete removes leaf keys and resets an empty root" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -170,7 +266,7 @@ test "delete removes leaf keys and resets an empty root" {
 }
 
 test "delete removes internal keys and preserves indexed order" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -203,7 +299,7 @@ test "delete removes internal keys and preserves indexed order" {
 }
 
 test "front and back return null for an empty tree" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -214,7 +310,7 @@ test "front and back return null for an empty tree" {
 }
 
 test "front and back find edge entries after splits" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -235,7 +331,7 @@ test "front and back find edge entries after splits" {
 }
 
 test "pushFront and pushBack enforce edge ordering" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -256,7 +352,7 @@ test "pushFront and pushBack enforce edge ordering" {
 }
 
 test "popFront and popBack remove edge entries" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -285,7 +381,7 @@ test "popFront and popBack remove edge entries" {
 }
 
 test "insertAt inserts only when the item fits at the index" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -307,7 +403,7 @@ test "insertAt inserts only when the item fits at the index" {
 }
 
 test "replaceAt replaces only when the new item fits" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -332,7 +428,7 @@ test "replaceAt replaces only when the new item fits" {
 }
 
 test "deleteAt removes by sorted index" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -357,7 +453,7 @@ test "deleteAt removes by sorted index" {
 }
 
 test "deleteRangeAt removes bounded index ranges" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -384,7 +480,7 @@ test "deleteRangeAt removes bounded index ranges" {
 }
 
 test "deleteAllAt removes everything from an index" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -402,7 +498,7 @@ test "deleteAllAt removes everything from an index" {
 }
 
 test "clear removes all entries and permits reuse" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -423,7 +519,7 @@ test "clear removes all entries and permits reuse" {
 }
 
 test "copy shares reads and diverges after insert" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var original = IntTree.init();
     defer original.deinit(testing.allocator);
 
@@ -449,7 +545,7 @@ test "copy shares reads and diverges after insert" {
 }
 
 test "copy diverges after delete without changing original" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var original = IntTree.init();
     defer original.deinit(testing.allocator);
 
@@ -473,7 +569,7 @@ test "copy diverges after delete without changing original" {
 }
 
 test "clearing one copy leaves the other usable" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var original = IntTree.init();
     defer original.deinit(testing.allocator);
 
@@ -497,7 +593,7 @@ test "clearing one copy leaves the other usable" {
 }
 
 test "insert and get random keys" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -519,7 +615,7 @@ test "insert and get random keys" {
 }
 
 test "random insertion preserves invariants" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -536,7 +632,7 @@ test "random insertion preserves invariants" {
 }
 
 test "ascent visits an empty tree without yielding" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     const tree = IntTree.init();
 
     var seen = CollectContext{};
@@ -547,7 +643,7 @@ test "ascent visits an empty tree without yielding" {
 }
 
 test "ascent yields every item in sorted order" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -573,7 +669,7 @@ test "ascent yields every item in sorted order" {
 }
 
 test "ascent propagates yield errors and stops traversal" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -589,7 +685,7 @@ test "ascent propagates yield errors and stops traversal" {
 }
 
 test "descent visits an empty tree without yielding" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     const tree = IntTree.init();
 
     var seen = CollectContext{};
@@ -600,7 +696,7 @@ test "descent visits an empty tree without yielding" {
 }
 
 test "descent yields every item in reverse sorted order" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -626,7 +722,7 @@ test "descent yields every item in reverse sorted order" {
 }
 
 test "descent propagates yield errors and stops traversal" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -642,7 +738,7 @@ test "descent propagates yield errors and stops traversal" {
 }
 
 test "seek functions handle empty trees and edge positions" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -673,7 +769,7 @@ test "seek functions handle empty trees and edge positions" {
 }
 
 test "getAt and indexOf use subtree counts" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -702,7 +798,7 @@ test "getAt and indexOf use subtree counts" {
 }
 
 test "ascendAt and descendAt start at an index and stop when yield returns false" {
-    const IntTree = btree.Tree(isize, isize, compareIntKey);
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
