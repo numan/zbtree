@@ -102,6 +102,9 @@ pub fn Tree(
 
         const Entry = Bound;
 
+        /// Optional predicate used by conditional edge-pop operations.
+        const PopCond = ?*const fn (K, V) bool;
+
         const Slot = struct {
             node: *Node,
             index: usize,
@@ -783,22 +786,44 @@ pub fn Tree(
             return Entry.init(node.keys[node.len - 1], node.values[node.len - 1]);
         }
 
+        /// Removes and returns the smallest item in sort order if accepted.
+        ///
+        /// Returns `null` when the tree is empty or when `cond` rejects the
+        /// current first item. A `null` predicate pops unconditionally.
+        pub fn popFrontIf(self: *Self, gpa: mem.Allocator, cond: PopCond) !?Entry {
+            const item = self.front() orelse return null;
+            if (cond) |accept| {
+                if (!accept(item.key, item.value)) return null;
+            }
+            _ = try self.delete(gpa, item.key, item.value);
+            return item;
+        }
+
+        /// Removes and returns the greatest item in sort order if accepted.
+        ///
+        /// Returns `null` when the tree is empty or when `cond` rejects the
+        /// current last item. A `null` predicate pops unconditionally.
+        pub fn popBackIf(self: *Self, gpa: mem.Allocator, cond: PopCond) !?Entry {
+            const item = self.back() orelse return null;
+            if (cond) |accept| {
+                if (!accept(item.key, item.value)) return null;
+            }
+            _ = try self.delete(gpa, item.key, item.value);
+            return item;
+        }
+
         /// Removes and returns the smallest item in sort order.
         ///
         /// Returns `null` when the tree is empty.
         pub fn popFront(self: *Self, gpa: mem.Allocator) !?Entry {
-            const item = self.front() orelse return null;
-            _ = try self.delete(gpa, item.key, item.value);
-            return item;
+            return self.popFrontIf(gpa, null);
         }
 
         /// Removes and returns the greatest item in sort order.
         ///
         /// Returns `null` when the tree is empty.
         pub fn popBack(self: *Self, gpa: mem.Allocator) !?Entry {
-            const item = self.back() orelse return null;
-            _ = try self.delete(gpa, item.key, item.value);
-            return item;
+            return self.popBackIf(gpa, null);
         }
 
         /// Inserts `key`/`value` before the current first item.

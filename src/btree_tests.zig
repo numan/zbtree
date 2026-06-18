@@ -50,6 +50,31 @@ fn stopAfter(ctx: *StopAfterContext, _: isize, _: isize) !void {
     if (ctx.seen == ctx.stop_after) return error.StopTraversal;
     ctx.seen += 1;
 }
+
+fn rejectKeyOne(key: isize, value: isize) bool {
+    std.debug.assert(key == 1);
+    std.debug.assert(value == -1);
+    return false;
+}
+
+fn acceptKeyOne(key: isize, value: isize) bool {
+    std.debug.assert(key == 1);
+    std.debug.assert(value == -1);
+    return true;
+}
+
+fn rejectKeyNinetyEight(key: isize, value: isize) bool {
+    std.debug.assert(key == 98);
+    std.debug.assert(value == -98);
+    return false;
+}
+
+fn acceptKeyNinetyEight(key: isize, value: isize) bool {
+    std.debug.assert(key == 98);
+    std.debug.assert(value == -98);
+    return true;
+}
+
 test "empty btree has expected constants" {
     const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
     const tree = IntTree.init();
@@ -378,6 +403,47 @@ test "popFront and popBack remove edge entries" {
     try testing.expectEqual(99, expected_front);
     try testing.expectEqual(0, tree.len);
     try testing.expect(tree.root == null);
+}
+
+test "conditional edge pops only remove accepted entries" {
+    const IntTree = btree.Tree(isize, isize, compareIntKey, .{ .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.popFrontIf(testing.allocator, null) == null);
+    try testing.expect(try tree.popBackIf(testing.allocator, null) == null);
+
+    for (0..100) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    try testing.expectEqual(0, (try tree.popFrontIf(testing.allocator, null)).?.key);
+    try testing.expectEqual(99, (try tree.popBackIf(testing.allocator, null)).?.key);
+    try testing.expectEqual(98, tree.len);
+
+    try testing.expect(try tree.popFrontIf(testing.allocator, &rejectKeyOne) == null);
+    try testing.expectEqual(98, tree.len);
+    try testing.expectEqual(1, tree.front().?.key);
+    try testing.expectEqual(-1, tree.front().?.value);
+
+    const front = (try tree.popFrontIf(testing.allocator, &acceptKeyOne)).?;
+    try testing.expectEqual(1, front.key);
+    try testing.expectEqual(-1, front.value);
+    try testing.expectEqual(97, tree.len);
+    try testing.expectEqual(2, tree.front().?.key);
+
+    try testing.expect(try tree.popBackIf(testing.allocator, &rejectKeyNinetyEight) == null);
+    try testing.expectEqual(97, tree.len);
+    try testing.expectEqual(98, tree.back().?.key);
+    try testing.expectEqual(-98, tree.back().?.value);
+
+    const back = (try tree.popBackIf(testing.allocator, &acceptKeyNinetyEight)).?;
+    try testing.expectEqual(98, back.key);
+    try testing.expectEqual(-98, back.value);
+    try testing.expectEqual(96, tree.len);
+    try testing.expectEqual(97, tree.back().?.key);
+    try tree.checkInvariants();
 }
 
 test "insertAt inserts only when the item fits at the index" {
