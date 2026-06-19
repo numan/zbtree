@@ -169,12 +169,9 @@ pub fn Tree(
             const middle_value = node.values[median];
 
             right.len = @intCast(max_items - median - 1);
-            var i: usize = 0;
-            while (i < right.len) : (i += 1) {
-                const idx = i + median + 1;
-                right.keys[i] = node.keys[idx];
-                right.values[i] = node.values[idx];
-            }
+            const right_items_start = median + 1;
+            @memcpy(right.keys[0..right.len], node.keys[right_items_start..max_items]);
+            @memcpy(right.values[0..right.len], node.values[right_items_start..max_items]);
 
             if (config.use_string_prefix and right.branch != null) {
                 for (0..right.len) |prefix_index| setPrefix(right, prefix_index);
@@ -182,14 +179,10 @@ pub fn Tree(
 
             if (node.branch) |left_branch| {
                 const right_branch = right.branch.?;
-                i = 0;
-                while (i <= right.len) : (i += 1) {
-                    const from = median + i + 1;
-                    right_branch.children[i] = left_branch.children[from];
-                    right_branch.counts[i] = left_branch.counts[from];
-                    left_branch.children[from] = null;
-                    left_branch.counts[from] = 0;
-                }
+                @memcpy(right_branch.children[0 .. right.len + 1], left_branch.children[right_items_start .. max_items + 1]);
+                @memcpy(right_branch.counts[0 .. right.len + 1], left_branch.counts[right_items_start .. max_items + 1]);
+                @memset(left_branch.children[right_items_start .. max_items + 1], null);
+                @memset(left_branch.counts[right_items_start .. max_items + 1], 0);
             }
 
             node.len = @intCast(median);
@@ -254,13 +247,10 @@ pub fn Tree(
         fn insertItemAt(node: *Node, index: usize, key: K, value: V) void {
             std.debug.assert(node.len < max_items);
 
-            var i = node.len;
-            while (i > index) : (i -= 1) {
-                node.keys[i] = node.keys[i - 1];
-                node.values[i] = node.values[i - 1];
-                if (config.use_string_prefix) {
-                    if (node.branch) |b| b.prefixes[i] = b.prefixes[i - 1];
-                }
+            mem.copyBackwards(K, node.keys[index + 1 .. node.len + 1], node.keys[index..node.len]);
+            mem.copyBackwards(V, node.values[index + 1 .. node.len + 1], node.values[index..node.len]);
+            if (config.use_string_prefix) {
+                if (node.branch) |b| std.mem.copyBackwards(u64, b.prefixes[index + 1 .. node.len + 1], b.prefixes[index..node.len]);
             }
 
             node.keys[index] = key;
@@ -275,11 +265,9 @@ pub fn Tree(
             const branch = node.branch.?;
             std.debug.assert(index <= node.len);
 
-            var i = node.len;
-            while (i > index) : (i -= 1) {
-                branch.children[i] = branch.children[i - 1];
-                branch.counts[i] = branch.counts[i - 1];
-            }
+            mem.copyBackwards(?*Node, branch.children[index + 1 .. node.len + 1], branch.children[index..node.len]);
+            mem.copyBackwards(usize, branch.counts[index + 1 .. node.len + 1], branch.counts[index..node.len]);
+
             branch.children[index] = child;
             branch.counts[index] = subtreeCount(child);
         }
@@ -607,14 +595,11 @@ pub fn Tree(
         // Removes and returns the item at `index`, shifting later items left.
         fn removeItemAt(node: *Node, index: usize) Entry {
             const removed = Entry.init(node.keys[index], node.values[index]);
-            var i = index;
 
-            while (i + 1 < node.len) : (i += 1) {
-                node.keys[i] = node.keys[i + 1];
-                node.values[i] = node.values[i + 1];
-                if (config.use_string_prefix) {
-                    if (node.branch) |b| b.prefixes[i] = b.prefixes[i + 1];
-                }
+            mem.copyForwards(K, node.keys[index .. node.len - 1], node.keys[index + 1 .. node.len]);
+            mem.copyForwards(V, node.values[index .. node.len - 1], node.values[index + 1 .. node.len]);
+            if (config.use_string_prefix) {
+                if (node.branch) |b| std.mem.copyForwards(u64, b.prefixes[index .. node.len - 1], b.prefixes[index + 1 .. node.len]);
             }
             node.len -= 1;
             return removed;

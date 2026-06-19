@@ -1,5 +1,7 @@
 const std = @import("std");
-const btree = @import("zbtree_ds").btree;
+const zbtree_ds = @import("zbtree_ds");
+const btree = zbtree_ds.btree;
+const order = zbtree_ds.order;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -19,9 +21,30 @@ pub fn main(init: std.process.Init) !void {
     defer stdout.flush() catch {};
 
     try stdout.print("\nzbtree_ds (Zig)\n", .{});
-    try benchType(i32, "int32", compareI32, .{ .use_string_prefix = false }, options, init.gpa, init.io, stdout);
-    try benchType(u64, "uint64", compareU64, .{ .use_string_prefix = false }, options, init.gpa, init.io, stdout);
-    try benchType([]const u8, "string", compareString, .{ .use_string_prefix = true }, options, init.gpa, init.io, stdout);
+    try benchType(
+        order.OrderedKey(i32, void),
+        "int32",
+        options,
+        init.gpa,
+        init.io,
+        stdout,
+    );
+    try benchType(
+        order.OrderedKey(u64, void),
+        "uint64",
+        options,
+        init.gpa,
+        init.io,
+        stdout,
+    );
+    try benchType(
+        order.OrderedKey([]const u8, void),
+        "string",
+        options,
+        init.gpa,
+        init.io,
+        stdout,
+    );
 }
 
 fn parseOptions(init: std.process.Init, arena: Allocator) !Options {
@@ -61,16 +84,15 @@ fn envUsize(init: std.process.Init, name: []const u8, default: usize) !usize {
 }
 
 fn benchType(
-    comptime K: type,
+    comptime Order: type,
     comptime key_name: []const u8,
-    comptime compare: fn (K, void, K, void) i32,
-    comptime config: btree.TreeConfig,
     options: Options,
     allocator: Allocator,
     io: Io,
     stdout: anytype,
 ) !void {
-    const Tree = btree.Tree(K, void, compare, config);
+    const K = Order.Key;
+    const Tree = btree.Tree(K, void, Order.compare, .{ .use_string_prefix = Order.use_string_prefix });
     const Ctx = BenchContext(K, Tree);
 
     var ctx = Ctx{
@@ -82,10 +104,50 @@ fn benchType(
     defer ctx.deinit();
 
     try stdout.print("Benchmarking {d} items, {s} keys, {d} times, using median\n", .{ options.items, key_name, options.runs });
-    try runBenchmark(Ctx, &ctx, "insert(seq)", options.runs, Ctx.preInsertSeq, Ctx.insertAll, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "insert(rand)", options.runs, Ctx.preInsertRand, Ctx.insertAll, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "get(seq)", options.runs, Ctx.preGetSeq, Ctx.getAll, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "get(rand)", options.runs, Ctx.preGetRand, Ctx.getAll, allocator, io, stdout);
+    try runBenchmark(
+        Ctx,
+        &ctx,
+        "insert(seq)",
+        options.runs,
+        Ctx.preInsertSeq,
+        Ctx.insertAll,
+        allocator,
+        io,
+        stdout,
+    );
+    try runBenchmark(
+        Ctx,
+        &ctx,
+        "insert(rand)",
+        options.runs,
+        Ctx.preInsertRand,
+        Ctx.insertAll,
+        allocator,
+        io,
+        stdout,
+    );
+    try runBenchmark(
+        Ctx,
+        &ctx,
+        "get(seq)",
+        options.runs,
+        Ctx.preGetSeq,
+        Ctx.getAll,
+        allocator,
+        io,
+        stdout,
+    );
+    try runBenchmark(
+        Ctx,
+        &ctx,
+        "get(rand)",
+        options.runs,
+        Ctx.preGetRand,
+        Ctx.getAll,
+        allocator,
+        io,
+        stdout,
+    );
     try stdout.print("\n", .{});
 }
 
@@ -274,22 +336,6 @@ fn decimalLength(value: usize) usize {
     var len: usize = 1;
     while (n >= 10) : (len += 1) n /= 10;
     return len;
-}
-
-fn compareI32(a_key: i32, _: void, b_key: i32, _: void) i32 {
-    return if (a_key < b_key) -1 else if (a_key > b_key) 1 else 0;
-}
-
-fn compareU64(a_key: u64, _: void, b_key: u64, _: void) i32 {
-    return if (a_key < b_key) -1 else if (a_key > b_key) 1 else 0;
-}
-
-fn compareString(a_key: []const u8, _: void, b_key: []const u8, _: void) i32 {
-    return switch (std.mem.order(u8, a_key, b_key)) {
-        .lt => -1,
-        .eq => 0,
-        .gt => 1,
-    };
 }
 
 fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
