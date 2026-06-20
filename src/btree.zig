@@ -407,7 +407,19 @@ pub fn Tree(
         // Inserts into a node that is known not to be full. Returns false when
         // the comparator says an equal item already exists.
         fn insertIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V) !bool {
-            const found = searchNode(node, key, value);
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            return self.insertIntoNonFullWithPrefix(gpa, node, key, value, prefix);
+        }
+
+        fn insertIntoNonFullWithPrefix(
+            self: *Self,
+            gpa: mem.Allocator,
+            node: *Node,
+            key: K,
+            value: V,
+            prefix: u64,
+        ) !bool {
+            const found = searchNodeWithPrefix(node, key, value, prefix);
             if (found.found) return false;
 
             if (node.isLeaf()) {
@@ -425,22 +437,62 @@ pub fn Tree(
                 if (cmp == .lt) child_index += 1;
             }
 
-            const inserted = try self.insertIntoNonFull(gpa, branch.children[child_index].?, key, value);
+            const child = branch.children[child_index].?;
+            if (child.isLeaf()) {
+                const child_found = searchNodeWithPrefix(child, key, value, prefix);
+                if (child_found.found) return false;
+                insertItemAt(child, child_found.index, key, value);
+                branch.counts[child_index] += 1;
+                return true;
+            }
+
+            const inserted = try self.insertIntoNonFullWithPrefix(gpa, child, key, value, prefix);
             if (inserted) branch.counts[child_index] += 1;
             return inserted;
         }
 
-        /// Inserts `key`/`value` if an equal item is not already present.
-        ///
-        /// Returns `true` when a new item was inserted and `false` for a
-        /// duplicate according to `compare`.
+        //TODO: Explore if inlineing this has impact on performance
+        fn insertRightEdgeIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V) !void {
+            if (node.isLeaf()) {
+                insertItemAt(node, node.len, key, value);
+                return;
+            }
+
+            const branch = node.branch.?;
+            var child_index: usize = node.len;
+            try self.makeUniqueChild(gpa, node, child_index);
+            if (branch.children[child_index].?.len == max_items) {
+                try self.splitChild(gpa, node, child_index);
+                child_index += 1;
+            }
+
+            try self.insertRightEdgeIntoNonFull(gpa, branch.children[child_index].?, key, value);
+            branch.counts[child_index] += 1;
+        }
+
         pub fn insert(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
             try self.makeUniqueRoot(gpa);
-            if (self.root == null) self.root = try self.newNode(gpa, true);
+            if (self.root == null) {
+                self.root = try self.newNode(gpa, true);
+                insertItemAt(self.root.?, 0, key, value);
+                self.len = 1;
+                return true;
+            }
+
+            if (self.back()) |last| {
+                const edge_cmp = keyCompare(last.key, last.value, key, value);
+                if (edge_cmp == .eq) return false;
+                if (edge_cmp == .lt) {
+                    if (self.root.?.len == max_items) try self.splitRoot(gpa);
+                    try self.insertRightEdgeIntoNonFull(gpa, self.root.?, key, value);
+                    self.len += 1;
+                    return true;
+                }
+            }
+
             if (self.root.?.len == max_items) try self.splitRoot(gpa);
-
-            const inserted = try self.insertIntoNonFull(gpa, self.root.?, key, value);
-
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const inserted = try self.insertIntoNonFullWithPrefix(gpa, self.root.?, key, value, prefix);
             if (inserted) self.len += 1;
             return inserted;
         }
@@ -1427,6 +1479,73 @@ test "splitRoot promotes the median into a new root" {
     try testing.expectEqual(31, branch.counts[0]);
     try testing.expectEqual(32, branch.children[1].?.keys[0]);
     try testing.expectEqual(31, branch.counts[1]);
+}
+
+test "right edge insert splits a full root and updates child counts" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..IntTree.max_items + 1) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    const root = tree.root.?;
+    const branch = root.branch.?;
+    try testing.expectEqual(1, root.len);
+    try testing.expectEqual(31, root.keys[0]);
+    try testing.expectEqual(31, branch.counts[0]);
+    try testing.expectEqual(32, branch.counts[1]);
+    try testing.expectEqual(IntTree.max_items + 1, tree.len);
+    try testing.expectEqual(@as(isize, @intCast(IntTree.max_items)), tree.back().?.key);
+    try tree.checkInvariants();
+}
+
+test "right edge insert splits a full rightmost child" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const parent = try tree.newNode(testing.allocator, false);
+    const left = try tree.newNode(testing.allocator, true);
+    const right = try tree.newNode(testing.allocator, true);
+    tree.root = parent;
+
+    for (0..31) |i| {
+        left.keys[i] = @intCast(i);
+        left.values[i] = -@as(isize, @intCast(i));
+    }
+    left.len = 31;
+
+    for (0..IntTree.max_items) |i| {
+        const key: isize = @intCast(32 + i);
+        right.keys[i] = key;
+        right.values[i] = -key;
+    }
+    right.len = IntTree.max_items;
+
+    parent.keys[0] = 31;
+    parent.values[0] = -31;
+    parent.len = 1;
+    parent.branch.?.children[0] = left;
+    parent.branch.?.children[1] = right;
+    parent.branch.?.counts[0] = IntTree.subtreeCount(left);
+    parent.branch.?.counts[1] = IntTree.subtreeCount(right);
+    tree.len = 95;
+
+    try tree.insertRightEdgeIntoNonFull(testing.allocator, parent, 95, -95);
+    tree.len += 1;
+
+    const branch = parent.branch.?;
+    try testing.expectEqual(2, parent.len);
+    try testing.expectEqual(31, parent.keys[0]);
+    try testing.expectEqual(63, parent.keys[1]);
+    try testing.expectEqual(31, branch.counts[0]);
+    try testing.expectEqual(31, branch.counts[1]);
+    try testing.expectEqual(32, branch.counts[2]);
+    try testing.expectEqual(95, branch.children[2].?.keys[31]);
+    try tree.checkInvariants();
 }
 
 test "maxEntry returns greatest entry from leaf and internal nodes" {

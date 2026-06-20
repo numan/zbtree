@@ -225,6 +225,68 @@ test "string prefixes survive copy on write cloning" {
     try original.checkInvariants();
 }
 
+test "append-only inserts preserve indexes after repeated right-edge splits" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..2000) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+        if (i % 127 == 0) try tree.checkInvariants();
+    }
+
+    try testing.expectEqual(2000, tree.len);
+    try testing.expectEqual(0, tree.front().?.key);
+    try testing.expectEqual(1999, tree.back().?.key);
+    for (0..2000) |i| {
+        const key: isize = @intCast(i);
+        const entry = tree.getAt(i).?;
+        try testing.expectEqual(key, entry.key);
+        try testing.expectEqual(-key, entry.value);
+        try testing.expectEqual(i, tree.indexOf(key, 0).?);
+    }
+    try tree.checkInvariants();
+}
+
+test "append-only string inserts preserve prefix routing after splits" {
+    const StringTree = btree.Tree([]const u8, usize, .{ .compare = compareStringKey, .use_string_prefix = true });
+    var tree = StringTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var buffers: [256][12]u8 = undefined;
+    try insertStringKeys(256, &tree, &buffers, "key");
+
+    try testing.expectEqual(256, tree.len);
+    try testing.expectEqualStrings("key-000", tree.front().?.key);
+    try testing.expectEqualStrings("key-255", tree.back().?.key);
+    for (0..256) |i| {
+        var expected_buffer: [12]u8 = undefined;
+        const expected = fillKey(expected_buffer[0..], "key", i);
+        try testing.expectEqualStrings(expected, tree.getAt(i).?.key);
+        try testing.expectEqual(i, tree.indexOf(expected, 0).?);
+        try testing.expectEqual(i, tree.get(expected, 0).?);
+    }
+    try tree.checkInvariants();
+}
+
+test "right-edge duplicate insert is rejected after splits" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..80) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    try testing.expect(!try tree.insert(testing.allocator, 79, 7900));
+    try testing.expectEqual(80, tree.len);
+    try testing.expectEqual(790, tree.get(79, 0).?);
+    try testing.expectEqual(79, tree.back().?.key);
+    try tree.checkInvariants();
+}
+
 test "insert rejects duplicate keys" {
     const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
     var tree = IntTree.init();
