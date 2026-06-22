@@ -693,6 +693,55 @@ pub fn Tree(
             }
         }
 
+        fn visitAscFrom(
+            comptime CtxType: type,
+            node: *const Node,
+            index: usize,
+            ctx: CtxType,
+            comptime yield: fn (CtxType, K, V) anyerror!bool,
+        ) !bool {
+            if (node.isLeaf()) {
+                for (index..node.len) |i| {
+                    if (!try yield(ctx, node.keys[i], node.values[i])) return false;
+                }
+                return true;
+            }
+
+            const branch = node.branch.?;
+            var remaining = index;
+            var started = false;
+
+            for (0..node.len) |i| {
+                const child_count = branch.counts[i];
+                if (!started) {
+                    if (remaining < child_count) {
+                        if (!try visitAscFrom(CtxType, branch.children[i].?, remaining, ctx, yield)) return false;
+                        started = true;
+                    } else {
+                        remaining -= child_count;
+                    }
+                } else {
+                    if (!try visitAscFrom(CtxType, branch.children[i].?, 0, ctx, yield)) return false;
+                }
+
+                if (!started) {
+                    if (remaining == 0) {
+                        started = true;
+                    } else {
+                        remaining -= 1;
+                    }
+                }
+
+                if (started and !try yield(ctx, node.keys[i], node.values[i])) return false;
+            }
+
+            if (!started) {
+                return visitAscFrom(CtxType, branch.children[node.len].?, remaining, ctx, yield);
+            }
+
+            return visitAscFrom(CtxType, branch.children[node.len].?, 0, ctx, yield);
+        }
+
         /// Visits items in ascending order starting at sorted position `index`.
         ///
         /// The callback returns `true` to continue or `false` to stop early.
@@ -704,11 +753,8 @@ pub fn Tree(
             context: CtxType,
             comptime yield: fn (CtxType, K, V) anyerror!bool,
         ) !void {
-            var i = index;
-            while (i < self.len) : (i += 1) {
-                const entry = self.getAt(i).?;
-                if (!try yield(context, entry.key, entry.value)) return;
-            }
+            if (index >= self.len) return;
+            _ = try visitAscFrom(CtxType, self.root.?, index, context, yield);
         }
 
         /// Visits items in descending order starting at sorted position `index`.
@@ -725,8 +771,8 @@ pub fn Tree(
             if (self.len == 0 or index >= self.len) return;
             var i = index;
             while (true) {
-                const entry = self.getAt(i).?;
-                if (!try yield(context, entry.key, entry.value)) return;
+                const item = self.getAt(i).?;
+                if (!try yield(context, item.key, item.value)) return;
                 if (i == 0) break;
                 i -= 1;
             }
@@ -1181,8 +1227,8 @@ pub fn Tree(
             if (config.use_string_prefix) {
                 mem.copyForwards(u64, branch.prefixes[child_index .. node.len - 1], branch.prefixes[child_index + 1 .. node.len]);
             }
-            mem.copyForwards(?*Node, branch.children[child_index .. node.len], branch.children[child_index + 1 .. node.len + 1]);
-            mem.copyForwards(usize, branch.counts[child_index .. node.len], branch.counts[child_index + 1 .. node.len + 1]);
+            mem.copyForwards(?*Node, branch.children[child_index..node.len], branch.children[child_index + 1 .. node.len + 1]);
+            mem.copyForwards(usize, branch.counts[child_index..node.len], branch.counts[child_index + 1 .. node.len + 1]);
 
             branch.children[node.len] = null;
             branch.counts[node.len] = 0;
@@ -1203,8 +1249,8 @@ pub fn Tree(
             if (config.use_string_prefix) {
                 mem.copyForwards(u64, branch.prefixes[index .. node.len - 1], branch.prefixes[index + 1 .. node.len]);
             }
-            mem.copyForwards(?*Node, branch.children[child_index .. node.len], branch.children[child_index + 1 .. node.len + 1]);
-            mem.copyForwards(usize, branch.counts[child_index .. node.len], branch.counts[child_index + 1 .. node.len + 1]);
+            mem.copyForwards(?*Node, branch.children[child_index..node.len], branch.children[child_index + 1 .. node.len + 1]);
+            mem.copyForwards(usize, branch.counts[child_index..node.len], branch.counts[child_index + 1 .. node.len + 1]);
 
             branch.children[node.len] = null;
             branch.counts[node.len] = 0;
