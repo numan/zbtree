@@ -1014,11 +1014,8 @@ pub fn Tree(
         /// current first item. A `null` predicate pops unconditionally.
         pub fn popFrontIf(self: *Self, gpa: mem.Allocator, cond: PopCond) !?Entry {
             const item = self.front() orelse return null;
-            if (cond) |accept| {
-                if (!accept(item.key, item.value)) return null;
-            }
-            _ = try self.delete(gpa, item.key, item.value);
-            return item;
+            if (cond) |accept| if (!accept(item.key, item.value)) return null;
+            return self.deleteAt(gpa, 0);
         }
 
         /// Removes and returns the greatest item in sort order if accepted.
@@ -1027,11 +1024,8 @@ pub fn Tree(
         /// current last item. A `null` predicate pops unconditionally.
         pub fn popBackIf(self: *Self, gpa: mem.Allocator, cond: PopCond) !?Entry {
             const item = self.back() orelse return null;
-            if (cond) |accept| {
-                if (!accept(item.key, item.value)) return null;
-            }
-            _ = try self.delete(gpa, item.key, item.value);
-            return item;
+            if (cond) |accept| if (!accept(item.key, item.value)) return null;
+            return self.deleteAt(gpa, self.len - 1);
         }
 
         /// Removes and returns the smallest item in sort order.
