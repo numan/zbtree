@@ -739,6 +739,144 @@ test "deleteRangeAt removes bounded index ranges" {
     try tree.checkInvariants();
 }
 
+test "deleteRange removes key-bounded ranges" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expectEqual(0, try tree.deleteRange(testing.allocator, 20, 0, 30, 0, .{}));
+
+    for (0..120) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    try testing.expectEqual(10, try tree.deleteRange(testing.allocator, 20, 0, 30, 0, .{}));
+    try testing.expectEqual(110, tree.len);
+    try testing.expectEqual(19, tree.getAt(19).?.key);
+    try testing.expectEqual(30, tree.getAt(20).?.key);
+    for (20..30) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(tree.get(key, 0) == null);
+    }
+
+    try testing.expectEqual(10, try tree.deleteRange(testing.allocator, 40, 0, 50, 0, .{ .min_exclusive = true, .max_inclusive = true }));
+    try testing.expectEqual(100, tree.len);
+    try testing.expectEqual(-40, tree.get(40, 0).?);
+    try testing.expectEqual(-51, tree.get(51, 0).?);
+    for (41..51) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(tree.get(key, 0) == null);
+    }
+
+    try testing.expectEqual(0, try tree.deleteRange(testing.allocator, 90, 0, 80, 0, .{}));
+    try testing.expectEqual(0, try tree.deleteRange(testing.allocator, 200, 0, 300, 0, .{ .max_inclusive = true }));
+    try testing.expectEqual(100, tree.len);
+    try tree.checkInvariants();
+}
+
+test "deleteRange uses lower bounds for missing endpoints" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..100) |i| {
+        const key: isize = @intCast(i * 2);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    try testing.expectEqual(5, try tree.deleteRange(testing.allocator, 15, 0, 25, 0, .{ .min_exclusive = true, .max_inclusive = true }));
+    for ([_]isize{ 16, 18, 20, 22, 24 }) |key| {
+        try testing.expect(tree.get(key, 0) == null);
+    }
+    try testing.expectEqual(-14, tree.get(14, 0).?);
+    try testing.expectEqual(-26, tree.get(26, 0).?);
+
+    try testing.expectEqual(3, try tree.deleteRange(testing.allocator, -5, 0, 5, 0, .{ .max_inclusive = true }));
+    for ([_]isize{ 0, 2, 4 }) |key| {
+        try testing.expect(tree.get(key, 0) == null);
+    }
+    try testing.expectEqual(-6, tree.get(6, 0).?);
+
+    try testing.expectEqual(2, try tree.deleteRange(testing.allocator, 195, 0, 250, 0, .{}));
+    try testing.expect(tree.get(196, 0) == null);
+    try testing.expect(tree.get(198, 0) == null);
+    try testing.expectEqual(90, tree.len);
+    try tree.checkInvariants();
+}
+
+test "deleteRange honors value tie breakers" {
+    const MultiTree = btree.Tree(isize, isize, .{ .compare = compareIntKeyThenValue, .use_string_prefix = false });
+    var tree = MultiTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.insert(testing.allocator, 9, 90));
+    for (0..10) |i| {
+        const value: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, 10, value));
+    }
+    try testing.expect(try tree.insert(testing.allocator, 11, 110));
+
+    try testing.expectEqual(5, try tree.deleteRange(testing.allocator, 10, 2, 10, 7, .{}));
+    for ([_]isize{ 2, 3, 4, 5, 6 }) |value| {
+        try testing.expect(tree.indexOf(10, value) == null);
+    }
+    for ([_]isize{ 0, 1, 7, 8, 9 }, [_]usize{ 1, 2, 3, 4, 5 }) |value, index| {
+        try testing.expectEqual(index, tree.indexOf(10, value).?);
+    }
+
+    try testing.expectEqual(2, try tree.deleteRange(testing.allocator, 10, 7, 10, 8, .{ .max_inclusive = true }));
+    try testing.expect(tree.indexOf(10, 7) == null);
+    try testing.expect(tree.indexOf(10, 8) == null);
+    try testing.expectEqual(5, tree.len);
+    try testing.expectEqual(9, tree.front().?.key);
+    try testing.expectEqual(11, tree.back().?.key);
+    try tree.checkInvariants();
+}
+
+test "deleteRange honors key_only ordering" {
+    const KeyOnlyTree = btree.Tree(isize, isize, .{ .compare = compareIntKeyThenValue, .use_string_prefix = false, .key_only = true });
+    var tree = KeyOnlyTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..10) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    try testing.expectEqual(4, try tree.deleteRange(testing.allocator, 3, 999, 6, -999, .{ .max_inclusive = true }));
+    for (3..7) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(tree.get(key, 0) == null);
+    }
+    try testing.expectEqual(6, tree.len);
+    try testing.expectEqual(20, tree.get(2, 999).?);
+    try testing.expectEqual(70, tree.get(7, -999).?);
+    try tree.checkInvariants();
+}
+
+test "deleteRange works with string prefix routing" {
+    const StringTree = btree.Tree([]const u8, usize, .{ .compare = compareStringKey, .use_string_prefix = true });
+    var tree = StringTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var buffers: [128][12]u8 = undefined;
+    try insertStringKeys(128, &tree, &buffers, "abcdefgh");
+
+    try testing.expectEqual(66, try tree.deleteRange(testing.allocator, "abcdefgh-031", 0, "abcdefgh-096", 0, .{ .max_inclusive = true }));
+    try testing.expectEqual(62, tree.len);
+    try testing.expectEqualStrings("abcdefgh-030", tree.getAt(30).?.key);
+    try testing.expectEqualStrings("abcdefgh-097", tree.getAt(31).?.key);
+    for (31..97) |i| {
+        var key_buffer: [12]u8 = undefined;
+        const key = fillKey(key_buffer[0..], "abcdefgh", i);
+        try testing.expect(tree.get(key, 0) == null);
+    }
+    try testing.expectEqual(30, tree.get("abcdefgh-030", 0).?);
+    try testing.expectEqual(97, tree.get("abcdefgh-097", 0).?);
+    try tree.checkInvariants();
+}
+
 test "deleteAllAt removes everything from an index" {
     const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
     var tree = IntTree.init();

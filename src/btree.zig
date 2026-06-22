@@ -128,12 +128,28 @@ pub fn Tree(
             key: K,
             value: V,
 
-            pub fn init(key: K, value: V) @This() {
+            fn init(key: K, value: V) @This() {
                 return .{ .key = key, .value = value };
             }
         };
 
-        const Entry = Bound;
+        const RankResult = struct {
+            index: usize,
+            found: bool,
+
+            fn init(index: usize, found: bool) RankResult {
+                return .{ .index = index, .found = found };
+            }
+        };
+
+        const Entry = struct {
+            key: K,
+            value: V,
+
+            fn init(key: K, value: V) @This() {
+                return .{ .key = key, .value = value };
+            }
+        };
 
         /// Optional predicate used by conditional edge-pop operations.
         const PopCond = ?*const fn (K, V) bool;
@@ -1160,6 +1176,21 @@ pub fn Tree(
             return removed;
         }
 
+        fn rankOf(self: *const Self, key: K, value: V) RankResult {
+            var node = self.root orelse return RankResult.init(0, false);
+            var skipped: usize = 0;
+
+            while (true) {
+                const found = searchNode(node, key, value);
+                if (node.isLeaf()) return RankResult.init(found.index + skipped, found.found);
+
+                const branch = node.branch.?;
+                for (0..found.index) |i| skipped += branch.counts[i] + 1;
+                if (found.found) return RankResult.init(skipped + branch.counts[found.index], true);
+
+                node = branch.children[found.index].?;
+            }
+        }
         /// Removes up to `count` items starting at sorted position `index`.
         ///
         /// Returns the number of items removed. Ranges past the end are
@@ -1167,12 +1198,35 @@ pub fn Tree(
         pub fn deleteRangeAt(self: *Self, gpa: mem.Allocator, index: usize, count: usize) !usize {
             if (index >= self.len or count == 0) return 0;
 
-            var removed: usize = 0;
             const limit = @min(count, self.len - index);
+
+            var removed: usize = 0;
             while (removed < limit) : (removed += 1) {
                 _ = try self.deleteAt(gpa, index);
             }
             return removed;
+        }
+
+        pub fn deleteRange(
+            self: *Self,
+            gpa: mem.Allocator,
+            min_key: K,
+            min_value: V,
+            max_key: K,
+            max_value: V,
+            opts: DeleteRangeOptions,
+        ) !usize {
+            const min_rank = self.rankOf(min_key, min_value);
+            const max_rank = self.rankOf(max_key, max_value);
+
+            var start = min_rank.index;
+            if (opts.min_exclusive and min_rank.found) start += 1;
+
+            var end = max_rank.index;
+            if (opts.max_inclusive and max_rank.found) end += 1;
+
+            if (end <= start) return 0;
+            return self.deleteRangeAt(gpa, start, end - start);
         }
 
         /// Removes every item and releases all nodes owned by this tree.
