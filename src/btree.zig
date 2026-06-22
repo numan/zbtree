@@ -846,12 +846,20 @@ pub fn Tree(
             if (child.len >= min_items) return;
 
             if (child_index > 0 and branch.children[child_index - 1].?.len > min_items) {
+                try self.makeUniqueChild(gpa, parent, child_index - 1);
+                try self.makeUniqueChild(gpa, parent, child_index);
                 rotateFromLeft(parent, child_index);
             } else if (child_index < parent.len and branch.children[child_index + 1].?.len > min_items) {
+                try self.makeUniqueChild(gpa, parent, child_index);
+                try self.makeUniqueChild(gpa, parent, child_index + 1);
                 rotateFromRight(parent, child_index);
             } else if (child_index > 0) {
+                try self.makeUniqueChild(gpa, parent, child_index - 1);
+                try self.makeUniqueChild(gpa, parent, child_index);
                 self.mergeChildren(gpa, parent, child_index - 1);
             } else {
+                try self.makeUniqueChild(gpa, parent, child_index);
+                try self.makeUniqueChild(gpa, parent, child_index + 1);
                 self.mergeChildren(gpa, parent, child_index);
             }
         }
@@ -1020,30 +1028,136 @@ pub fn Tree(
             return self.insert(gpa, key, value);
         }
 
+        fn fitsReplacementAt(self: *const Self, index: usize, key: K, value: V) bool {
+            if (index > 0) {
+                const previous = self.getAt(index - 1).?;
+                const cmp = keyCompare(previous.key, previous.value, key, value);
+                if (cmp == .eq or cmp == .gt) return false;
+            }
+            if (index + 1 < self.len) {
+                const next = self.getAt(index + 1).?;
+                const cmp = keyCompare(key, value, next.key, next.value);
+                if (cmp == .eq or cmp == .gt) return false;
+            }
+            return true;
+        }
+
+        fn replaceAtInNode(self: *Self, gpa: mem.Allocator, node: *Node, index: usize, key: K, value: V) !Entry {
+            if (node.isLeaf()) {
+                const old = Entry.init(node.keys[index], node.values[index]);
+                node.keys[index] = key;
+                node.values[index] = value;
+                return old;
+            }
+
+            const branch = node.branch.?;
+            var remaining = index;
+            for (0..node.len) |i| {
+                const child_count = branch.counts[i];
+                if (remaining < child_count) {
+                    try self.makeUniqueChild(gpa, node, i);
+                    return self.replaceAtInNode(gpa, branch.children[i].?, remaining, key, value);
+                }
+                remaining -= child_count;
+                if (remaining == 0) {
+                    const old = Entry.init(node.keys[i], node.values[i]);
+                    node.keys[i] = key;
+                    node.values[i] = value;
+                    setPrefix(node, i);
+                    return old;
+                }
+                remaining -= 1;
+            }
+
+            try self.makeUniqueChild(gpa, node, node.len);
+            return self.replaceAtInNode(gpa, branch.children[node.len].?, remaining, key, value);
+        }
+
         /// Replaces the item at sorted position `index`.
         ///
         /// Returns the old entry on success, or `null` if `index` is out of
         /// range or the replacement does not fit between its neighbors.
         pub fn replaceAt(self: *Self, gpa: mem.Allocator, index: usize, key: K, value: V) !?Entry {
             if (index >= self.len) return null;
-            const old = self.getAt(index).?;
-            _ = try self.delete(gpa, old.key, old.value);
-            if (!self.fitsBetween(index, key, value)) {
-                _ = try self.insert(gpa, old.key, old.value);
-                return null;
+            if (!self.fitsReplacementAt(index, key, value)) return null;
+            try self.makeUniqueRoot(gpa);
+            return try self.replaceAtInNode(gpa, self.root.?, index, key, value);
+        }
+
+        fn collapseRootIfNeeded(self: *Self, gpa: mem.Allocator) void {
+            const root = self.root orelse return;
+            if (root.len != 0) return;
+
+            if (root.branch) |branch| {
+                self.root = branch.children[0];
+                branch.children[0] = null;
+            } else {
+                self.root = null;
+            }
+            self.destroyNode(gpa, root);
+        }
+
+        fn deleteMaxFromNode(self: *Self, gpa: mem.Allocator, node: *Node) !Entry {
+            if (node.isLeaf()) return removeItemAt(node, node.len - 1);
+
+            const branch = node.branch.?;
+            const child_index = node.len;
+            try self.makeUniqueChild(gpa, node, child_index);
+            const removed = try self.deleteMaxFromNode(gpa, branch.children[child_index].?);
+            branch.counts[child_index] -= 1;
+            try self.rebalanceChild(gpa, node, child_index);
+            return removed;
+        }
+
+        fn deleteAtFromNode(self: *Self, gpa: mem.Allocator, node: *Node, index: usize) !Entry {
+            if (node.isLeaf()) return removeItemAt(node, index);
+
+            const branch = node.branch.?;
+            var remaining = index;
+            for (0..node.len) |i| {
+                const child_count = branch.counts[i];
+                if (remaining < child_count) {
+                    try self.makeUniqueChild(gpa, node, i);
+                    const removed = try self.deleteAtFromNode(gpa, branch.children[i].?, remaining);
+                    branch.counts[i] -= 1;
+                    try self.rebalanceChild(gpa, node, i);
+                    return removed;
+                }
+
+                remaining -= child_count;
+
+                if (remaining == 0) {
+                    try self.makeUniqueChild(gpa, node, i);
+                    const old = Entry.init(node.keys[i], node.values[i]);
+                    const replacement = try self.deleteMaxFromNode(gpa, branch.children[i].?);
+                    branch.counts[i] -= 1;
+                    node.keys[i] = replacement.key;
+                    node.values[i] = replacement.value;
+                    setPrefix(node, i);
+                    try self.rebalanceChild(gpa, node, i);
+                    return old;
+                }
+                remaining -= 1;
             }
 
-            _ = try self.insert(gpa, key, value);
-            return old;
+            const child_index = node.len;
+            try self.makeUniqueChild(gpa, node, child_index);
+            const removed = try self.deleteAtFromNode(gpa, branch.children[child_index].?, remaining);
+            branch.counts[child_index] -= 1;
+            try self.rebalanceChild(gpa, node, child_index);
+            return removed;
         }
 
         /// Removes and returns the item at sorted position `index`.
         ///
         /// Returns `null` when `index` is out of range.
         pub fn deleteAt(self: *Self, gpa: mem.Allocator, index: usize) !?Entry {
-            const item = self.getAt(index) orelse return null;
-            _ = try self.delete(gpa, item.key, item.value);
-            return item;
+            if (index >= self.len) return null;
+            try self.makeUniqueRoot(gpa);
+            const removed = try self.deleteAtFromNode(gpa, self.root.?, index);
+            self.len -= 1;
+            self.collapseRootIfNeeded(gpa);
+            return removed;
         }
 
         /// Removes up to `count` items starting at sorted position `index`.
@@ -1832,6 +1946,141 @@ test "fitsBetween validates index neighbors" {
     try testing.expect(!tree.fitsBetween(1, 30, 3000));
     try testing.expect(tree.fitsBetween(3, 40, 400));
     try testing.expect(!tree.fitsBetween(3, 25, 250));
+}
+
+test "replaceAt updates leaf and internal positions without reordering" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..150) |i| {
+        const key: isize = @intCast(i * 10);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    const first = (try tree.replaceAt(testing.allocator, 0, -5, 5)).?;
+    try testing.expectEqual(0, first.key);
+    try testing.expectEqual(150, tree.len);
+    try testing.expectEqual(-5, tree.getAt(0).?.key);
+
+    const separator = (try tree.replaceAt(testing.allocator, 32, 315, -315)).?;
+    try testing.expectEqual(320, separator.key);
+    try testing.expectEqual(315, tree.getAt(32).?.key);
+    try testing.expect(tree.indexOf(320, 0) == null);
+    try testing.expectEqual(-315, tree.get(315, 0).?);
+
+    const last_index = tree.len - 1;
+    const last = (try tree.replaceAt(testing.allocator, last_index, 2000, -2000)).?;
+    try testing.expectEqual(1490, last.key);
+    try testing.expectEqual(2000, tree.getAt(last_index).?.key);
+
+    try testing.expect((try tree.replaceAt(testing.allocator, 1, -5, 0)) == null);
+    try testing.expect((try tree.replaceAt(testing.allocator, 1, 315, 0)) == null);
+    try testing.expect((try tree.replaceAt(testing.allocator, tree.len, 3000, 0)) == null);
+    try testing.expectEqual(150, tree.len);
+    try tree.checkInvariants();
+}
+
+test "replaceAt refreshes prefixes for internal string keys" {
+    const StringTree = Tree([]const u8, usize, .{ .compare = compareTestStringKey, .use_string_prefix = true });
+    var tree = StringTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var keys: [150][7]u8 = undefined;
+    for (0..keys.len) |i| {
+        const key = try std.fmt.bufPrint(&keys[i], "key-{d:0>3}", .{i});
+        try testing.expect(try tree.insert(testing.allocator, key, i));
+    }
+
+    const replaced = (try tree.replaceAt(testing.allocator, 31, "key-031a", 3100)).?;
+    try testing.expectEqualStrings("key-031", replaced.key);
+    try testing.expectEqualStrings("key-031a", tree.getAt(31).?.key);
+    try tree.checkInvariants();
+}
+
+test "deleteAt removes leaf separator and edge entries" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..200) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    const separator = (try tree.deleteAt(testing.allocator, 31)).?;
+    try testing.expectEqual(31, separator.key);
+    try testing.expectEqual(-31, separator.value);
+    try testing.expectEqual(199, tree.len);
+    try testing.expect(tree.indexOf(31, 0) == null);
+    try testing.expectEqual(32, tree.getAt(31).?.key);
+
+    const first = (try tree.deleteAt(testing.allocator, 0)).?;
+    try testing.expectEqual(0, first.key);
+    try testing.expectEqual(1, tree.front().?.key);
+
+    const last = (try tree.deleteAt(testing.allocator, tree.len - 1)).?;
+    try testing.expectEqual(199, last.key);
+    try testing.expectEqual(198, tree.back().?.key);
+
+    var expected: isize = 1;
+    for (0..tree.len) |i| {
+        if (expected == 31) expected += 1;
+        try testing.expectEqual(expected, tree.getAt(i).?.key);
+        expected += 1;
+    }
+    try testing.expect((try tree.deleteAt(testing.allocator, tree.len)) == null);
+    try tree.checkInvariants();
+}
+
+test "deleteAt collapses the root after removing every item" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..70) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    for (0..70) |i| {
+        const removed = (try tree.deleteAt(testing.allocator, 0)).?;
+        try testing.expectEqual(@as(isize, @intCast(i)), removed.key);
+        try tree.checkInvariants();
+    }
+
+    try testing.expectEqual(0, tree.len);
+    try testing.expect(tree.root == null);
+    try testing.expect((try tree.deleteAt(testing.allocator, 0)) == null);
+}
+
+test "replaceAt and deleteAt clone copy-on-write paths" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..150) |i| {
+        const key: isize = @intCast(i * 10);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    var copy = tree.copy();
+    defer copy.deinit(testing.allocator);
+
+    const replaced = (try copy.replaceAt(testing.allocator, 40, 405, -405)).?;
+    try testing.expectEqual(400, replaced.key);
+    try testing.expectEqual(400, tree.getAt(40).?.key);
+    try testing.expectEqual(405, copy.getAt(40).?.key);
+
+    const removed = (try copy.deleteAt(testing.allocator, 40)).?;
+    try testing.expectEqual(405, removed.key);
+    try testing.expectEqual(150, tree.len);
+    try testing.expectEqual(149, copy.len);
+    try testing.expectEqual(400, tree.getAt(40).?.key);
+    try testing.expectEqual(410, copy.getAt(40).?.key);
+
+    try tree.checkInvariants();
+    try copy.checkInvariants();
 }
 
 test "copy retains the root until both trees release it" {
