@@ -895,6 +895,55 @@ test "deleteAllAt removes everything from an index" {
     try tree.checkInvariants();
 }
 
+test "deleteRangeAt removes all entries after splits" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..2000) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    try testing.expectEqual(2000, try tree.deleteRangeAt(testing.allocator, 0, 2000));
+    try testing.expectEqual(0, tree.len);
+    try testing.expect(tree.root == null);
+    try tree.checkInvariants();
+
+    try testing.expect(try tree.insert(testing.allocator, 7, 70));
+    try testing.expectEqual(70, tree.get(7, 0).?);
+}
+
+test "deleteRange clones copy-on-write paths before removing subtrees" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var original = IntTree.init();
+    defer original.deinit(testing.allocator);
+
+    for (0..2000) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try original.insert(testing.allocator, key, -key));
+    }
+
+    var copy = original.copy();
+    defer copy.deinit(testing.allocator);
+
+    try testing.expectEqual(1000, try copy.deleteRange(testing.allocator, 500, 0, 1500, 0, .{}));
+    try testing.expectEqual(1000, copy.len);
+    try testing.expectEqual(2000, original.len);
+
+    for (0..2000) |i| {
+        const key: isize = @intCast(i);
+        try testing.expectEqual(-key, original.get(key, 0).?);
+        if (i >= 500 and i < 1500) {
+            try testing.expect(copy.get(key, 0) == null);
+        }
+    }
+    try testing.expectEqual(-499, copy.get(499, 0).?);
+    try testing.expectEqual(-1500, copy.get(1500, 0).?);
+    try original.checkInvariants();
+    try copy.checkInvariants();
+}
+
 test "clear removes all entries and permits reuse" {
     const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
     var tree = IntTree.init();

@@ -856,27 +856,31 @@ pub fn Tree(
         // Restores the minimum size rule for `parent`'s child at `child_index`
         // by borrowing from a sibling when possible or merging siblings.
         fn rebalanceChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
-            const branch = parent.branch.?;
-            const child = branch.children[child_index].?;
+            while (parent.len > 0) {
+                const branch = parent.branch.?;
+                const child = branch.children[child_index].?;
 
-            if (child.len >= min_items) return;
+                if (child.len >= min_items) return;
 
-            if (child_index > 0 and branch.children[child_index - 1].?.len > min_items) {
-                try self.makeUniqueChild(gpa, parent, child_index - 1);
-                try self.makeUniqueChild(gpa, parent, child_index);
-                rotateFromLeft(parent, child_index);
-            } else if (child_index < parent.len and branch.children[child_index + 1].?.len > min_items) {
-                try self.makeUniqueChild(gpa, parent, child_index);
-                try self.makeUniqueChild(gpa, parent, child_index + 1);
-                rotateFromRight(parent, child_index);
-            } else if (child_index > 0) {
-                try self.makeUniqueChild(gpa, parent, child_index - 1);
-                try self.makeUniqueChild(gpa, parent, child_index);
-                self.mergeChildren(gpa, parent, child_index - 1);
-            } else {
-                try self.makeUniqueChild(gpa, parent, child_index);
-                try self.makeUniqueChild(gpa, parent, child_index + 1);
-                self.mergeChildren(gpa, parent, child_index);
+                if (child_index > 0 and branch.children[child_index - 1].?.len > min_items) {
+                    try self.makeUniqueChild(gpa, parent, child_index - 1);
+                    try self.makeUniqueChild(gpa, parent, child_index);
+                    rotateFromLeft(parent, child_index);
+                } else if (child_index < parent.len and branch.children[child_index + 1].?.len > min_items) {
+                    try self.makeUniqueChild(gpa, parent, child_index);
+                    try self.makeUniqueChild(gpa, parent, child_index + 1);
+                    rotateFromRight(parent, child_index);
+                } else if (child_index > 0) {
+                    try self.makeUniqueChild(gpa, parent, child_index - 1);
+                    try self.makeUniqueChild(gpa, parent, child_index);
+                    self.mergeChildren(gpa, parent, child_index - 1);
+                    return;
+                } else {
+                    try self.makeUniqueChild(gpa, parent, child_index);
+                    try self.makeUniqueChild(gpa, parent, child_index + 1);
+                    self.mergeChildren(gpa, parent, child_index);
+                    return;
+                }
             }
         }
 
@@ -1101,16 +1105,17 @@ pub fn Tree(
         }
 
         fn collapseRootIfNeeded(self: *Self, gpa: mem.Allocator) void {
-            const root = self.root orelse return;
-            if (root.len != 0) return;
+            while (self.root) |root| {
+                if (root.len != 0) return;
 
-            if (root.branch) |branch| {
-                self.root = branch.children[0];
-                branch.children[0] = null;
-            } else {
-                self.root = null;
+                if (root.branch) |branch| {
+                    self.root = branch.children[0];
+                    branch.children[0] = null;
+                } else {
+                    self.root = null;
+                }
+                self.destroyNode(gpa, root);
             }
-            self.destroyNode(gpa, root);
         }
 
         fn deleteMaxFromNode(self: *Self, gpa: mem.Allocator, node: *Node) !Entry {
@@ -1164,6 +1169,107 @@ pub fn Tree(
             return removed;
         }
 
+        fn removeChildAndItemAt(self: *Self, gpa: mem.Allocator, node: *Node, child_index: usize) usize {
+            const branch = node.branch.?;
+            const removed = branch.counts[child_index] + 1;
+
+            self.releaseNode(gpa, branch.children[child_index]);
+            releaseValue(gpa, node.values[child_index]);
+
+            mem.copyForwards(K, node.keys[child_index .. node.len - 1], node.keys[child_index + 1 .. node.len]);
+            mem.copyForwards(V, node.values[child_index .. node.len - 1], node.values[child_index + 1 .. node.len]);
+            if (config.use_string_prefix) {
+                mem.copyForwards(u64, branch.prefixes[child_index .. node.len - 1], branch.prefixes[child_index + 1 .. node.len]);
+            }
+            mem.copyForwards(?*Node, branch.children[child_index .. node.len], branch.children[child_index + 1 .. node.len + 1]);
+            mem.copyForwards(usize, branch.counts[child_index .. node.len], branch.counts[child_index + 1 .. node.len + 1]);
+
+            branch.children[node.len] = null;
+            branch.counts[node.len] = 0;
+            node.len -= 1;
+            return removed;
+        }
+
+        fn removeItemAndRightChildAt(self: *Self, gpa: mem.Allocator, node: *Node, index: usize) usize {
+            const branch = node.branch.?;
+            const child_index = index + 1;
+            const removed = branch.counts[child_index] + 1;
+
+            releaseValue(gpa, node.values[index]);
+            self.releaseNode(gpa, branch.children[child_index]);
+
+            mem.copyForwards(K, node.keys[index .. node.len - 1], node.keys[index + 1 .. node.len]);
+            mem.copyForwards(V, node.values[index .. node.len - 1], node.values[index + 1 .. node.len]);
+            if (config.use_string_prefix) {
+                mem.copyForwards(u64, branch.prefixes[index .. node.len - 1], branch.prefixes[index + 1 .. node.len]);
+            }
+            mem.copyForwards(?*Node, branch.children[child_index .. node.len], branch.children[child_index + 1 .. node.len + 1]);
+            mem.copyForwards(usize, branch.counts[child_index .. node.len], branch.counts[child_index + 1 .. node.len + 1]);
+
+            branch.children[node.len] = null;
+            branch.counts[node.len] = 0;
+            node.len -= 1;
+            return removed;
+        }
+
+        fn deleteRangeFromLeaf(gpa: mem.Allocator, node: *Node, index: usize, count: usize) usize {
+            const removed = @min(count, node.len - index);
+            for (index..index + removed) |i| releaseValue(gpa, node.values[i]);
+
+            mem.copyForwards(K, node.keys[index .. node.len - removed], node.keys[index + removed .. node.len]);
+            mem.copyForwards(V, node.values[index .. node.len - removed], node.values[index + removed .. node.len]);
+            node.len -= @intCast(removed);
+            return removed;
+        }
+
+        fn deleteRangeStep(self: *Self, gpa: mem.Allocator, node: *Node, index: usize, count: usize) anyerror!usize {
+            if (node.isLeaf()) return deleteRangeFromLeaf(gpa, node, index, count);
+
+            const branch = node.branch.?;
+            var position: usize = 0;
+            for (0..node.len + 1) |i| {
+                const child_count = branch.counts[i];
+                if (index < position + child_count) {
+                    const child_index = index - position;
+                    if (child_index == 0 and i < node.len and count >= child_count + 1 and node.len > min_items) {
+                        return self.removeChildAndItemAt(gpa, node, i);
+                    }
+
+                    try self.makeUniqueChild(gpa, node, i);
+                    const removed = try self.deleteRangeFromNode(gpa, branch.children[i].?, child_index, @min(count, child_count - child_index));
+                    branch.counts[i] -= removed;
+                    if (removed > 0) try self.rebalanceChild(gpa, node, i);
+                    return removed;
+                }
+                position += child_count;
+
+                if (i < node.len) {
+                    if (index == position) {
+                        if (count >= branch.counts[i + 1] + 1 and node.len > min_items) {
+                            return self.removeItemAndRightChildAt(gpa, node, i);
+                        }
+
+                        const removed = try self.deleteAtFromNode(gpa, node, index);
+                        releaseValue(gpa, removed.value);
+                        return 1;
+                    }
+                    position += 1;
+                }
+            }
+
+            return 0;
+        }
+
+        fn deleteRangeFromNode(self: *Self, gpa: mem.Allocator, node: *Node, index: usize, count: usize) anyerror!usize {
+            var removed: usize = 0;
+            while (removed < count) {
+                const step_removed = try self.deleteRangeStep(gpa, node, index, count - removed);
+                if (step_removed == 0) break;
+                removed += step_removed;
+            }
+            return removed;
+        }
+
         /// Removes and returns the item at sorted position `index`.
         ///
         /// Returns `null` when `index` is out of range.
@@ -1198,12 +1304,11 @@ pub fn Tree(
         pub fn deleteRangeAt(self: *Self, gpa: mem.Allocator, index: usize, count: usize) !usize {
             if (index >= self.len or count == 0) return 0;
 
+            try self.makeUniqueRoot(gpa);
             const limit = @min(count, self.len - index);
-
-            var removed: usize = 0;
-            while (removed < limit) : (removed += 1) {
-                _ = try self.deleteAt(gpa, index);
-            }
+            const removed = try self.deleteRangeFromNode(gpa, self.root.?, index, limit);
+            self.len -= removed;
+            self.collapseRootIfNeeded(gpa);
             return removed;
         }
 
