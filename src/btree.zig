@@ -219,14 +219,15 @@ pub fn Tree(
 
         // Recursively frees a node, all of its descendants, and branch data.
         fn destroyNode(self: *Self, gpa: mem.Allocator, node: *Node) void {
+            for (0..node.len) |i| releaseValue(gpa, node.values[i]);
+
             if (node.branch) |branch| {
-                var i: usize = 0;
-                while (i <= node.len) : (i += 1) {
+                for (0..node.len + 1) |i| {
                     self.releaseNode(gpa, branch.children[i]);
                 }
-
                 gpa.destroy(branch);
             }
+
             gpa.destroy(node);
         }
 
@@ -1148,30 +1149,31 @@ pub fn Tree(
         /// mutating path is cloned lazily.
         pub fn copy(self: *Self) Self {
             retainNode(self.root);
-            return .{ .root = self.root, .len = self.len };
+            self.copied = true;
+            return .{ .root = self.root, .len = self.len, .copied = true };
         }
 
         // Allocates a private copy of one node. Internal-node children remain
         // shared and have their reference counts incremented.
         fn cloneNode(self: *Self, gpa: mem.Allocator, node: *Node) !*Node {
             const clone = try self.newNode(gpa, node.isLeaf());
-            clone.len = node.len;
+            errdefer self.destroyNode(gpa, clone);
 
+            clone.len = 0;
             for (0..node.len) |i| {
-                clone.keys[i] = node.keys[i];
-                clone.values[i] = node.values[i];
+                clone.values[i] = try copyValue(gpa, node.values[i]);
+                clone.len += 1;
             }
+            @memcpy(&clone.keys, &node.keys);
 
             if (node.branch) |branch| {
                 const clone_branch = clone.branch.?;
-                if (config.use_string_prefix) {
-                    for (0..node.len) |i| clone_branch.prefixes[i] = branch.prefixes[i];
-                }
-                for (0..node.len + 1) |i| {
-                    clone_branch.children[i] = branch.children[i];
-                    clone_branch.counts[i] = branch.counts[i];
-                    retainNode(branch.children[i]);
-                }
+                if (comptime config.use_string_prefix) @memcpy(&clone_branch.prefixes, &branch.prefixes);
+
+                @memcpy(&clone_branch.counts, &branch.counts);
+                @memcpy(&clone_branch.children, &branch.children);
+
+                for (0..node.len + 1) |i| retainNode(branch.children[i]);
             }
 
             return clone;
@@ -1179,6 +1181,7 @@ pub fn Tree(
 
         // Clones the root when it is shared with another copy-on-write tree.
         fn makeUniqueRoot(self: *Self, gpa: mem.Allocator) !void {
+            if (!self.copied) return;
             const root = self.root orelse return;
             if (root.rc.load(.monotonic) == 0) return;
             _ = root.rc.fetchSub(1, .acq_rel);
@@ -1188,6 +1191,7 @@ pub fn Tree(
         // Clones an internal child when it is shared with another
         // copy-on-write tree.
         fn makeUniqueChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
+            if (!self.copied) return;
             const branch = parent.branch.?;
             const child = branch.children[child_index].?;
             if (child.rc.load(.monotonic) == 0) return;
@@ -1234,6 +1238,18 @@ fn compareTestStringKey(a_key: []const u8, _: usize, b_key: []const u8, _: usize
     return mem.order(u8, a_key, b_key);
 }
 
+fn compareTestIntKeyOwnedValue(a_key: isize, _: []const u8, b_key: isize, _: []const u8) std.math.Order {
+    return if (a_key < b_key) .lt else if (a_key > b_key) .gt else .eq;
+}
+
+fn copyTestBytes(gpa: mem.Allocator, value: []const u8) ![]const u8 {
+    return try gpa.dupe(u8, value);
+}
+
+fn releaseTestBytes(gpa: mem.Allocator, value: []const u8) void {
+    gpa.free(value);
+}
+
 test "core nodes allocate and deallocate" {
     const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
     var tree = IntTree.init();
@@ -1243,6 +1259,59 @@ test "core nodes allocate and deallocate" {
     tree.destroyNode(testing.allocator, leaf);
 
     tree.root = try tree.newNode(std.testing.allocator, false);
+}
+
+test "destroyNode releases every value in a full leaf" {
+    const ByteTree = Tree(isize, []const u8, .{
+        .compare = compareTestIntKeyOwnedValue,
+        .use_string_prefix = false,
+        .key_only = true,
+        .copy_value = copyTestBytes,
+        .release_value = releaseTestBytes,
+    });
+    var tree = ByteTree.init();
+
+    const node = try tree.newNode(testing.allocator, true);
+    for (0..ByteTree.max_items) |i| {
+        node.keys[i] = @intCast(i);
+        node.values[i] = try std.fmt.allocPrint(testing.allocator, "value-{d}", .{i});
+    }
+    node.len = ByteTree.max_items;
+
+    tree.destroyNode(testing.allocator, node);
+}
+
+test "destroyNode releases the rightmost child of internal nodes" {
+    const ByteTree = Tree(isize, []const u8, .{
+        .compare = compareTestIntKeyOwnedValue,
+        .use_string_prefix = false,
+        .key_only = true,
+        .copy_value = copyTestBytes,
+        .release_value = releaseTestBytes,
+    });
+    var tree = ByteTree.init();
+
+    const parent = try tree.newNode(testing.allocator, false);
+    const left = try tree.newNode(testing.allocator, true);
+    const right = try tree.newNode(testing.allocator, true);
+
+    left.keys[0] = 10;
+    left.values[0] = try testing.allocator.dupe(u8, "left");
+    left.len = 1;
+
+    right.keys[0] = 30;
+    right.values[0] = try testing.allocator.dupe(u8, "right");
+    right.len = 1;
+
+    parent.keys[0] = 20;
+    parent.values[0] = try testing.allocator.dupe(u8, "parent");
+    parent.len = 1;
+    parent.branch.?.children[0] = left;
+    parent.branch.?.children[1] = right;
+    parent.branch.?.counts[0] = ByteTree.subtreeCount(left);
+    parent.branch.?.counts[1] = ByteTree.subtreeCount(right);
+
+    tree.destroyNode(testing.allocator, parent);
 }
 
 test "node local search returns lower bound" {
@@ -1803,6 +1872,54 @@ test "makeUniqueRoot clones a retained root" {
     try testing.expectEqual(0, original_root.rc.load(.monotonic));
     try testing.expectEqual(100, tree.get(10, 0).?);
     try testing.expectEqual(100, copy.get(10, 0).?);
+}
+
+test "makeUniqueRoot deep copies owned values" {
+    const ByteTree = Tree(isize, []const u8, .{
+        .compare = compareTestIntKeyOwnedValue,
+        .use_string_prefix = false,
+        .key_only = true,
+        .copy_value = copyTestBytes,
+        .release_value = releaseTestBytes,
+    });
+    var tree = ByteTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const value = try testing.allocator.dupe(u8, "owned value");
+    try testing.expect(try tree.insert(testing.allocator, 10, value));
+
+    var copy = tree.copy();
+    defer copy.deinit(testing.allocator);
+
+    try copy.makeUniqueRoot(testing.allocator);
+
+    const original_value = tree.get(10, "").?;
+    const copied_value = copy.get(10, "").?;
+    try testing.expectEqualStrings("owned value", original_value);
+    try testing.expectEqualStrings("owned value", copied_value);
+    try testing.expect(original_value.ptr != copied_value.ptr);
+}
+
+test "makeUniqueRoot retains the rightmost child" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..150) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    const original_root = tree.root.?;
+    const rightmost_index = original_root.len;
+    const original_rightmost = original_root.branch.?.children[rightmost_index].?;
+
+    var copy = tree.copy();
+    defer copy.deinit(testing.allocator);
+    try copy.makeUniqueRoot(testing.allocator);
+
+    try testing.expectEqual(original_rightmost, copy.root.?.branch.?.children[rightmost_index].?);
+    try testing.expect(original_rightmost.rc.load(.monotonic) > 0);
 }
 
 test "makeUniqueChild clones a retained child" {
