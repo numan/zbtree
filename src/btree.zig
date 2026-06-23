@@ -1658,15 +1658,21 @@ pub fn Tree(
         pub fn deleteRangeAt(self: *Self, gpa: mem.Allocator, index: usize, count: usize, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
             if (index >= self.len or count == 0) return .{ .removed_count = 0, .items = &.{} };
 
-            const limit = @min(count, self.len - index);
+            var start = index;
+            var end = @min(index + count, self.len);
+            if (comptime opts.min_exclusive) start += 1;
+            if (comptime opts.max_inclusive) end = @min(end + 1, self.len);
+            if (end <= start) return .{ .removed_count = 0, .items = &.{} };
+
+            const limit = end - start;
             if (comptime opts.no_return) {
-                if (index == 0 and limit == self.len) {
+                if (start == 0 and limit == self.len) {
                     self.clear(gpa);
                     return .{ .removed_count = limit, .items = &.{} };
                 }
 
                 try self.makeUniqueRoot(gpa);
-                const removed = try self.deleteRangeFromNode(gpa, self.root.?, index, limit);
+                const removed = try self.deleteRangeFromNode(gpa, self.root.?, start, limit);
                 self.len -= removed;
                 self.collapseRootIfNeeded(gpa);
                 return .{ .removed_count = removed, .items = &.{} };
@@ -1680,7 +1686,7 @@ pub fn Tree(
                 }
 
                 while (removed < limit) : (removed += 1) {
-                    items[removed] = (try self.deleteAt(gpa, index)).?;
+                    items[removed] = (try self.deleteAt(gpa, start)).?;
                 }
                 return .{ .removed_count = removed, .items = items[0..removed] };
             }
@@ -1705,7 +1711,7 @@ pub fn Tree(
             if (opts.max_inclusive and max_rank.found) end += 1;
 
             if (end <= start) return .{ .removed_count = 0, .items = &.{} };
-            return self.deleteRangeAt(gpa, start, end - start, opts);
+            return self.deleteRangeAt(gpa, start, end - start, .{ .no_return = opts.no_return });
         }
 
         /// Removes every item and releases all nodes owned by this tree.
