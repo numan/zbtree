@@ -902,31 +902,26 @@ pub fn Tree(
         // Restores the minimum size rule for `parent`'s child at `child_index`
         // by borrowing from a sibling when possible or merging siblings.
         fn rebalanceChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
-            while (parent.len > 0) {
-                const branch = parent.branch.?;
-                const child = branch.children[child_index].?;
+            if (parent.len == 0) return;
 
-                if (child.len >= min_items) return;
+            const branch = parent.branch.?;
+            if (branch.children[child_index].?.len >= min_items) return;
 
-                if (child_index > 0 and branch.children[child_index - 1].?.len > min_items) {
-                    try self.makeUniqueChild(gpa, parent, child_index - 1);
-                    try self.makeUniqueChild(gpa, parent, child_index);
-                    rotateFromLeft(parent, child_index);
-                } else if (child_index < parent.len and branch.children[child_index + 1].?.len > min_items) {
-                    try self.makeUniqueChild(gpa, parent, child_index);
-                    try self.makeUniqueChild(gpa, parent, child_index + 1);
-                    rotateFromRight(parent, child_index);
-                } else if (child_index > 0) {
-                    try self.makeUniqueChild(gpa, parent, child_index - 1);
-                    try self.makeUniqueChild(gpa, parent, child_index);
-                    self.mergeChildren(gpa, parent, child_index - 1);
-                    return;
-                } else {
-                    try self.makeUniqueChild(gpa, parent, child_index);
-                    try self.makeUniqueChild(gpa, parent, child_index + 1);
-                    self.mergeChildren(gpa, parent, child_index);
-                    return;
-                }
+            var i = child_index;
+            if (i == parent.len) i -= 1;
+
+            try self.makeUniqueChild(gpa, parent, i);
+            try self.makeUniqueChild(gpa, parent, i + 1);
+
+            const left = branch.children[i].?;
+            const right = branch.children[i + 1].?;
+
+            if (left.len + right.len < max_items) {
+                self.mergeChildren(gpa, parent, i);
+            } else if (left.len > right.len) {
+                rotateFromLeft(parent, i + 1);
+            } else {
+                rotateFromRight(parent, i);
             }
         }
 
@@ -936,10 +931,21 @@ pub fn Tree(
             const branch = parent.branch.?;
             const left = branch.children[child_index - 1].?;
             const child = branch.children[child_index].?;
+            const left_index = left.len - 1;
+            const promoted_key = left.keys[left_index];
+            const promoted_value = left.values[left_index];
+
+            if (child.branch) |child_branch| {
+                const left_branch = left.branch.?;
+                insertChildAt(child, 0, left_branch.children[left.len].?);
+                child_branch.counts[0] = left_branch.counts[left.len];
+                left_branch.children[left.len] = null;
+                left_branch.counts[left.len] = 0;
+            }
 
             insertItemAt(child, 0, parent.keys[child_index - 1], parent.values[child_index - 1]);
-            parent.keys[child_index - 1] = left.keys[left.len - 1];
-            parent.values[child_index - 1] = left.values[left.len - 1];
+            parent.keys[child_index - 1] = promoted_key;
+            parent.values[child_index - 1] = promoted_value;
             setPrefix(parent, child_index - 1);
             left.len -= 1;
             branch.counts[child_index - 1] = subtreeCount(left);
@@ -952,6 +958,16 @@ pub fn Tree(
             const branch = parent.branch.?;
             const child = branch.children[child_index].?;
             const right = branch.children[child_index + 1].?;
+
+            if (child.branch) |child_branch| {
+                const right_branch = right.branch.?;
+                child_branch.children[child.len + 1] = right_branch.children[0];
+                child_branch.counts[child.len + 1] = right_branch.counts[0];
+                mem.copyForwards(?*Node, right_branch.children[0..right.len], right_branch.children[1 .. right.len + 1]);
+                mem.copyForwards(usize, right_branch.counts[0..right.len], right_branch.counts[1 .. right.len + 1]);
+                right_branch.children[right.len] = null;
+                right_branch.counts[right.len] = 0;
+            }
 
             insertItemAt(child, child.len, parent.keys[child_index], parent.values[child_index]);
             parent.keys[child_index] = right.keys[0];
@@ -2091,7 +2107,7 @@ test "mergeChildren joins adjacent leaves and removes the separator" {
     try testing.expectEqual(63, parent.branch.?.counts[0]);
 }
 
-test "rebalanceChild borrows from a left sibling when possible" {
+test "rebalanceChild merges siblings when their items fit" {
     const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
@@ -2107,8 +2123,8 @@ test "rebalanceChild borrows from a left sibling when possible" {
     }
     left.len = 32;
     for (0..30) |i| {
-        child.keys[i] = @intCast(40 + i);
-        child.values[i] = -@as(isize, @intCast(40 + i));
+        child.keys[i] = @intCast(33 + i);
+        child.values[i] = -@as(isize, @intCast(33 + i));
     }
     child.len = 30;
     parent.keys[0] = 32;
@@ -2118,13 +2134,14 @@ test "rebalanceChild borrows from a left sibling when possible" {
     parent.branch.?.children[1] = child;
     parent.branch.?.counts[0] = IntTree.subtreeCount(left);
     parent.branch.?.counts[1] = IntTree.subtreeCount(child);
+    tree.len = 63;
 
     try tree.rebalanceChild(testing.allocator, parent, 1);
 
-    try testing.expectEqual(31, left.len);
-    try testing.expectEqual(31, parent.keys[0]);
-    try testing.expectEqual(31, child.len);
-    try testing.expectEqual(32, child.keys[0]);
+    try testing.expectEqual(0, parent.len);
+    try testing.expectEqual(63, left.len);
+    try testing.expect(parent.branch.?.children[1] == null);
+    try testing.expectEqual(63, parent.branch.?.counts[0]);
 }
 
 test "fitsBetween validates index neighbors" {
