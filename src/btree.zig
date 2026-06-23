@@ -778,13 +778,18 @@ pub fn Tree(
             }
         }
 
-        // Finds the node slot containing an item equal to `key`/`val`.
-        fn findSlot(self: *Self, key: K, val: V) ?Slot {
+        // Finds a slot that may be mutated by cloning each shared node on the
+        // search path before reaching it.
+        fn findSlotForWrite(self: *Self, gpa: mem.Allocator, key: K, val: V) !?Slot {
+            try self.makeUniqueRoot(gpa);
             var node = self.root orelse return null;
             while (true) {
                 const found = searchNode(node, key, val);
                 if (found.found) return Slot.init(node, found.index);
-                if (node.branch) |branch| node = branch.children[found.index].? else return null;
+                if (node.branch) |branch| {
+                    try self.makeUniqueChild(gpa, node, found.index);
+                    node = branch.children[found.index].?;
+                } else return null;
             }
         }
 
@@ -793,8 +798,8 @@ pub fn Tree(
         /// Returns the old value when an equal item exists, or `null` when no
         /// matching item is present. The tree length and sort position are
         /// unchanged.
-        pub fn replace(self: *Self, key: K, val: V) ?V {
-            const slot = self.findSlot(key, val) orelse return null;
+        pub fn replace(self: *Self, gpa: mem.Allocator, key: K, val: V) !?V {
+            const slot = (try self.findSlotForWrite(gpa, key, val)) orelse return null;
             const old = slot.node.values[slot.index];
             slot.node.values[slot.index] = val;
             return old;
@@ -803,9 +808,9 @@ pub fn Tree(
         /// Inserts `key`/`val` or replaces the value of an equal existing item.
         ///
         /// Returns the old value when an item was replaced, or `null` when a new
-        /// item was inserted. Allocation is only needed when inserting.
+        /// item was inserted.
         pub fn set(self: *Self, gpa: mem.Allocator, key: K, val: V) !?V {
-            if (self.findSlot(key, val)) |slot| {
+            if (try self.findSlotForWrite(gpa, key, val)) |slot| {
                 const old = slot.node.values[slot.index];
                 slot.node.keys[slot.index] = key;
                 slot.node.values[slot.index] = val;

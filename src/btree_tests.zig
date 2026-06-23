@@ -417,17 +417,17 @@ test "replace updates existing value without inserting" {
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
-    try testing.expect(tree.replace(42, 420) == null);
+    try testing.expect(try tree.replace(testing.allocator, 42, 420) == null);
 
     try testing.expect(try tree.insert(testing.allocator, 10, 100));
     try testing.expect(try tree.insert(testing.allocator, 20, 200));
 
-    try testing.expectEqual(100, tree.replace(10, 111).?);
+    try testing.expectEqual(100, (try tree.replace(testing.allocator, 10, 111)).?);
     try testing.expectEqual(2, tree.len);
     try testing.expectEqual(111, tree.get(10, 0).?);
     try testing.expectEqual(200, tree.get(20, 0).?);
 
-    try testing.expect(tree.replace(30, 300) == null);
+    try testing.expect(try tree.replace(testing.allocator, 30, 300) == null);
     try testing.expectEqual(2, tree.len);
     try tree.checkInvariants();
 }
@@ -446,6 +446,48 @@ test "set inserts missing keys and replaces existing values" {
     try testing.expectEqual(111, tree.get(10, 0).?);
     try testing.expectEqual(200, tree.get(20, 0).?);
     try tree.checkInvariants();
+}
+
+test "copy-on-write replace does not mutate original" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false, .key_only = true });
+    var original = IntTree.init();
+    defer original.deinit(testing.allocator);
+
+    for (0..200) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try original.insert(testing.allocator, key, key * 10));
+    }
+
+    var copy = original.copy();
+    defer copy.deinit(testing.allocator);
+
+    try testing.expectEqual(100, (try copy.replace(testing.allocator, 10, 111)).?);
+    try testing.expectEqual(100, original.get(10, 0).?);
+    try testing.expectEqual(111, copy.get(10, 0).?);
+    try original.checkInvariants();
+    try copy.checkInvariants();
+}
+
+test "copy-on-write set existing key does not mutate original" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false, .key_only = true });
+    var original = IntTree.init();
+    defer original.deinit(testing.allocator);
+
+    for (0..200) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try original.insert(testing.allocator, key, key * 10));
+    }
+
+    var copy = original.copy();
+    defer copy.deinit(testing.allocator);
+
+    try testing.expectEqual(100, (try copy.set(testing.allocator, 10, 111)).?);
+    try testing.expectEqual(100, original.get(10, 0).?);
+    try testing.expectEqual(111, copy.get(10, 0).?);
+    try testing.expectEqual(200, original.len);
+    try testing.expectEqual(200, copy.len);
+    try original.checkInvariants();
+    try copy.checkInvariants();
 }
 
 test "set replaces values after node splits without changing counts" {
