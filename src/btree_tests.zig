@@ -105,6 +105,38 @@ fn failAscending(ctx: *FailAscendingContext, key: isize, value: isize) !bool {
     return true;
 }
 
+const VerifyDescendingContext = struct {
+    next: usize,
+    seen: usize = 0,
+    limit: usize = std.math.maxInt(usize),
+};
+
+fn verifyDescending(ctx: *VerifyDescendingContext, key: isize, value: isize) !bool {
+    const expected: isize = @intCast(ctx.next);
+    try testing.expectEqual(expected, key);
+    try testing.expectEqual(expected * 10, value);
+    ctx.seen += 1;
+    if (ctx.next == 0) return false;
+    ctx.next -= 1;
+    return ctx.seen < ctx.limit;
+}
+
+const FailDescendingContext = struct {
+    next: usize,
+    seen: usize = 0,
+    fail_after: usize,
+};
+
+fn failDescending(ctx: *FailDescendingContext, key: isize, value: isize) !bool {
+    if (ctx.seen == ctx.fail_after) return error.StopTraversal;
+    const expected: isize = @intCast(ctx.next);
+    try testing.expectEqual(expected, key);
+    try testing.expectEqual(expected * 10, value);
+    ctx.next -= 1;
+    ctx.seen += 1;
+    return true;
+}
+
 fn rejectKeyOne(key: isize, value: isize) bool {
     std.debug.assert(key == 1);
     std.debug.assert(value == -1);
@@ -1502,4 +1534,51 @@ test "ascendAt propagates errors after starting inside a multi-level tree" {
     try testing.expectError(error.StopTraversal, tree.ascendAt(*FailAscendingContext, 2048, &ctx, failAscending));
     try testing.expectEqual(17, ctx.seen);
     try testing.expectEqual(2065, ctx.next);
+}
+
+test "descendAt starts correctly at every index in a multi-level tree" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try fillSequentialTree(IntTree, &tree, 5000);
+    try tree.checkInvariants();
+
+    for (0..tree.len) |index| {
+        var ctx = VerifyDescendingContext{ .next = index, .limit = 4 };
+        try tree.descendAt(*VerifyDescendingContext, index, &ctx, verifyDescending);
+        try testing.expectEqual(@min(@as(usize, 4), index + 1), ctx.seen);
+    }
+
+    var out_of_range = VerifyDescendingContext{ .next = tree.len };
+    try tree.descendAt(*VerifyDescendingContext, tree.len, &out_of_range, verifyDescending);
+    try testing.expectEqual(0, out_of_range.seen);
+}
+
+test "descendAt continues across multi-level child boundaries" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try fillSequentialTree(IntTree, &tree, 5000);
+
+    const starts = [_]usize{ 0, 1, 30, 31, 32, 62, 63, 64, 95, 96, 127, 128, 255, 256, 1023, 1024, 2047, 2048, 4095, 4096, 4999 };
+    for (starts) |index| {
+        var ctx = VerifyDescendingContext{ .next = index };
+        try tree.descendAt(*VerifyDescendingContext, index, &ctx, verifyDescending);
+        try testing.expectEqual(index + 1, ctx.seen);
+    }
+}
+
+test "descendAt propagates errors after starting inside a multi-level tree" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try fillSequentialTree(IntTree, &tree, 5000);
+
+    var ctx = FailDescendingContext{ .next = 2048, .fail_after = 17 };
+    try testing.expectError(error.StopTraversal, tree.descendAt(*FailDescendingContext, 2048, &ctx, failDescending));
+    try testing.expectEqual(17, ctx.seen);
+    try testing.expectEqual(2031, ctx.next);
 }

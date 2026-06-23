@@ -1,6 +1,6 @@
 const std = @import("std");
 const zbtree_ds = @import("zbtree_ds");
-const btree = zbtree_ds.btree;
+const map = zbtree_ds.map;
 const order = zbtree_ds.order;
 
 const Io = std.Io;
@@ -12,8 +12,13 @@ const Options = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const arena = init.arena.allocator();
-    const options = try parseOptions(init, arena);
+    const args_allocator = init.arena.allocator();
+    const options = try parseOptions(init, args_allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
@@ -25,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
         order.OrderedKey(i32, void),
         "int32",
         options,
-        init.gpa,
+        allocator,
         init.io,
         stdout,
     );
@@ -33,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         order.OrderedKey(u64, void),
         "uint64",
         options,
-        init.gpa,
+        allocator,
         init.io,
         stdout,
     );
@@ -41,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
         order.OrderedKey([]const u8, void),
         "string",
         options,
-        init.gpa,
+        allocator,
         init.io,
         stdout,
     );
@@ -92,14 +97,14 @@ fn benchType(
     stdout: anytype,
 ) !void {
     const K = Order.Key;
-    const Tree = btree.Tree(K, void, Order.compare, .{ .use_string_prefix = Order.use_string_prefix });
-    const Ctx = BenchContext(K, Tree);
+    const Map = map.Map(K, void, .{ .use_string_prefix = Order.use_string_prefix });
+    const Ctx = BenchContext(K, Map);
 
     var ctx = Ctx{
         .allocator = allocator,
         .prng = std.Random.DefaultPrng.init(0xdecafbad),
         .items = options.items,
-        .tree = Tree.init(),
+        .tree = Map.init(),
     };
     defer ctx.deinit();
 
@@ -151,14 +156,14 @@ fn benchType(
     try stdout.print("\n", .{});
 }
 
-fn BenchContext(comptime K: type, comptime Tree: type) type {
+fn BenchContext(comptime K: type, comptime Map: type) type {
     return struct {
         const Self = @This();
 
         allocator: Allocator,
         prng: std.Random.DefaultPrng,
         items: usize,
-        tree: Tree,
+        tree: Map,
         keys: []K = &.{},
         string_bytes: if (K == []const u8) []u8 else void = if (K == []const u8) &.{} else {},
         checksum: usize = 0,
@@ -200,7 +205,6 @@ fn BenchContext(comptime K: type, comptime Tree: type) type {
             var total_len: usize = 0;
             for (0..self.items) |i| total_len += decimalLength(i);
             self.string_bytes = try self.allocator.alloc(u8, total_len);
-
             var offset: usize = 0;
             for (0..self.items) |i| {
                 const written = try std.fmt.bufPrint(self.string_bytes[offset..], "{d}", .{i});
@@ -251,13 +255,13 @@ fn BenchContext(comptime K: type, comptime Tree: type) type {
                 self.resident_string_bytes = self.string_bytes;
                 self.string_bytes = &.{};
             }
-            std.mem.doNotOptimizeAway(self.tree.len);
+            std.mem.doNotOptimizeAway(self.tree.len());
         }
 
         pub fn getAll(self: *Self) !void {
             var found: usize = 0;
             for (self.keys) |key| {
-                _ = self.tree.get(key, {}) orelse return error.BenchmarkMissingKey;
+                _ = self.tree.get(key) orelse return error.BenchmarkMissingKey;
                 found += 1;
             }
             self.checksum +%= found;
