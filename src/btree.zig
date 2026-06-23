@@ -11,6 +11,7 @@ pub const SearchMode = enum {
 pub const DeleteRangeOptions = struct {
     min_exclusive: bool = false,
     max_inclusive: bool = false,
+    no_return: bool = false,
 };
 
 pub fn TreeConfig(comptime K: type, comptime V: type) type {
@@ -142,12 +143,27 @@ pub fn Tree(
             }
         };
 
-        const Entry = struct {
+        pub const Entry = struct {
             key: K,
             value: V,
 
             fn init(key: K, value: V) @This() {
                 return .{ .key = key, .value = value };
+            }
+        };
+
+        /// Owned result returned by range deletion operations.
+        ///
+        /// When `items` is non-empty, the result owns the removed entries'
+        /// values until `deinit` is called. When `.no_return = true`, `items`
+        /// is empty and removed values are released during deletion.
+        pub const DeleteRangeResult = struct {
+            removed_count: usize,
+            items: []Entry,
+
+            pub fn deinit(result: @This(), gpa: mem.Allocator) void {
+                for (result.items) |item| releaseValue(gpa, item.value);
+                gpa.free(result.items);
             }
         };
 
@@ -1360,17 +1376,36 @@ pub fn Tree(
         }
         /// Removes up to `count` items starting at sorted position `index`.
         ///
-        /// Returns the number of items removed. Ranges past the end are
-        /// clamped, and empty or out-of-range requests remove nothing.
-        pub fn deleteRangeAt(self: *Self, gpa: mem.Allocator, index: usize, count: usize) !usize {
-            if (index >= self.len or count == 0) return 0;
+        /// Ranges past the end are clamped, and empty or out-of-range requests
+        /// remove nothing. By default the returned result owns the removed
+        /// entries in sorted order; callers must call `DeleteRangeResult.deinit`.
+        /// With `.no_return = true`, removed values are released immediately
+        /// and the result's `items` slice is empty.
+        pub fn deleteRangeAt(self: *Self, gpa: mem.Allocator, index: usize, count: usize, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
+            if (index >= self.len or count == 0) return .{ .removed_count = 0, .items = &.{} };
 
-            try self.makeUniqueRoot(gpa);
             const limit = @min(count, self.len - index);
-            const removed = try self.deleteRangeFromNode(gpa, self.root.?, index, limit);
-            self.len -= removed;
-            self.collapseRootIfNeeded(gpa);
-            return removed;
+            if (comptime opts.no_return) {
+                var removed: usize = 0;
+                while (removed < limit) : (removed += 1) {
+                    const item = (try self.deleteAt(gpa, index)).?;
+                    releaseValue(gpa, item.value);
+                }
+                return .{ .removed_count = removed, .items = &.{} };
+            } else {
+                const items = try gpa.alloc(Entry, limit);
+                errdefer gpa.free(items);
+
+                var removed: usize = 0;
+                errdefer {
+                    for (items[0..removed]) |item| releaseValue(gpa, item.value);
+                }
+
+                while (removed < limit) : (removed += 1) {
+                    items[removed] = (try self.deleteAt(gpa, index)).?;
+                }
+                return .{ .removed_count = removed, .items = items[0..removed] };
+            }
         }
 
         pub fn deleteRange(
@@ -1380,8 +1415,8 @@ pub fn Tree(
             min_value: V,
             max_key: K,
             max_value: V,
-            opts: DeleteRangeOptions,
-        ) !usize {
+            comptime opts: DeleteRangeOptions,
+        ) !DeleteRangeResult {
             const min_rank = self.rankOf(min_key, min_value);
             const max_rank = self.rankOf(max_key, max_value);
 
@@ -1391,8 +1426,8 @@ pub fn Tree(
             var end = max_rank.index;
             if (opts.max_inclusive and max_rank.found) end += 1;
 
-            if (end <= start) return 0;
-            return self.deleteRangeAt(gpa, start, end - start);
+            if (end <= start) return .{ .removed_count = 0, .items = &.{} };
+            return self.deleteRangeAt(gpa, start, end - start, opts);
         }
 
         /// Removes every item and releases all nodes owned by this tree.
@@ -1404,9 +1439,9 @@ pub fn Tree(
 
         /// Removes every item from sorted position `index` through the end.
         ///
-        /// Returns the number of items removed.
-        pub fn deleteAllAt(self: *Self, gpa: mem.Allocator, index: usize) !usize {
-            return self.deleteRangeAt(gpa, index, self.len - @min(index, self.len));
+        /// Returns an owned range deletion result.
+        pub fn deleteAllAt(self: *Self, gpa: mem.Allocator, index: usize, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
+            return self.deleteRangeAt(gpa, index, self.len - @min(index, self.len), opts);
         }
 
         // Converts a failed internal consistency check into a testable error.
