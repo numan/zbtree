@@ -63,8 +63,6 @@ func benchMap[T keyType](items, runs int) {
 	runBench("popFront", items, runs, ctx.preFullSeq, ctx.popFrontAll)
 	runBench("popBack", items, runs, ctx.preFullSeq, ctx.popBackAll)
 	rangeOps := partialRangeCount(items)
-	runBench("deleteRangeAt(part)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangeAtPartial)
-	runBench("deleteRange(part)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangePartial)
 	runBench("deleteRangeAt(ret)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangeAtReturning)
 	runBench("deleteRange(ret)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangeReturning)
 	runBench("release", items, runs, ctx.preFullSeq, ctx.releaseAll)
@@ -266,25 +264,6 @@ func (c *benchContext[T]) popBackAll() {
 	}
 	assert(deleted == c.items)
 	c.record(deleted)
-}
-
-func (c *benchContext[T]) deleteRangeAtPartial() {
-	count := partialRangeCount(c.items)
-	start := partialRangeStart(c.items, count)
-	removed := c.tree.DeleteRangeAtOptions(start, count, btype.DeleteRangeOptions{NoReturn: true})
-	assert(removed.Len() == 0)
-	assert(c.tree.Len() == c.items-count)
-	c.record(count)
-}
-
-func (c *benchContext[T]) deleteRangePartial() {
-	first, last, ok := c.partialRangeBounds()
-	assert(ok)
-	count := partialRangeCount(c.items)
-	removed := c.tree.DeleteRangeOptions(first, last, btype.DeleteRangeOptions{MaxInclusive: true, NoReturn: true})
-	assert(removed.Len() == 0)
-	assert(c.tree.Len() == c.items-count)
-	c.record(count)
 }
 
 func (c *benchContext[T]) deleteRangeAtReturning() {

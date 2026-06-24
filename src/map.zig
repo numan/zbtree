@@ -79,7 +79,7 @@ pub fn Map(
         }
 
         pub inline fn get(self: *const Self, key: K) ?V {
-            return self.tree.get(key, undefined);
+            return self.tree.getKeyOnly(key);
         }
 
         pub inline fn seek(self: *const Self, key: K) ?Entry {
@@ -149,7 +149,7 @@ pub fn Map(
         }
 
         pub inline fn delete(self: *Self, gpa: mem.Allocator, key: K) !?V {
-            return self.tree.delete(gpa, key, undefined);
+            return self.tree.deleteKeyOnly(gpa, key);
         }
 
         pub inline fn front(self: *const Self) ?Entry {
@@ -191,7 +191,7 @@ pub fn Map(
             max_key: K,
             comptime opts: DeleteRangeOptions,
         ) !DeleteRangeResult {
-            return self.tree.deleteRange(gpa, min_key, undefined, max_key, undefined, opts);
+            return self.tree.deleteRangeKeyOnly(gpa, min_key, max_key, opts);
         }
 
         pub inline fn deleteAllAt(self: *Self, gpa: mem.Allocator, index: usize, comptime opts: DeleteRangeOptions) !DeleteRangeResult {

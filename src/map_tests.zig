@@ -411,7 +411,7 @@ test "map property range deletion returns sorted removed entries" {
     try no_op.checkInvariants();
 }
 
-test "map deleteRangeAt honors bounds options and no_return" {
+test "map deleteRangeAt honors bounds options" {
     const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
@@ -459,10 +459,10 @@ test "map deleteRangeAt honors bounds options and no_return" {
 
     try refillIntMap(IntMap, &m, n);
     {
-        const removed = try m.deleteRangeAt(testing.allocator, 3000, 1000, .{ .max_inclusive = true, .no_return = true });
+        const removed = try m.deleteRangeAt(testing.allocator, 3000, 1000, .{ .max_inclusive = true });
         defer removed.deinit(testing.allocator);
         try testing.expectEqual(1001, removed.removed_count);
-        try testing.expectEqual(0, removed.chunk_count);
+        try testing.expect(removed.chunk_count > 0);
         try testing.expectEqual(8999, m.len());
     }
     try m.checkInvariants();

@@ -107,8 +107,6 @@ fn benchType(
     try runBenchmark(Ctx, &ctx, "popFront", options.items, options.runs, Ctx.preFullSeq, Ctx.popFrontAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "popBack", options.items, options.runs, Ctx.preFullSeq, Ctx.popBackAll, allocator, io, stdout);
     const range_ops = partialRangeCount(options.items);
-    try runBenchmark(Ctx, &ctx, "deleteRangeAt(part)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangeAtPartial, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "deleteRange(part)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangePartial, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "deleteRangeAt(ret)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangeAtReturning, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "deleteRange(ret)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangeReturning, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "release", options.items, options.runs, Ctx.preFullSeq, Ctx.releaseAll, allocator, io, stdout);
@@ -124,15 +122,24 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
         prng: std.Random.DefaultPrng,
         items: usize,
         tree: Map,
+        pending_removed: ?Map.DeleteRangeResult = null,
         keys: []K = &.{},
         string_bytes: if (K == []const u8) []u8 else void = if (K == []const u8) &.{} else {},
         checksum: usize = 0,
         resident_string_bytes: if (K == []const u8) []u8 else void = if (K == []const u8) &.{} else {},
 
         fn deinit(self: *Self) void {
+            self.cleanupUntimed();
             self.tree.deinit(self.allocator);
             self.freeKeys();
             self.freeResidentStringBytes();
+        }
+
+        fn cleanupUntimed(self: *Self) void {
+            if (self.pending_removed) |removed| {
+                removed.deinit(self.allocator);
+                self.pending_removed = null;
+            }
         }
 
         fn freeKeys(self: *Self) void {
@@ -353,28 +360,15 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             self.record(deleted);
         }
 
-        pub fn deleteRangeAtPartial(self: *Self) !void {
-            const count = partialRangeCount(self.items);
-            const start = partialRangeStart(self.items, count);
-            const removed = try self.tree.deleteRangeAt(self.allocator, start, count, .{ .no_return = true });
-            if (removed.removed_count != count) return error.BenchmarkMissingKey;
-            self.record(removed.removed_count);
-        }
-
-        pub fn deleteRangePartial(self: *Self) !void {
-            const bounds = self.partialRangeBounds() orelse return error.BenchmarkMissingKey;
-            const count = partialRangeCount(self.items);
-            const removed = try self.tree.deleteRange(self.allocator, bounds.first, bounds.last, .{ .max_inclusive = true, .no_return = true });
-            if (removed.removed_count != count) return error.BenchmarkMissingKey;
-            self.record(removed.removed_count);
-        }
-
         pub fn deleteRangeAtReturning(self: *Self) !void {
             const count = partialRangeCount(self.items);
             const start = partialRangeStart(self.items, count);
             const removed = try self.tree.deleteRangeAt(self.allocator, start, count, .{});
-            defer removed.deinit(self.allocator);
-            if (removed.removed_count != count or removed.len() != count) return error.BenchmarkMissingKey;
+            if (removed.removed_count != count or removed.len() != count) {
+                removed.deinit(self.allocator);
+                return error.BenchmarkMissingKey;
+            }
+            self.pending_removed = removed;
             self.record(removed.removed_count);
         }
 
@@ -382,8 +376,11 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             const bounds = self.partialRangeBounds() orelse return error.BenchmarkMissingKey;
             const count = partialRangeCount(self.items);
             const removed = try self.tree.deleteRange(self.allocator, bounds.first, bounds.last, .{ .max_inclusive = true });
-            defer removed.deinit(self.allocator);
-            if (removed.removed_count != count or removed.len() != count) return error.BenchmarkMissingKey;
+            if (removed.removed_count != count or removed.len() != count) {
+                removed.deinit(self.allocator);
+                return error.BenchmarkMissingKey;
+            }
+            self.pending_removed = removed;
             self.record(removed.removed_count);
         }
 
@@ -444,11 +441,16 @@ fn runBenchmark(
     defer allocator.free(elapsed);
 
     for (elapsed) |*sample| {
+        ctx.cleanupUntimed();
         try pre(ctx);
         const start = benchTime(io);
-        try op(ctx);
+        op(ctx) catch |err| {
+            ctx.cleanupUntimed();
+            return err;
+        };
         const end = benchTime(io);
         sample.* = @intCast(end - start);
+        ctx.cleanupUntimed();
     }
 
     std.sort.pdq(u64, elapsed, {}, lessU64);

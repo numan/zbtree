@@ -51,6 +51,11 @@ fn collectPair(ctx: *CollectContext, key: isize, value: isize) !void {
     ctx.len += 1;
 }
 
+fn expectRemovedCount(expected: usize, result: anytype) !void {
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(expected, result.removed_count);
+}
+
 const CollectLimitContext = struct {
     items: [300]Pair = undefined,
     len: usize = 0,
@@ -204,6 +209,47 @@ fn insertStringKeys(comptime count: usize, tree: anytype, buffers: *[count][12]u
     for (buffers, 0..) |*buffer, i| {
         try testing.expect(try tree.insert(testing.allocator, fillKey(buffer[0..], prefix, i), i));
     }
+}
+
+test "key-only lookup and delete use ordered keys after splits" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKeyThenValue, .use_string_prefix = false, .key_only = true });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..160) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insertKeyOnly(testing.allocator, key, key * 10));
+    }
+
+    try testing.expect(!try tree.insertKeyOnly(testing.allocator, 42, -1));
+    const expected_value: ?isize = 420;
+    const missing_value: ?isize = null;
+    try testing.expectEqual(expected_value, tree.getKeyOnly(42));
+    try testing.expectEqual(expected_value, try tree.deleteKeyOnly(testing.allocator, 42));
+    try testing.expectEqual(missing_value, tree.getKeyOnly(42));
+    try testing.expectEqual(missing_value, try tree.deleteKeyOnly(testing.allocator, 42));
+    try testing.expectEqual(159, tree.len);
+    try tree.checkInvariants();
+}
+
+test "string key-only lookup and delete use prefix routing" {
+    const StringTree = btree.Tree([]const u8, usize, .{ .compare = compareStringKey, .use_string_prefix = true, .key_only = true });
+    var tree = StringTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var buffers: [96][20]u8 = undefined;
+    for (&buffers, 0..) |*buffer, i| {
+        const key = try std.fmt.bufPrint(buffer, "shared-prefix-{d:0>3}", .{i});
+        try testing.expect(try tree.insertKeyOnly(testing.allocator, key, i));
+    }
+
+    const expected_value: ?usize = 64;
+    const missing_value: ?usize = null;
+    try testing.expectEqual(expected_value, tree.getKeyOnly("shared-prefix-064"));
+    try testing.expectEqual(expected_value, try tree.deleteKeyOnly(testing.allocator, "shared-prefix-064"));
+    try testing.expectEqual(missing_value, tree.getKeyOnly("shared-prefix-064"));
+    try testing.expectEqual(95, tree.len);
+    try tree.checkInvariants();
 }
 
 test "string prefixes route searches across split root" {
@@ -840,9 +886,9 @@ test "deleteRangeAt removes bounded index ranges" {
         try testing.expect(try tree.insert(testing.allocator, key, -key));
     }
 
-    try testing.expectEqual(0, (try tree.deleteRangeAt(testing.allocator, 10, 0, .{ .no_return = true })).removed_count);
-    try testing.expectEqual(0, (try tree.deleteRangeAt(testing.allocator, 120, 5, .{ .no_return = true })).removed_count);
-    try testing.expectEqual(10, (try tree.deleteRangeAt(testing.allocator, 20, 10, .{ .no_return = true })).removed_count);
+    try expectRemovedCount(0, try tree.deleteRangeAt(testing.allocator, 10, 0, .{}));
+    try expectRemovedCount(0, try tree.deleteRangeAt(testing.allocator, 120, 5, .{}));
+    try expectRemovedCount(10, try tree.deleteRangeAt(testing.allocator, 20, 10, .{}));
     try testing.expectEqual(110, tree.len);
     try testing.expectEqual(19, tree.getAt(19).?.key);
     try testing.expectEqual(30, tree.getAt(20).?.key);
@@ -851,7 +897,7 @@ test "deleteRangeAt removes bounded index ranges" {
         try testing.expect(tree.get(key, 0) == null);
     }
 
-    try testing.expectEqual(5, (try tree.deleteRangeAt(testing.allocator, 105, 50, .{ .no_return = true })).removed_count);
+    try expectRemovedCount(5, try tree.deleteRangeAt(testing.allocator, 105, 50, .{}));
     try testing.expectEqual(105, tree.len);
     try testing.expectEqual(114, tree.back().?.key);
     try tree.checkInvariants();
@@ -886,7 +932,7 @@ test "deleteRangeAt returns removed entries in sorted order" {
     try tree.checkInvariants();
 }
 
-test "deleteRangeAt no_return skips returned entries" {
+test "deleteRangeAt always returns removed entries" {
     const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
@@ -896,14 +942,67 @@ test "deleteRangeAt no_return skips returned entries" {
         try testing.expect(try tree.insert(testing.allocator, key, key * 10));
     }
 
-    const result = try tree.deleteRangeAt(testing.allocator, 3, 5, .{ .no_return = true });
+    const result = try tree.deleteRangeAt(testing.allocator, 3, 5, .{});
     defer result.deinit(testing.allocator);
 
+    var removed_items = CollectContext{};
+    try result.ascent(*CollectContext, &removed_items, collectPair);
+
     try testing.expectEqual(5, result.removed_count);
-    try testing.expectEqual(0, result.chunk_count);
+    try testing.expectEqual(5, removed_items.len);
+    try testing.expectEqual(3, removed_items.items[0].key);
+    try testing.expectEqual(7, removed_items.items[4].key);
     try testing.expectEqual(7, tree.len);
     try testing.expectEqual(2, tree.getAt(2).?.key);
     try testing.expectEqual(8, tree.getAt(3).?.key);
+    try tree.checkInvariants();
+}
+
+test "deleteRange groups boundary entries into result chunks" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..2000) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, -key));
+    }
+
+    const result = try tree.deleteRangeAt(testing.allocator, 500, 1000, .{});
+    defer result.deinit(testing.allocator);
+
+    var removed_items = CollectContext{};
+    try result.ascent(*CollectContext, &removed_items, collectPair);
+
+    try testing.expectEqual(1000, result.removed_count);
+    try testing.expect(result.chunk_count < result.removed_count);
+    try testing.expectEqual(1000, removed_items.len);
+    for (0..1000) |i| {
+        const expected: isize = @intCast(500 + i);
+        try testing.expectEqual(expected, removed_items.items[i].key);
+        try testing.expectEqual(-expected, removed_items.items[i].value);
+    }
+    try testing.expectEqual(1000, tree.len);
+    try tree.checkInvariants();
+}
+
+test "deleteRangeAt rebalances underfull child after zero-progress range step" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..500_000) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    const result = try tree.deleteRangeAt(testing.allocator, 225_000, 50_000, .{});
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(50_000, result.removed_count);
+    try testing.expectEqual(450_000, tree.len);
+    try testing.expectEqual(224_999, tree.getAt(224_999).?.key);
+    try testing.expectEqual(275_000, tree.getAt(225_000).?.key);
     try tree.checkInvariants();
 }
 
@@ -955,14 +1054,14 @@ test "deleteRange removes key-bounded ranges" {
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
-    try testing.expectEqual(0, (try tree.deleteRange(testing.allocator, 20, 0, 30, 0, .{ .no_return = true })).removed_count);
+    try expectRemovedCount(0, try tree.deleteRange(testing.allocator, 20, 0, 30, 0, .{}));
 
     for (0..120) |i| {
         const key: isize = @intCast(i);
         try testing.expect(try tree.insert(testing.allocator, key, -key));
     }
 
-    try testing.expectEqual(10, (try tree.deleteRange(testing.allocator, 20, 0, 30, 0, .{ .no_return = true })).removed_count);
+    try expectRemovedCount(10, try tree.deleteRange(testing.allocator, 20, 0, 30, 0, .{}));
     try testing.expectEqual(110, tree.len);
     try testing.expectEqual(19, tree.getAt(19).?.key);
     try testing.expectEqual(30, tree.getAt(20).?.key);
@@ -971,7 +1070,7 @@ test "deleteRange removes key-bounded ranges" {
         try testing.expect(tree.get(key, 0) == null);
     }
 
-    try testing.expectEqual(10, (try tree.deleteRange(testing.allocator, 40, 0, 50, 0, .{ .min_exclusive = true, .max_inclusive = true, .no_return = true })).removed_count);
+    try expectRemovedCount(10, try tree.deleteRange(testing.allocator, 40, 0, 50, 0, .{ .min_exclusive = true, .max_inclusive = true }));
     try testing.expectEqual(100, tree.len);
     try testing.expectEqual(-40, tree.get(40, 0).?);
     try testing.expectEqual(-51, tree.get(51, 0).?);
@@ -980,8 +1079,8 @@ test "deleteRange removes key-bounded ranges" {
         try testing.expect(tree.get(key, 0) == null);
     }
 
-    try testing.expectEqual(0, (try tree.deleteRange(testing.allocator, 90, 0, 80, 0, .{ .no_return = true })).removed_count);
-    try testing.expectEqual(0, (try tree.deleteRange(testing.allocator, 200, 0, 300, 0, .{ .max_inclusive = true, .no_return = true })).removed_count);
+    try expectRemovedCount(0, try tree.deleteRange(testing.allocator, 90, 0, 80, 0, .{}));
+    try expectRemovedCount(0, try tree.deleteRange(testing.allocator, 200, 0, 300, 0, .{ .max_inclusive = true }));
     try testing.expectEqual(100, tree.len);
     try tree.checkInvariants();
 }
@@ -996,20 +1095,20 @@ test "deleteRange uses lower bounds for missing endpoints" {
         try testing.expect(try tree.insert(testing.allocator, key, -key));
     }
 
-    try testing.expectEqual(5, (try tree.deleteRange(testing.allocator, 15, 0, 25, 0, .{ .min_exclusive = true, .max_inclusive = true, .no_return = true })).removed_count);
+    try expectRemovedCount(5, try tree.deleteRange(testing.allocator, 15, 0, 25, 0, .{ .min_exclusive = true, .max_inclusive = true }));
     for ([_]isize{ 16, 18, 20, 22, 24 }) |key| {
         try testing.expect(tree.get(key, 0) == null);
     }
     try testing.expectEqual(-14, tree.get(14, 0).?);
     try testing.expectEqual(-26, tree.get(26, 0).?);
 
-    try testing.expectEqual(3, (try tree.deleteRange(testing.allocator, -5, 0, 5, 0, .{ .max_inclusive = true, .no_return = true })).removed_count);
+    try expectRemovedCount(3, try tree.deleteRange(testing.allocator, -5, 0, 5, 0, .{ .max_inclusive = true }));
     for ([_]isize{ 0, 2, 4 }) |key| {
         try testing.expect(tree.get(key, 0) == null);
     }
     try testing.expectEqual(-6, tree.get(6, 0).?);
 
-    try testing.expectEqual(2, (try tree.deleteRange(testing.allocator, 195, 0, 250, 0, .{ .no_return = true })).removed_count);
+    try expectRemovedCount(2, try tree.deleteRange(testing.allocator, 195, 0, 250, 0, .{}));
     try testing.expect(tree.get(196, 0) == null);
     try testing.expect(tree.get(198, 0) == null);
     try testing.expectEqual(90, tree.len);
@@ -1028,7 +1127,7 @@ test "deleteRange honors value tie breakers" {
     }
     try testing.expect(try tree.insert(testing.allocator, 11, 110));
 
-    try testing.expectEqual(5, (try tree.deleteRange(testing.allocator, 10, 2, 10, 7, .{ .no_return = true })).removed_count);
+    try expectRemovedCount(5, try tree.deleteRange(testing.allocator, 10, 2, 10, 7, .{}));
     for ([_]isize{ 2, 3, 4, 5, 6 }) |value| {
         try testing.expect(tree.indexOf(10, value) == null);
     }
@@ -1036,7 +1135,7 @@ test "deleteRange honors value tie breakers" {
         try testing.expectEqual(index, tree.indexOf(10, value).?);
     }
 
-    try testing.expectEqual(2, (try tree.deleteRange(testing.allocator, 10, 7, 10, 8, .{ .max_inclusive = true, .no_return = true })).removed_count);
+    try expectRemovedCount(2, try tree.deleteRange(testing.allocator, 10, 7, 10, 8, .{ .max_inclusive = true }));
     try testing.expect(tree.indexOf(10, 7) == null);
     try testing.expect(tree.indexOf(10, 8) == null);
     try testing.expectEqual(5, tree.len);
@@ -1055,7 +1154,7 @@ test "deleteRange honors key_only ordering" {
         try testing.expect(try tree.insert(testing.allocator, key, key * 10));
     }
 
-    try testing.expectEqual(4, (try tree.deleteRange(testing.allocator, 3, 999, 6, -999, .{ .max_inclusive = true, .no_return = true })).removed_count);
+    try expectRemovedCount(4, try tree.deleteRange(testing.allocator, 3, 999, 6, -999, .{ .max_inclusive = true }));
     for (3..7) |i| {
         const key: isize = @intCast(i);
         try testing.expect(tree.get(key, 0) == null);
@@ -1074,7 +1173,7 @@ test "deleteRange works with string prefix routing" {
     var buffers: [128][12]u8 = undefined;
     try insertStringKeys(128, &tree, &buffers, "abcdefgh");
 
-    try testing.expectEqual(66, (try tree.deleteRange(testing.allocator, "abcdefgh-031", 0, "abcdefgh-096", 0, .{ .max_inclusive = true, .no_return = true })).removed_count);
+    try expectRemovedCount(66, try tree.deleteRange(testing.allocator, "abcdefgh-031", 0, "abcdefgh-096", 0, .{ .max_inclusive = true }));
     try testing.expectEqual(62, tree.len);
     try testing.expectEqualStrings("abcdefgh-030", tree.getAt(30).?.key);
     try testing.expectEqualStrings("abcdefgh-097", tree.getAt(31).?.key);
@@ -1098,11 +1197,11 @@ test "deleteAllAt removes everything from an index" {
         try testing.expect(try tree.insert(testing.allocator, key, -key));
     }
 
-    try testing.expectEqual(25, (try tree.deleteAllAt(testing.allocator, 25, .{ .no_return = true })).removed_count);
+    try expectRemovedCount(25, try tree.deleteAllAt(testing.allocator, 25, .{}));
     try testing.expectEqual(25, tree.len);
     try testing.expectEqual(0, tree.front().?.key);
     try testing.expectEqual(24, tree.back().?.key);
-    try testing.expect((try tree.deleteAllAt(testing.allocator, 25, .{ .no_return = true })).removed_count == 0);
+    try expectRemovedCount(0, try tree.deleteAllAt(testing.allocator, 25, .{}));
     try tree.checkInvariants();
 }
 
@@ -1116,7 +1215,7 @@ test "deleteRangeAt removes all entries after splits" {
         try testing.expect(try tree.insert(testing.allocator, key, -key));
     }
 
-    try testing.expectEqual(2000, (try tree.deleteRangeAt(testing.allocator, 0, 2000, .{ .no_return = true })).removed_count);
+    try expectRemovedCount(2000, try tree.deleteRangeAt(testing.allocator, 0, 2000, .{}));
     try testing.expectEqual(0, tree.len);
     try testing.expect(tree.root == null);
     try tree.checkInvariants();

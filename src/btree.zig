@@ -11,7 +11,6 @@ pub const SearchMode = enum {
 pub const DeleteRangeOptions = struct {
     min_exclusive: bool = false,
     max_inclusive: bool = false,
-    no_return: bool = false,
 };
 
 pub fn TreeConfig(comptime K: type, comptime V: type) type {
@@ -163,16 +162,15 @@ pub fn Tree(
         ///
         /// Returned entries are stored lazily as detached tree chunks plus small
         /// boundary item slices. Iterate with `ascent`; call `deinit` to release
-        /// removed values and detached nodes. When `.no_return = true`, `chunks`
-        /// is empty and removed values are released during deletion.
+        /// removed values and detached nodes.
         pub const DeleteRangeResult = struct {
             removed_count: usize,
             chunks: []Chunk,
             chunk_count: usize,
 
-            const Chunk = union(enum) {
-                node: *Node,
-                items: []Entry,
+            const Chunk = struct {
+                node: ?*Node = null,
+                items: []Entry = &.{},
             };
 
             pub fn len(result: @This()) usize {
@@ -185,21 +183,19 @@ pub fn Tree(
                 context: CtxType,
                 comptime yield: fn (CtxType, K, V) anyerror!void,
             ) !void {
-                for (result.chunks[0..result.chunk_count]) |chunk| switch (chunk) {
-                    .node => |node| try visitAsc(CtxType, node, context, yield),
-                    .items => |items| for (items) |item| try yield(context, item.key, item.value),
-                };
+                for (result.chunks[0..result.chunk_count]) |chunk| {
+                    if (chunk.node) |node| try visitAsc(CtxType, node, context, yield);
+                    for (chunk.items) |item| try yield(context, item.key, item.value);
+                }
             }
 
             pub fn deinit(result: @This(), gpa: mem.Allocator) void {
                 var owner = Self{};
-                for (result.chunks[0..result.chunk_count]) |chunk| switch (chunk) {
-                    .node => |node| owner.releaseNode(gpa, node),
-                    .items => |items| {
-                        for (items) |item| releaseValue(gpa, item.value);
-                        gpa.free(items);
-                    },
-                };
+                for (result.chunks[0..result.chunk_count]) |chunk| {
+                    if (chunk.node) |node| owner.releaseNode(gpa, node);
+                    for (chunk.items) |item| releaseValue(gpa, item.value);
+                    if (chunk.items.len != 0) gpa.free(chunk.items);
+                }
                 gpa.free(result.chunks);
             }
         };
@@ -392,6 +388,17 @@ pub fn Tree(
             return searchNodeLinear(node, key, value);
         }
 
+        fn searchKeyOnlyWithPrefix(node: *const Node, key: K, prefix: u64) SearchResult {
+            comptime if (!config.key_only) @compileError("searchKeyOnlyWithPrefix requires TreeConfig.key_only = true");
+
+            if (comptime config.use_string_prefix) {
+                if (!node.isLeaf()) return searchBranchByKeyPrefix(node, key, prefix);
+            }
+
+            if (comptime useBinarySearch()) return searchOrderedKeyBinary(node, key);
+            return searchOrderedKeyLinear(node, key);
+        }
+
         fn seachBranchWithPrefixes(node: *const Node, key: []const u8, value: V, wanted: u64) SearchResult {
             const branch = node.branch.?;
             if (wanted > branch.prefixes[node.len - 1]) return SearchResult.init(node.len, false);
@@ -403,6 +410,23 @@ pub fn Tree(
                 if (prefix > wanted) return SearchResult.init(i, false);
 
                 const c = keyCompare(node.keys[i], node.values[i], key, value);
+                if (c == .gt or c == .eq) return SearchResult.init(i, c == .eq);
+            }
+
+            return SearchResult.init(i, false);
+        }
+
+        fn searchBranchByKeyPrefix(node: *const Node, key: []const u8, wanted: u64) SearchResult {
+            const branch = node.branch.?;
+            if (wanted > branch.prefixes[node.len - 1]) return SearchResult.init(node.len, false);
+
+            var i: usize = 0;
+            while (i < node.len) : (i += 1) {
+                const prefix = branch.prefixes[i];
+                if (prefix < wanted) continue;
+                if (prefix > wanted) return SearchResult.init(i, false);
+
+                const c = orderedKeyCompare(node.keys[i], key);
                 if (c == .gt or c == .eq) return SearchResult.init(i, c == .eq);
             }
 
@@ -612,7 +636,7 @@ pub fn Tree(
         }
 
         fn insertKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V, prefix: u64) !bool {
-            const found = searchNodeWithPrefix(node, key, value, prefix);
+            const found = searchKeyOnlyWithPrefix(node, key, prefix);
             if (found.found) return false;
 
             if (node.isLeaf()) {
@@ -632,7 +656,7 @@ pub fn Tree(
 
             const child = branch.children[child_index].?;
             if (child.isLeaf()) {
-                const child_found = searchNodeWithPrefix(child, key, value, prefix);
+                const child_found = searchKeyOnlyWithPrefix(child, key, prefix);
                 if (child_found.found) return false;
                 insertItemAt(child, child_found.index, key, value);
                 branch.counts[child_index] += 1;
@@ -685,6 +709,18 @@ pub fn Tree(
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             while (true) {
                 const found = searchNodeWithPrefix(node, key, value, prefix);
+                if (found.found) return node.values[found.index];
+                if (node.branch) |branch| node = branch.children[found.index].? else return null;
+            }
+        }
+
+        pub inline fn getKeyOnly(self: *const Self, key: K) ?V {
+            comptime if (!config.key_only) @compileError("getKeyOnly requires TreeConfig.key_only = true");
+
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
                 if (found.found) return node.values[found.index];
                 if (node.branch) |branch| node = branch.children[found.index].? else return null;
             }
@@ -1117,12 +1153,34 @@ pub fn Tree(
             return self.deleteUnique(gpa, key, val);
         }
 
+        pub inline fn deleteKeyOnly(self: *Self, gpa: mem.Allocator, key: K) !?V {
+            comptime if (!config.key_only) @compileError("deleteKeyOnly requires TreeConfig.key_only = true");
+
+            try self.makeUniqueRoot(gpa);
+            return self.deleteKeyOnlyUnique(gpa, key);
+        }
+
         // Deletes from a tree whose root has already been made unique for a
         // copy-on-write mutation. Handles length updates and root collapse.
         fn deleteUnique(self: *Self, gpa: mem.Allocator, key: K, val: V) !?V {
             const old = if (self.root) |root| try self.deleteFromNode(gpa, root, key, val) else return null;
-            if (old != null) self.len -= 1;
+            if (old != null) {
+                self.len -= 1;
+                self.collapseEmptyRoot(gpa);
+            }
+            return old;
+        }
 
+        fn deleteKeyOnlyUnique(self: *Self, gpa: mem.Allocator, key: K) !?V {
+            const old = if (self.root) |root| try self.deleteKeyOnlyFromNode(gpa, root, key) else return null;
+            if (old != null) {
+                self.len -= 1;
+                self.collapseEmptyRoot(gpa);
+            }
+            return old;
+        }
+
+        fn collapseEmptyRoot(self: *Self, gpa: mem.Allocator) void {
             if (self.root) |root| {
                 if (root.len == 0) {
                     if (root.branch) |branch| {
@@ -1135,7 +1193,6 @@ pub fn Tree(
                     }
                 }
             }
-            return old;
         }
 
         // Recursive deletion implementation. It removes directly from leaves,
@@ -1165,6 +1222,38 @@ pub fn Tree(
 
             try self.makeUniqueChild(gpa, node, found.index);
             const old = try self.deleteFromNodeWithPrefix(gpa, branch.children[found.index].?, key, val, prefix);
+            if (old != null) {
+                branch.counts[found.index] -= 1;
+                try self.rebalanceChild(gpa, node, found.index);
+            }
+
+            return old;
+        }
+
+        fn deleteKeyOnlyFromNode(self: *Self, gpa: mem.Allocator, node: *Node, key: K) anyerror!?V {
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            return self.deleteKeyOnlyFromNodeWithPrefix(gpa, node, key, prefix);
+        }
+
+        fn deleteKeyOnlyFromNodeWithPrefix(self: *Self, gpa: mem.Allocator, node: *Node, key: K, prefix: u64) anyerror!?V {
+            const found = searchKeyOnlyWithPrefix(node, key, prefix);
+            if (node.isLeaf()) return if (found.found) removeItemAt(node, found.index).value else null;
+
+            const branch = node.branch.?;
+            if (found.found) {
+                try self.makeUniqueChild(gpa, node, found.index);
+                const old = node.values[found.index];
+                const replacement = try self.deleteMaxFromNode(gpa, branch.children[found.index].?);
+                node.keys[found.index] = replacement.key;
+                node.values[found.index] = replacement.value;
+                setPrefix(node, found.index);
+                branch.counts[found.index] -= 1;
+                try self.rebalanceChild(gpa, node, found.index);
+                return old;
+            }
+
+            try self.makeUniqueChild(gpa, node, found.index);
+            const old = try self.deleteKeyOnlyFromNodeWithPrefix(gpa, branch.children[found.index].?, key, prefix);
             if (old != null) {
                 branch.counts[found.index] -= 1;
                 try self.rebalanceChild(gpa, node, found.index);
@@ -1550,154 +1639,96 @@ pub fn Tree(
             return removed;
         }
 
-        fn removeChildAndItemAt(self: *Self, gpa: mem.Allocator, node: *Node, child_index: usize) usize {
-            const branch = node.branch.?;
-            const removed = branch.counts[child_index] + 1;
-
-            self.releaseNode(gpa, branch.children[child_index]);
-            releaseValue(gpa, node.values[child_index]);
-
-            mem.copyForwards(K, node.keys[child_index .. node.len - 1], node.keys[child_index + 1 .. node.len]);
-            mem.copyForwards(V, node.values[child_index .. node.len - 1], node.values[child_index + 1 .. node.len]);
-            if (config.use_string_prefix) {
-                mem.copyForwards(u64, branch.prefixes[child_index .. node.len - 1], branch.prefixes[child_index + 1 .. node.len]);
-            }
-            mem.copyForwards(?*Node, branch.children[child_index..node.len], branch.children[child_index + 1 .. node.len + 1]);
-            mem.copyForwards(usize, branch.counts[child_index..node.len], branch.counts[child_index + 1 .. node.len + 1]);
-
-            branch.children[node.len] = null;
-            branch.counts[node.len] = 0;
-            node.len -= 1;
-            return removed;
-        }
-
-        fn removeItemAndRightChildAt(self: *Self, gpa: mem.Allocator, node: *Node, index: usize) usize {
-            const branch = node.branch.?;
-            const child_index = index + 1;
-            const removed = branch.counts[child_index] + 1;
-
-            releaseValue(gpa, node.values[index]);
-            self.releaseNode(gpa, branch.children[child_index]);
-
-            mem.copyForwards(K, node.keys[index .. node.len - 1], node.keys[index + 1 .. node.len]);
-            mem.copyForwards(V, node.values[index .. node.len - 1], node.values[index + 1 .. node.len]);
-            if (config.use_string_prefix) {
-                mem.copyForwards(u64, branch.prefixes[index .. node.len - 1], branch.prefixes[index + 1 .. node.len]);
-            }
-            mem.copyForwards(?*Node, branch.children[child_index..node.len], branch.children[child_index + 1 .. node.len + 1]);
-            mem.copyForwards(usize, branch.counts[child_index..node.len], branch.counts[child_index + 1 .. node.len + 1]);
-
-            branch.children[node.len] = null;
-            branch.counts[node.len] = 0;
-            node.len -= 1;
-            return removed;
-        }
-
-        fn deleteRangeFromLeaf(gpa: mem.Allocator, node: *Node, index: usize, count: usize, depth: usize) usize {
-            const floor = if (depth == 0) 0 else min_items - 1;
-            const removable = if (node.len > floor) node.len - floor else 0;
-            const removed = @min(count, node.len - index, removable);
-            for (index..index + removed) |i| releaseValue(gpa, node.values[i]);
-
-            mem.copyForwards(K, node.keys[index .. node.len - removed], node.keys[index + removed .. node.len]);
-            mem.copyForwards(V, node.values[index .. node.len - removed], node.values[index + removed .. node.len]);
-            node.len -= @intCast(removed);
-            return removed;
-        }
-
-        fn deleteRangeStep(self: *Self, gpa: mem.Allocator, node: *Node, index: usize, count: usize, depth: usize) anyerror!usize {
-            if (node.isLeaf()) return deleteRangeFromLeaf(gpa, node, index, count, depth);
-
-            const branch = node.branch.?;
-            var position: usize = 0;
-            for (0..node.len + 1) |i| {
-                const child_count = branch.counts[i];
-                if (index < position + child_count) {
-                    const child_index = index - position;
-                    if (child_index == 0 and i < node.len and count >= child_count + 1 and node.len > min_items) {
-                        return self.removeChildAndItemAt(gpa, node, i);
-                    }
-
-                    try self.makeUniqueChild(gpa, node, i);
-                    const removed = try self.deleteRangeFromNode(gpa, branch.children[i].?, child_index, @min(count, child_count - child_index), depth + 1);
-                    branch.counts[i] -= removed;
-                    if (removed > 0) try self.rebalanceChild(gpa, node, i);
-                    return removed;
-                }
-                position += child_count;
-
-                if (i < node.len) {
-                    if (index == position) {
-                        if (count >= branch.counts[i + 1] + 1 and node.len > min_items) {
-                            return self.removeItemAndRightChildAt(gpa, node, i);
-                        }
-
-                        const removed = try self.deleteAtFromNode(gpa, node, index);
-                        releaseValue(gpa, removed.value);
-                        return 1;
-                    }
-                    position += 1;
-                }
-            }
-
-            return 0;
-        }
-
-        fn deleteRangeFromNode(self: *Self, gpa: mem.Allocator, node: *Node, index: usize, count: usize, depth: usize) anyerror!usize {
-            var removed: usize = 0;
-            while (removed < count) {
-                const step_removed = try self.deleteRangeStep(gpa, node, index, count - removed, depth);
-                if (step_removed == 0) break;
-                removed += step_removed;
-            }
-            return removed;
-        }
-
         const RangeBuilder = struct {
-            chunks: []DeleteRangeResult.Chunk,
-            chunk_count: usize = 0,
+            const Chunk = DeleteRangeResult.Chunk;
 
-            fn init(gpa: mem.Allocator, item_count: usize) !@This() {
-                return .{ .chunks = try gpa.alloc(DeleteRangeResult.Chunk, item_count * 2 + 1) };
+            chunks: std.ArrayList(Chunk),
+            pending_items: std.ArrayList(Entry),
+
+            fn init() @This() {
+                return .{ .chunks = .empty, .pending_items = .empty };
             }
 
-            fn appendNode(builder: *@This(), node: *Node) void {
-                builder.chunks[builder.chunk_count] = .{ .node = node };
-                builder.chunk_count += 1;
+            fn appendEntry(builder: *@This(), gpa: mem.Allocator, entry: Entry) !void {
+                try builder.pending_items.append(gpa, entry);
             }
 
-            fn appendItems(builder: *@This(), items: []Entry) void {
-                builder.chunks[builder.chunk_count] = .{ .items = items };
-                builder.chunk_count += 1;
+            fn appendNode(builder: *@This(), gpa: mem.Allocator, node: *Node) !void {
+                try builder.flushItems(gpa);
+                try builder.chunks.append(gpa, .{ .node = node });
             }
 
-            fn result(builder: @This(), removed_count: usize) DeleteRangeResult {
-                return .{ .removed_count = removed_count, .chunks = builder.chunks, .chunk_count = builder.chunk_count };
+            fn appendItems(builder: *@This(), gpa: mem.Allocator, items: []Entry) !void {
+                if (items.len == 0) return;
+                try builder.flushItems(gpa);
+                try builder.chunks.append(gpa, .{ .items = items });
             }
+
+            fn appendBuilder(builder: *@This(), gpa: mem.Allocator, other: *@This()) !void {
+                try builder.flushItems(gpa);
+                try other.flushItems(gpa);
+                try builder.chunks.appendSlice(gpa, other.chunks.items);
+                other.chunks.clearRetainingCapacity();
+            }
+
+            fn takePendingItems(builder: *@This(), gpa: mem.Allocator) ![]Entry {
+                if (builder.pending_items.items.len == 0) return &.{};
+                return try builder.pending_items.toOwnedSlice(gpa);
+            }
+
+            fn flushItems(builder: *@This(), gpa: mem.Allocator) !void {
+                const items = try builder.takePendingItems(gpa);
+                if (items.len == 0) return;
+                errdefer gpa.free(items);
+                try builder.chunks.append(gpa, .{ .items = items });
+            }
+
+            fn result(builder: *@This(), gpa: mem.Allocator, removed_count: usize) !DeleteRangeResult {
+                try builder.flushItems(gpa);
+                const chunks = try builder.chunks.toOwnedSlice(gpa);
+                return .{ .removed_count = removed_count, .chunks = chunks, .chunk_count = chunks.len };
+            }
+
+            fn releaseOwned(builder: *@This(), tree: *Self, gpa: mem.Allocator) void {
+                for (builder.chunks.items) |chunk| {
+                    if (chunk.node) |node| tree.releaseNode(gpa, node);
+                    for (chunk.items) |item| releaseValue(gpa, item.value);
+                    if (chunk.items.len != 0) gpa.free(chunk.items);
+                }
+                for (builder.pending_items.items) |item| releaseValue(gpa, item.value);
+                builder.deinit(gpa);
+            }
+
+            fn deinit(builder: *@This(), gpa: mem.Allocator) void {
+                builder.pending_items.deinit(gpa);
+                builder.chunks.deinit(gpa);
+            }
+        };
+
+        const DeleteRangeChunk = struct {
+            start: usize = 0,
+            count: usize = 0,
         };
 
         fn allocEntryChunk(gpa: mem.Allocator, count: usize) ![]Entry {
             return try gpa.alloc(Entry, count);
         }
 
-        fn deleteRangeFromLeafReturning(gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, index: usize, count: usize, depth: usize) !usize {
+        fn deleteRangeFromLeafReturning(gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, offset: usize, index: usize, count: usize, depth: usize) !DeleteRangeChunk {
             const floor = if (depth == 0) 0 else min_items - 1;
             const removable = if (node.len > floor) node.len - floor else 0;
             const removed = @min(count, node.len - index, removable);
+            if (removed == 0) return .{ .start = offset + index, .count = 0 };
+
             const items = try allocEntryChunk(gpa, removed);
+            errdefer gpa.free(items);
             for (items, 0..) |*item, i| item.* = Entry.init(node.keys[index + i], node.values[index + i]);
-            builder.appendItems(items);
+            try builder.appendItems(gpa, items);
 
             mem.copyForwards(K, node.keys[index .. node.len - removed], node.keys[index + removed .. node.len]);
             mem.copyForwards(V, node.values[index .. node.len - removed], node.values[index + removed .. node.len]);
             node.len -= @intCast(removed);
-            return removed;
-        }
-
-        fn appendSingleEntry(gpa: mem.Allocator, builder: *RangeBuilder, entry: Entry) !void {
-            const items = try allocEntryChunk(gpa, 1);
-            items[0] = entry;
-            builder.appendItems(items);
+            return .{ .start = offset + index, .count = removed };
         }
 
         fn detachChildAndItemAt(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, child_index: usize) !usize {
@@ -1706,13 +1737,8 @@ pub fn Tree(
             const child = branch.children[child_index].?;
             const removed = branch.counts[child_index] + 1;
 
-            try appendSingleEntry(gpa, builder, Entry.init(node.keys[child_index], node.values[child_index]));
-            builder.appendNode(child);
-            const item_chunk_index = builder.chunk_count - 2;
-            const node_chunk_index = builder.chunk_count - 1;
-            const item_chunk = builder.chunks[item_chunk_index];
-            builder.chunks[item_chunk_index] = builder.chunks[node_chunk_index];
-            builder.chunks[node_chunk_index] = item_chunk;
+            try builder.appendNode(gpa, child);
+            try builder.appendEntry(gpa, Entry.init(node.keys[child_index], node.values[child_index]));
 
             mem.copyForwards(K, node.keys[child_index .. node.len - 1], node.keys[child_index + 1 .. node.len]);
             mem.copyForwards(V, node.values[child_index .. node.len - 1], node.values[child_index + 1 .. node.len]);
@@ -1735,8 +1761,8 @@ pub fn Tree(
             const child = branch.children[child_index].?;
             const removed = branch.counts[child_index] + 1;
 
-            try appendSingleEntry(gpa, builder, Entry.init(node.keys[index], node.values[index]));
-            builder.appendNode(child);
+            try builder.appendEntry(gpa, Entry.init(node.keys[index], node.values[index]));
+            try builder.appendNode(gpa, child);
 
             mem.copyForwards(K, node.keys[index .. node.len - 1], node.keys[index + 1 .. node.len]);
             mem.copyForwards(V, node.values[index .. node.len - 1], node.values[index + 1 .. node.len]);
@@ -1752,52 +1778,98 @@ pub fn Tree(
             return removed;
         }
 
-        fn deleteRangeStepReturning(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, index: usize, count: usize, depth: usize) anyerror!usize {
-            if (node.isLeaf()) return deleteRangeFromLeafReturning(gpa, builder, node, index, count, depth);
+        fn deleteRangeChunkFromNode(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, offset: usize, index: usize, count: usize, depth: usize) anyerror!DeleteRangeChunk {
+            if (node.isLeaf()) return deleteRangeFromLeafReturning(gpa, builder, node, offset, index, count, depth);
 
             const branch = node.branch.?;
-            var position: usize = 0;
-            for (0..node.len + 1) |i| {
+            var i: usize = 0;
+            var child_offset = offset;
+            var child_index = index;
+            var found_separator = false;
+
+            while (i < node.len) : (i += 1) {
                 const child_count = branch.counts[i];
-                if (index < position + child_count) {
-                    const child_index = index - position;
-                    if (child_index == 0 and i < node.len and count >= child_count + 1 and node.len > min_items) {
-                        return self.detachChildAndItemAt(gpa, builder, node, i);
+                if (child_index <= child_count) {
+                    if (child_index == child_count) {
+                        child_offset += child_count;
+                        found_separator = true;
                     }
-
-                    try self.makeUniqueChild(gpa, node, i);
-                    const removed = try self.deleteRangeFromNodeReturning(gpa, builder, branch.children[i].?, child_index, @min(count, child_count - child_index), depth + 1);
-                    branch.counts[i] -= removed;
-                    if (removed > 0) try self.rebalanceChild(gpa, node, i);
-                    return removed;
+                    break;
                 }
-                position += child_count;
-
-                if (i < node.len) {
-                    if (index == position) {
-                        if (count >= branch.counts[i + 1] + 1 and node.len > min_items) {
-                            return self.detachItemAndRightChildAt(gpa, builder, node, i);
-                        }
-
-                        const item = try allocEntryChunk(gpa, 1);
-                        const removed = try self.deleteAtFromNode(gpa, node, index);
-                        item[0] = removed;
-                        builder.appendItems(item);
-                        return 1;
-                    }
-                    position += 1;
-                }
+                child_index -= child_count + 1;
+                child_offset += child_count + 1;
             }
 
-            return 0;
+            if (found_separator and node.len > min_items and count > branch.counts[i + 1]) {
+                return .{ .start = child_offset, .count = try self.detachItemAndRightChildAt(gpa, builder, node, i) };
+            }
+
+            if (found_separator) {
+                const removed = try self.deleteAtFromNode(gpa, node, index);
+                try builder.appendEntry(gpa, removed);
+                return .{ .start = child_offset, .count = 1 };
+            }
+
+            var taken: usize = 0;
+            var remaining_count = count;
+            var chunk: DeleteRangeChunk = .{};
+            while (child_index == 0 and i < node.len and node.len > min_items and remaining_count > branch.counts[i]) {
+                if (taken == 0) chunk.start = child_offset;
+                const removed = try self.detachChildAndItemAt(gpa, builder, node, i);
+                chunk.count += removed;
+                remaining_count -= removed;
+                taken += 1;
+            }
+            if (taken > 0) return chunk;
+
+            while (child_index > 0 and i < node.len and node.len > min_items and remaining_count > (branch.counts[i] - child_index) + branch.counts[i + 1] + 1) {
+                if (taken == 0) chunk.start = child_offset + branch.counts[i];
+                const removed = try self.detachItemAndRightChildAt(gpa, builder, node, i);
+                chunk.count += removed;
+                remaining_count -= removed;
+                taken += 1;
+            }
+            if (taken > 0) return chunk;
+
+            try self.makeUniqueChild(gpa, node, i);
+            const deleted = try self.deleteRangeChunkFromNode(gpa, builder, branch.children[i].?, child_offset, child_index, count, depth + 1);
+            branch.counts[i] -= deleted.count;
+            if (branch.children[i].?.len < min_items) try self.rebalanceChild(gpa, node, i);
+            return deleted;
         }
 
-        fn deleteRangeFromNodeReturning(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, index: usize, count: usize, depth: usize) anyerror!usize {
-            var removed: usize = 0;
-            while (removed < count) {
-                const step_removed = try self.deleteRangeStepReturning(gpa, builder, node, index, count - removed, depth);
-                if (step_removed == 0) break;
-                removed += step_removed;
+        fn deleteRangeChunkFromRoot(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, index: usize, count: usize) anyerror!DeleteRangeChunk {
+            try self.makeUniqueRoot(gpa);
+            const deleted = try self.deleteRangeChunkFromNode(gpa, builder, self.root.?, 0, index, count, 0);
+            self.len -= deleted.count;
+            self.collapseRootIfNeeded(gpa);
+            return deleted;
+        }
+
+        fn deleteRangeRecursive(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, index: usize, count: usize) anyerror!usize {
+            const end = index + count;
+            var chunk_builder = RangeBuilder.init();
+            var chunk_appended = false;
+            errdefer if (!chunk_appended) chunk_builder.releaseOwned(self, gpa);
+
+            const deleted = try self.deleteRangeChunkFromRoot(gpa, &chunk_builder, index, count);
+            if (deleted.count == 0) {
+                chunk_builder.deinit(gpa);
+                return 0;
+            }
+
+            var removed: usize = deleted.count;
+            if (deleted.start > index) {
+                removed += try self.deleteRangeRecursive(gpa, builder, index, deleted.start - index);
+            }
+
+            try builder.appendBuilder(gpa, &chunk_builder);
+            chunk_appended = true;
+            chunk_builder.deinit(gpa);
+
+            const deleted_end = deleted.start + deleted.count;
+            if (deleted_end < end) {
+                removed += try self.deleteRangeRecursive(gpa, builder, index, end - deleted_end);
             }
             return removed;
         }
@@ -1833,13 +1905,31 @@ pub fn Tree(
                 node = branch.children[found.index].?;
             }
         }
+
+        fn rankOfKeyOnly(self: *const Self, key: K) RankResult {
+            comptime if (!config.key_only) @compileError("rankOfKeyOnly requires TreeConfig.key_only = true");
+
+            var node = self.root orelse return RankResult.init(0, false);
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            var skipped: usize = 0;
+
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (node.isLeaf()) return RankResult.init(found.index + skipped, found.found);
+
+                const branch = node.branch.?;
+                for (0..found.index) |i| skipped += branch.counts[i] + 1;
+                if (found.found) return RankResult.init(skipped + branch.counts[found.index], true);
+
+                node = branch.children[found.index].?;
+            }
+        }
         /// Removes up to `count` items starting at sorted position `index`.
         ///
         /// Ranges past the end are clamped, and empty or out-of-range requests
-        /// remove nothing. By default the returned result lazily owns the
-        /// removed entries in sorted order; callers must call
-        /// `DeleteRangeResult.deinit`. With `.no_return = true`, removed values
-        /// are released immediately and the result has no chunks.
+        /// remove nothing. The returned result lazily owns the removed entries
+        /// in sorted order; callers must call `DeleteRangeResult.deinit` unless
+        /// they intentionally transfer ownership to a longer-lived allocator.
         pub fn deleteRangeAt(self: *Self, gpa: mem.Allocator, index: usize, count: usize, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
             if (index >= self.len or count == 0) return .{ .removed_count = 0, .chunks = &.{}, .chunk_count = 0 };
 
@@ -1850,34 +1940,29 @@ pub fn Tree(
             if (end <= start) return .{ .removed_count = 0, .chunks = &.{}, .chunk_count = 0 };
 
             const limit = end - start;
-            if (comptime opts.no_return) {
-                if (start == 0 and limit == self.len) {
-                    self.clear(gpa);
-                    return .{ .removed_count = limit, .chunks = &.{}, .chunk_count = 0 };
-                }
-
-                try self.makeUniqueRoot(gpa);
-                const removed = try self.deleteRangeFromNode(gpa, self.root.?, start, limit, 0);
-                self.len -= removed;
-                self.collapseRootIfNeeded(gpa);
-                return .{ .removed_count = removed, .chunks = &.{}, .chunk_count = 0 };
-            }
-
-            var builder = try RangeBuilder.init(gpa, limit);
-            errdefer builder.result(0).deinit(gpa);
+            var builder = RangeBuilder.init();
+            errdefer builder.releaseOwned(self, gpa);
 
             if (start == 0 and limit == self.len) {
-                if (self.root) |root| builder.appendNode(root);
+                if (self.root) |root| try builder.appendNode(gpa, root);
                 self.root = null;
                 self.len = 0;
-                return builder.result(limit);
+                return builder.result(gpa, limit);
             }
 
-            try self.makeUniqueRoot(gpa);
-            const removed = try self.deleteRangeFromNodeReturning(gpa, &builder, self.root.?, start, limit, 0);
-            self.len -= removed;
-            self.collapseRootIfNeeded(gpa);
-            return builder.result(removed);
+            const removed = try self.deleteRangeRecursive(gpa, &builder, start, limit);
+            return builder.result(gpa, removed);
+        }
+
+        fn deleteRangeByRank(self: *Self, gpa: mem.Allocator, min_rank: RankResult, max_rank: RankResult, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
+            var start = min_rank.index;
+            if (opts.min_exclusive and min_rank.found) start += 1;
+
+            var end = max_rank.index;
+            if (opts.max_inclusive and max_rank.found) end += 1;
+
+            if (end <= start) return .{ .removed_count = 0, .chunks = &.{}, .chunk_count = 0 };
+            return self.deleteRangeAt(gpa, start, end - start, .{});
         }
 
         pub fn deleteRange(
@@ -1889,17 +1974,12 @@ pub fn Tree(
             max_value: V,
             comptime opts: DeleteRangeOptions,
         ) !DeleteRangeResult {
-            const min_rank = self.rankOf(min_key, min_value);
-            const max_rank = self.rankOf(max_key, max_value);
+            return self.deleteRangeByRank(gpa, self.rankOf(min_key, min_value), self.rankOf(max_key, max_value), opts);
+        }
 
-            var start = min_rank.index;
-            if (opts.min_exclusive and min_rank.found) start += 1;
-
-            var end = max_rank.index;
-            if (opts.max_inclusive and max_rank.found) end += 1;
-
-            if (end <= start) return .{ .removed_count = 0, .chunks = &.{}, .chunk_count = 0 };
-            return self.deleteRangeAt(gpa, start, end - start, .{ .no_return = opts.no_return });
+        pub fn deleteRangeKeyOnly(self: *Self, gpa: mem.Allocator, min_key: K, max_key: K, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
+            comptime if (!config.key_only) @compileError("deleteRangeKeyOnly requires TreeConfig.key_only = true");
+            return self.deleteRangeByRank(gpa, self.rankOfKeyOnly(min_key), self.rankOfKeyOnly(max_key), opts);
         }
 
         /// Removes every item and releases all nodes owned by this tree.
@@ -2301,6 +2381,52 @@ test "prefix branch search uses prefixes before full string compare" {
     try testing.expect(!after_all.found);
 }
 
+test "key-only search uses ordered key prefixes without values" {
+    const StringTree = Tree([]const u8, usize, .{ .compare = compareTestStringKey, .use_string_prefix = true, .key_only = true });
+    var tree = StringTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const branch_node = try tree.newNode(testing.allocator, false);
+    defer tree.destroyNode(testing.allocator, branch_node);
+
+    branch_node.keys[0] = "abcdefgh-010";
+    branch_node.values[0] = 10;
+    branch_node.keys[1] = "abcdefgh-020";
+    branch_node.values[1] = 20;
+    branch_node.keys[2] = "ijklmnop-000";
+    branch_node.values[2] = 30;
+    branch_node.len = 3;
+    for (0..branch_node.len) |i| StringTree.setPrefix(branch_node, i);
+
+    const collision_match = StringTree.searchKeyOnlyWithPrefix(branch_node, "abcdefgh-020", StringTree.stringPrefix("abcdefgh-020"));
+    const between_prefixes = StringTree.searchKeyOnlyWithPrefix(branch_node, "abcdefgi", StringTree.stringPrefix("abcdefgi"));
+    const after_all = StringTree.searchKeyOnlyWithPrefix(branch_node, "zzzzzzzz", StringTree.stringPrefix("zzzzzzzz"));
+
+    try testing.expectEqual(1, collision_match.index);
+    try testing.expect(collision_match.found);
+    try testing.expectEqual(2, between_prefixes.index);
+    try testing.expect(!between_prefixes.found);
+    try testing.expectEqual(3, after_all.index);
+    try testing.expect(!after_all.found);
+
+    const leaf_node = try tree.newNode(testing.allocator, true);
+    defer tree.destroyNode(testing.allocator, leaf_node);
+
+    leaf_node.keys[0] = "alpha";
+    leaf_node.values[0] = 1;
+    leaf_node.keys[1] = "bravo";
+    leaf_node.values[1] = 2;
+    leaf_node.len = 2;
+
+    const leaf_match = StringTree.searchKeyOnlyWithPrefix(leaf_node, "bravo", StringTree.stringPrefix("bravo"));
+    const leaf_insert = StringTree.searchKeyOnlyWithPrefix(leaf_node, "azure", StringTree.stringPrefix("azure"));
+
+    try testing.expectEqual(1, leaf_match.index);
+    try testing.expect(leaf_match.found);
+    try testing.expectEqual(1, leaf_insert.index);
+    try testing.expect(!leaf_insert.found);
+}
+
 test "insertItemAt shifts items inside a leaf" {
     const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
     var tree = IntTree.init();
@@ -2511,6 +2637,46 @@ test "deleteFromNode removes matching leaf entries" {
     try testing.expectEqual(30, node.keys[1]);
     try testing.expectEqual(40, node.keys[2]);
     try testing.expect(try tree.deleteFromNode(testing.allocator, node, 50, 0) == null);
+}
+
+test "key-only get and delete ignore stored values" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false, .key_only = true });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..80) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insertKeyOnly(testing.allocator, key, key * 10));
+    }
+
+    const found_value: ?isize = 420;
+    const missing_value: ?isize = null;
+    try testing.expectEqual(found_value, tree.getKeyOnly(42));
+    try testing.expect(!try tree.insertKeyOnly(testing.allocator, 42, -42));
+    try testing.expectEqual(found_value, try tree.deleteKeyOnly(testing.allocator, 42));
+    try testing.expectEqual(missing_value, tree.getKeyOnly(42));
+    try testing.expectEqual(missing_value, try tree.deleteKeyOnly(testing.allocator, 42));
+    try testing.expectEqual(79, tree.len);
+    try tree.checkInvariants();
+}
+
+test "key-only delete collapses empty root" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false, .key_only = true });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..80) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insertKeyOnly(testing.allocator, key, -key));
+    }
+
+    for (0..80) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect((try tree.deleteKeyOnly(testing.allocator, key)) != null);
+    }
+
+    try testing.expectEqual(0, tree.len);
+    try testing.expect(tree.root == null);
 }
 
 test "rotateFromLeft borrows the left sibling maximum through the parent" {
