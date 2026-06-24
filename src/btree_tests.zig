@@ -211,47 +211,6 @@ fn insertStringKeys(comptime count: usize, tree: anytype, buffers: *[count][12]u
     }
 }
 
-test "key-only lookup and delete use ordered keys after splits" {
-    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKeyThenValue, .use_string_prefix = false, .key_only = true });
-    var tree = IntTree.init();
-    defer tree.deinit(testing.allocator);
-
-    for (0..160) |i| {
-        const key: isize = @intCast(i);
-        try testing.expect(try tree.insertKeyOnly(testing.allocator, key, key * 10));
-    }
-
-    try testing.expect(!try tree.insertKeyOnly(testing.allocator, 42, -1));
-    const expected_value: ?isize = 420;
-    const missing_value: ?isize = null;
-    try testing.expectEqual(expected_value, tree.getKeyOnly(42));
-    try testing.expectEqual(expected_value, try tree.deleteKeyOnly(testing.allocator, 42));
-    try testing.expectEqual(missing_value, tree.getKeyOnly(42));
-    try testing.expectEqual(missing_value, try tree.deleteKeyOnly(testing.allocator, 42));
-    try testing.expectEqual(159, tree.len);
-    try tree.checkInvariants();
-}
-
-test "string key-only lookup and delete use prefix routing" {
-    const StringTree = btree.Tree([]const u8, usize, .{ .compare = compareStringKey, .use_string_prefix = true, .key_only = true });
-    var tree = StringTree.init();
-    defer tree.deinit(testing.allocator);
-
-    var buffers: [96][20]u8 = undefined;
-    for (&buffers, 0..) |*buffer, i| {
-        const key = try std.fmt.bufPrint(buffer, "shared-prefix-{d:0>3}", .{i});
-        try testing.expect(try tree.insertKeyOnly(testing.allocator, key, i));
-    }
-
-    const expected_value: ?usize = 64;
-    const missing_value: ?usize = null;
-    try testing.expectEqual(expected_value, tree.getKeyOnly("shared-prefix-064"));
-    try testing.expectEqual(expected_value, try tree.deleteKeyOnly(testing.allocator, "shared-prefix-064"));
-    try testing.expectEqual(missing_value, tree.getKeyOnly("shared-prefix-064"));
-    try testing.expectEqual(95, tree.len);
-    try tree.checkInvariants();
-}
-
 test "string prefixes route searches across split root" {
     const StringTree = btree.Tree([]const u8, usize, .{ .compare = compareStringKey, .use_string_prefix = true });
     var tree = StringTree.init();
@@ -303,27 +262,6 @@ test "binary string search works with prefix routing and collisions" {
     try testing.expectEqualStrings("abcdefgh-063", tree.seekPrev("abcdefgh-064", 0).?.key);
     try testing.expectEqual(64, tree.indexOf("abcdefgh-064", 0).?);
     try testing.expect(tree.get("abcdefgh-999", 0) == null);
-    try tree.checkInvariants();
-}
-
-test "key_only string search ignores values with prefixes enabled" {
-    const StringTree = btree.Tree([]const u8, usize, .{ .compare = compareStringKey, .use_string_prefix = true, .key_only = true });
-    var tree = StringTree.init();
-    defer tree.deinit(testing.allocator);
-
-    var buffers: [81][12]u8 = undefined;
-    try insertStringKeys(80, &tree, buffers[0..80], "key");
-    try testing.expect(!try tree.insert(testing.allocator, "key-042", 4200));
-    try testing.expectEqual(80, tree.len);
-    try testing.expectEqual(42, tree.get("key-042", 999).?);
-    try testing.expectEqual(42, tree.indexOf("key-042", 999).?);
-
-    try testing.expectEqual(42, (try tree.set(testing.allocator, "key-042", 4200)).?);
-    try testing.expectEqual(80, tree.len);
-    try testing.expectEqual(4200, tree.get("key-042", 0).?);
-    try testing.expectEqual(4200, (try tree.delete(testing.allocator, "key-042", 1234)).?);
-    try testing.expectEqual(79, tree.len);
-    try testing.expect(tree.get("key-042", 0) == null);
     try tree.checkInvariants();
 }
 
@@ -437,42 +375,6 @@ test "default comparator can order equal keys by value" {
     try tree.checkInvariants();
 }
 
-test "key_only ignores values for ordered integer keys" {
-    const KeyOnlyTree = btree.Tree(isize, isize, .{ .compare = compareIntKeyThenValue, .use_string_prefix = false, .key_only = true });
-    var tree = KeyOnlyTree.init();
-    defer tree.deinit(testing.allocator);
-
-    try testing.expect(try tree.insert(testing.allocator, 10, 100));
-    try testing.expect(!try tree.insert(testing.allocator, 10, 200));
-    try testing.expectEqual(1, tree.len);
-    try testing.expectEqual(100, tree.get(10, 999).?);
-
-    try testing.expectEqual(100, (try tree.set(testing.allocator, 10, 200)).?);
-    try testing.expectEqual(1, tree.len);
-    try testing.expectEqual(200, tree.get(10, -1).?);
-    try testing.expectEqual(0, tree.indexOf(10, 1234).?);
-    try testing.expectEqual(200, (try tree.delete(testing.allocator, 10, -1)).?);
-    try testing.expectEqual(0, tree.len);
-    try tree.checkInvariants();
-}
-
-test "key_only supports enum key ordering" {
-    const EnumTree = btree.Tree(Color, usize, .{ .compare = compareColorKey, .use_string_prefix = false, .key_only = true });
-    var tree = EnumTree.init();
-    defer tree.deinit(testing.allocator);
-
-    try testing.expect(try tree.insert(testing.allocator, .blue, 3));
-    try testing.expect(try tree.insert(testing.allocator, .red, 1));
-    try testing.expect(try tree.insert(testing.allocator, .green, 2));
-    try testing.expect(!try tree.insert(testing.allocator, .green, 22));
-
-    try testing.expectEqual(Color.red, tree.getAt(0).?.key);
-    try testing.expectEqual(Color.green, tree.getAt(1).?.key);
-    try testing.expectEqual(Color.blue, tree.getAt(2).?.key);
-    try testing.expectEqual(2, tree.get(.green, 99).?);
-    try tree.checkInvariants();
-}
-
 test "binary search mode preserves lookup and index behavior after splits" {
     const BinaryTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false, .search_mode = .binary });
     var tree = BinaryTree.init();
@@ -539,7 +441,7 @@ test "set inserts missing keys and replaces existing values" {
 }
 
 test "copy-on-write replace does not mutate original" {
-    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false, .key_only = true });
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
     var original = IntTree.init();
     defer original.deinit(testing.allocator);
 
@@ -559,7 +461,7 @@ test "copy-on-write replace does not mutate original" {
 }
 
 test "copy-on-write set existing key does not mutate original" {
-    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false, .key_only = true });
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
     var original = IntTree.init();
     defer original.deinit(testing.allocator);
 
@@ -1010,7 +912,6 @@ test "deleteRange result owns removed values" {
     const ByteTree = btree.Tree(isize, []const u8, .{
         .compare = compareIntKeyOwnedBytes,
         .use_string_prefix = false,
-        .key_only = true,
         .copy_value = copyBytes,
         .release_value = releaseBytes,
     });
@@ -1141,27 +1042,6 @@ test "deleteRange honors value tie breakers" {
     try testing.expectEqual(5, tree.len);
     try testing.expectEqual(9, tree.front().?.key);
     try testing.expectEqual(11, tree.back().?.key);
-    try tree.checkInvariants();
-}
-
-test "deleteRange honors key_only ordering" {
-    const KeyOnlyTree = btree.Tree(isize, isize, .{ .compare = compareIntKeyThenValue, .use_string_prefix = false, .key_only = true });
-    var tree = KeyOnlyTree.init();
-    defer tree.deinit(testing.allocator);
-
-    for (0..10) |i| {
-        const key: isize = @intCast(i);
-        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
-    }
-
-    try expectRemovedCount(4, try tree.deleteRange(testing.allocator, 3, 999, 6, -999, .{ .max_inclusive = true }));
-    for (3..7) |i| {
-        const key: isize = @intCast(i);
-        try testing.expect(tree.get(key, 0) == null);
-    }
-    try testing.expectEqual(6, tree.len);
-    try testing.expectEqual(20, tree.get(2, 999).?);
-    try testing.expectEqual(70, tree.get(7, -999).?);
     try tree.checkInvariants();
 }
 

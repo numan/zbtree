@@ -1,10 +1,10 @@
 const std = @import("std");
-const btree = @import("btree.zig");
+const map_tree = @import("map_tree.zig");
 
 const mem = std.mem;
 
-pub const SearchMode = btree.SearchMode;
-pub const DeleteRangeOptions = btree.DeleteRangeOptions;
+pub const SearchMode = map_tree.SearchMode;
+pub const DeleteRangeOptions = map_tree.DeleteRangeOptions;
 
 pub fn MapConfig(comptime K: type, comptime V: type) type {
     return struct {
@@ -19,14 +19,6 @@ pub fn MapConfig(comptime K: type, comptime V: type) type {
     };
 }
 
-fn ignoredCompare(comptime K: type, comptime V: type) fn (K, V, K, V) std.math.Order {
-    return struct {
-        fn compare(_: K, _: V, _: K, _: V) std.math.Order {
-            unreachable;
-        }
-    }.compare;
-}
-
 /// btype.Map-like key/value collection.
 ///
 /// Items are ordered and identified by key only. Values never participate in
@@ -38,11 +30,9 @@ pub fn Map(
     comptime V: type,
     comptime config: MapConfig(K, V),
 ) type {
-    const Tree = btree.Tree(K, V, .{
-        .compare = ignoredCompare(K, V),
+    const Tree = map_tree.OrderedMapTree(K, V, .{
         .use_string_prefix = config.use_string_prefix,
         .search_mode = config.search_mode,
-        .key_only = true,
         .copy_value = config.copy_value,
         .release_value = config.release_value,
     });
@@ -75,23 +65,23 @@ pub fn Map(
         }
 
         pub inline fn insert(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
-            return self.tree.insertKeyOnly(gpa, key, value);
+            return self.tree.insert(gpa, key, value);
         }
 
         pub inline fn get(self: *const Self, key: K) ?V {
-            return self.tree.getKeyOnly(key);
+            return self.tree.get(key);
         }
 
         pub inline fn seek(self: *const Self, key: K) ?Entry {
-            return self.tree.seek(key, undefined);
+            return self.tree.seek(key);
         }
 
         pub inline fn seekNext(self: *const Self, key: K) ?Entry {
-            return self.tree.seekNext(key, undefined);
+            return self.tree.seekNext(key);
         }
 
         pub inline fn seekPrev(self: *const Self, key: K) ?Entry {
-            return self.tree.seekPrev(key, undefined);
+            return self.tree.seekPrev(key);
         }
 
         pub inline fn getAt(self: *const Self, index: usize) ?Entry {
@@ -99,7 +89,7 @@ pub fn Map(
         }
 
         pub inline fn indexOf(self: *const Self, key: K) ?usize {
-            return self.tree.indexOf(key, undefined);
+            return self.tree.indexOf(key);
         }
 
         pub inline fn ascent(
@@ -149,7 +139,7 @@ pub fn Map(
         }
 
         pub inline fn delete(self: *Self, gpa: mem.Allocator, key: K) !?V {
-            return self.tree.deleteKeyOnly(gpa, key);
+            return self.tree.delete(gpa, key);
         }
 
         pub inline fn front(self: *const Self) ?Entry {
@@ -191,7 +181,7 @@ pub fn Map(
             max_key: K,
             comptime opts: DeleteRangeOptions,
         ) !DeleteRangeResult {
-            return self.tree.deleteRangeKeyOnly(gpa, min_key, max_key, opts);
+            return self.tree.deleteRange(gpa, min_key, max_key, opts);
         }
 
         pub inline fn deleteAllAt(self: *Self, gpa: mem.Allocator, index: usize, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
