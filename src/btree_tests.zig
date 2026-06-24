@@ -42,7 +42,7 @@ const Pair = struct {
 };
 
 const CollectContext = struct {
-    items: [300]Pair = undefined,
+    items: [1200]Pair = undefined,
     len: usize = 0,
 };
 
@@ -870,9 +870,12 @@ test "deleteRangeAt returns removed entries in sorted order" {
     const result = try tree.deleteRangeAt(testing.allocator, 5, 7, .{});
     defer result.deinit(testing.allocator);
 
+    var removed_items = CollectContext{};
+    try result.ascent(*CollectContext, &removed_items, collectPair);
+
     try testing.expectEqual(7, result.removed_count);
-    try testing.expectEqual(7, result.items.len);
-    for (result.items, 5..) |item, expected| {
+    try testing.expectEqual(7, removed_items.len);
+    for (removed_items.items[0..removed_items.len], 5..) |item, expected| {
         const key: isize = @intCast(expected);
         try testing.expectEqual(key, item.key);
         try testing.expectEqual(-key, item.value);
@@ -897,7 +900,7 @@ test "deleteRangeAt no_return skips returned entries" {
     defer result.deinit(testing.allocator);
 
     try testing.expectEqual(5, result.removed_count);
-    try testing.expectEqual(0, result.items.len);
+    try testing.expectEqual(0, result.chunk_count);
     try testing.expectEqual(7, tree.len);
     try testing.expectEqual(2, tree.getAt(2).?.key);
     try testing.expectEqual(8, tree.getAt(3).?.key);
@@ -924,12 +927,23 @@ test "deleteRange result owns removed values" {
     const result = try tree.deleteRange(testing.allocator, 2, "", 5, "", .{ .max_inclusive = true });
     defer result.deinit(testing.allocator);
 
+    const ByteContext = struct {
+        seen: usize = 0,
+
+        fn verify(ctx: *@This(), key: isize, value: []const u8) !void {
+            const expected_key: isize = @intCast(ctx.seen + 2);
+            var buffer: [16]u8 = undefined;
+            const expected_value = try std.fmt.bufPrint(&buffer, "value-{d}", .{expected_key});
+            try testing.expectEqual(expected_key, key);
+            try testing.expectEqualStrings(expected_value, value);
+            ctx.seen += 1;
+        }
+    };
+    var byte_context = ByteContext{};
+    try result.ascent(*ByteContext, &byte_context, ByteContext.verify);
+
     try testing.expectEqual(4, result.removed_count);
-    try testing.expectEqual(4, result.items.len);
-    try testing.expectEqual(2, result.items[0].key);
-    try testing.expectEqualStrings("value-2", result.items[0].value);
-    try testing.expectEqual(5, result.items[3].key);
-    try testing.expectEqualStrings("value-5", result.items[3].value);
+    try testing.expectEqual(4, byte_context.seen);
     try testing.expectEqual(4, tree.len);
     try testing.expect(tree.get(2, "") == null);
     try testing.expectEqualStrings("value-6", tree.get(6, "").?);
@@ -1127,10 +1141,13 @@ test "deleteRange clones copy-on-write paths before removing subtrees" {
     const result = try copy.deleteRange(testing.allocator, 500, 0, 1500, 0, .{});
     defer result.deinit(testing.allocator);
 
+    var removed_items = CollectContext{};
+    try result.ascent(*CollectContext, &removed_items, collectPair);
+
     try testing.expectEqual(1000, result.removed_count);
-    try testing.expectEqual(1000, result.items.len);
-    try testing.expectEqual(500, result.items[0].key);
-    try testing.expectEqual(1499, result.items[result.items.len - 1].key);
+    try testing.expectEqual(1000, removed_items.len);
+    try testing.expectEqual(500, removed_items.items[0].key);
+    try testing.expectEqual(1499, removed_items.items[removed_items.len - 1].key);
     try testing.expectEqual(1000, copy.len);
     try testing.expectEqual(2000, original.len);
 

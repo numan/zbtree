@@ -168,6 +168,14 @@ pub fn Map(
             return self.tree.popBack(gpa);
         }
 
+        pub inline fn pushFront(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
+            return self.tree.pushFront(gpa, key, value);
+        }
+
+        pub inline fn pushBack(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
+            return self.tree.pushBack(gpa, key, value);
+        }
+
         pub inline fn deleteAt(self: *Self, gpa: mem.Allocator, index: usize) !?Entry {
             return self.tree.deleteAt(gpa, index);
         }

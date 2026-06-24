@@ -46,6 +46,8 @@ func benchMap[T keyType](items, runs int) {
 
 	fmt.Printf("Benchmarking %d items, %s keys, %d times, using median\n", items, keyName, runs)
 	runBench("insert(seq)", items, runs, ctx.preInsertSeq, ctx.insertAll)
+	runBench("pushBack(seq)", items, runs, ctx.prePushBackSeq, ctx.pushBackAll)
+	runBench("pushFront(seq)", items, runs, ctx.prePushFrontSeq, ctx.pushFrontAll)
 	runBench("insert(rand)", items, runs, ctx.preInsertRand, ctx.insertAll)
 	runBench("get(seq)", items, runs, ctx.preFullSeq, ctx.getAll)
 	runBench("get(rand)", items, runs, ctx.preFullRand, ctx.getAll)
@@ -60,9 +62,12 @@ func benchMap[T keyType](items, runs int) {
 	runBench("deleteAt(front)", items, runs, ctx.preFullSeq, ctx.deleteAtFrontAll)
 	runBench("popFront", items, runs, ctx.preFullSeq, ctx.popFrontAll)
 	runBench("popBack", items, runs, ctx.preFullSeq, ctx.popBackAll)
-	runBench("deleteRangeAt", items, runs, ctx.preFullSeq, ctx.deleteRangeAtAll)
-	runBench("deleteRange", items, runs, ctx.preFullSeq, ctx.deleteRangeAll)
-	runBench("clear", items, runs, ctx.preFullSeq, ctx.clearAll)
+	rangeOps := partialRangeCount(items)
+	runBench("deleteRangeAt(part)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangeAtPartial)
+	runBench("deleteRange(part)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangePartial)
+	runBench("deleteRangeAt(ret)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangeAtReturning)
+	runBench("deleteRange(ret)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangeReturning)
+	runBench("release", items, runs, ctx.preFullSeq, ctx.releaseAll)
 	runBench("copy", 1, runs, ctx.preFullSeq, ctx.copyOnce)
 	fmt.Println()
 }
@@ -87,6 +92,15 @@ func (c *benchContext[T]) preInsertRand() {
 	shuffle(c.rng, c.keys)
 }
 
+func (c *benchContext[T]) prePushBackSeq() {
+	c.preInsertSeq()
+}
+
+func (c *benchContext[T]) prePushFrontSeq() {
+	c.preInsertSeq()
+	slices.Reverse(c.keys)
+}
+
 func (c *benchContext[T]) preFullSeq() {
 	c.fillTree(false)
 }
@@ -108,6 +122,20 @@ func (c *benchContext[T]) insertAll() {
 	for _, key := range c.keys {
 		_, ok := c.tree.Insert(key, struct{}{})
 		assert(ok)
+	}
+	runtime.KeepAlive(c.tree.Len())
+}
+
+func (c *benchContext[T]) pushBackAll() {
+	for _, key := range c.keys {
+		assert(c.tree.PushBack(key, struct{}{}))
+	}
+	runtime.KeepAlive(c.tree.Len())
+}
+
+func (c *benchContext[T]) pushFrontAll() {
+	for _, key := range c.keys {
+		assert(c.tree.PushFront(key, struct{}{}))
 	}
 	runtime.KeepAlive(c.tree.Len())
 }
@@ -240,26 +268,58 @@ func (c *benchContext[T]) popBackAll() {
 	c.record(deleted)
 }
 
-func (c *benchContext[T]) deleteRangeAtAll() {
-	removed := c.tree.DeleteRangeAtOptions(0, c.items, btype.DeleteRangeOptions{NoReturn: true})
+func (c *benchContext[T]) deleteRangeAtPartial() {
+	count := partialRangeCount(c.items)
+	start := partialRangeStart(c.items, count)
+	removed := c.tree.DeleteRangeAtOptions(start, count, btype.DeleteRangeOptions{NoReturn: true})
 	assert(removed.Len() == 0)
-	assert(c.tree.Len() == 0)
-	c.record(c.items)
+	assert(c.tree.Len() == c.items-count)
+	c.record(count)
 }
 
-func (c *benchContext[T]) deleteRangeAll() {
-	first, _, ok := c.tree.Front()
+func (c *benchContext[T]) deleteRangePartial() {
+	first, last, ok := c.partialRangeBounds()
 	assert(ok)
-	last, _, ok := c.tree.Back()
-	assert(ok)
+	count := partialRangeCount(c.items)
 	removed := c.tree.DeleteRangeOptions(first, last, btype.DeleteRangeOptions{MaxInclusive: true, NoReturn: true})
 	assert(removed.Len() == 0)
-	assert(c.tree.Len() == 0)
-	c.record(c.items)
+	assert(c.tree.Len() == c.items-count)
+	c.record(count)
 }
 
-func (c *benchContext[T]) clearAll() {
-	c.tree.Clear()
+func (c *benchContext[T]) deleteRangeAtReturning() {
+	count := partialRangeCount(c.items)
+	start := partialRangeStart(c.items, count)
+	removed := c.tree.DeleteRangeAt(start, count)
+	assert(removed.Len() == count)
+	assert(c.tree.Len() == c.items-count)
+	c.record(count)
+}
+
+func (c *benchContext[T]) deleteRangeReturning() {
+	first, last, ok := c.partialRangeBounds()
+	assert(ok)
+	count := partialRangeCount(c.items)
+	removed := c.tree.DeleteRangeOptions(first, last, btype.DeleteRangeOptions{MaxInclusive: true})
+	assert(removed.Len() == count)
+	assert(c.tree.Len() == c.items-count)
+	c.record(count)
+}
+
+func (c *benchContext[T]) partialRangeBounds() (T, T, bool) {
+	count := partialRangeCount(c.items)
+	start := partialRangeStart(c.items, count)
+	first, _, ok := c.tree.GetAt(start)
+	if !ok {
+		var zero T
+		return zero, zero, false
+	}
+	last, _, ok := c.tree.GetAt(start + count - 1)
+	return first, last, ok
+}
+
+func (c *benchContext[T]) releaseAll() {
+	c.tree.Release()
 	c.record(c.items)
 }
 
@@ -287,6 +347,14 @@ func runBench(label string, ops, runs int, pre, op func()) {
 	median := elapsed[runs/2]
 	fmt.Printf("%-19s", label)
 	writeOutput(ops, median)
+}
+
+func partialRangeCount(items int) int {
+	return max(1, items/10)
+}
+
+func partialRangeStart(items, count int) int {
+	return (items - count) / 2
 }
 
 func randKeys[T keyType](rng *rand.Rand, items int) []T {

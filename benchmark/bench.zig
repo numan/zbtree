@@ -90,6 +90,8 @@ fn benchType(
     try stdout.print("Benchmarking {d} items, {s} keys, {d} times, using median\n", .{ options.items, key_name, options.runs });
 
     try runBenchmark(Ctx, &ctx, "insert(seq)", options.items, options.runs, Ctx.preInsertSeq, Ctx.insertAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "pushBack(seq)", options.items, options.runs, Ctx.prePushBackSeq, Ctx.pushBackAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "pushFront(seq)", options.items, options.runs, Ctx.prePushFrontSeq, Ctx.pushFrontAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "insert(rand)", options.items, options.runs, Ctx.preInsertRand, Ctx.insertAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "get(seq)", options.items, options.runs, Ctx.preFullSeq, Ctx.getAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "get(rand)", options.items, options.runs, Ctx.preFullRand, Ctx.getAll, allocator, io, stdout);
@@ -104,9 +106,12 @@ fn benchType(
     try runBenchmark(Ctx, &ctx, "deleteAt(front)", options.items, options.runs, Ctx.preFullSeq, Ctx.deleteAtFrontAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "popFront", options.items, options.runs, Ctx.preFullSeq, Ctx.popFrontAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "popBack", options.items, options.runs, Ctx.preFullSeq, Ctx.popBackAll, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "deleteRangeAt", options.items, options.runs, Ctx.preFullSeq, Ctx.deleteRangeAtAll, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "deleteRange", options.items, options.runs, Ctx.preFullSeq, Ctx.deleteRangeAll, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "clear", options.items, options.runs, Ctx.preFullSeq, Ctx.clearAll, allocator, io, stdout);
+    const range_ops = partialRangeCount(options.items);
+    try runBenchmark(Ctx, &ctx, "deleteRangeAt(part)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangeAtPartial, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "deleteRange(part)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangePartial, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "deleteRangeAt(ret)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangeAtReturning, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "deleteRange(ret)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangeReturning, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "release", options.items, options.runs, Ctx.preFullSeq, Ctx.releaseAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "copy", 1, options.runs, Ctx.preFullSeq, Ctx.copyOnce, allocator, io, stdout);
     try stdout.print("\n", .{});
 }
@@ -210,6 +215,15 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             try self.prepareKeys(true);
         }
 
+        pub fn prePushBackSeq(self: *Self) !void {
+            try self.preInsertSeq();
+        }
+
+        pub fn prePushFrontSeq(self: *Self) !void {
+            try self.preInsertSeq();
+            std.mem.reverse(K, self.keys);
+        }
+
         pub fn preFullSeq(self: *Self) !void {
             try self.fillTree(false);
         }
@@ -221,6 +235,22 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
         pub fn insertAll(self: *Self) !void {
             for (self.keys) |key| {
                 if (!try self.tree.insert(self.allocator, key, {})) return error.BenchmarkDuplicateKey;
+            }
+            self.retainPreparedStringBytes();
+            std.mem.doNotOptimizeAway(self.tree.len());
+        }
+
+        pub fn pushBackAll(self: *Self) !void {
+            for (self.keys) |key| {
+                if (!try self.tree.pushBack(self.allocator, key, {})) return error.BenchmarkDuplicateKey;
+            }
+            self.retainPreparedStringBytes();
+            std.mem.doNotOptimizeAway(self.tree.len());
+        }
+
+        pub fn pushFrontAll(self: *Self) !void {
+            for (self.keys) |key| {
+                if (!try self.tree.pushFront(self.allocator, key, {})) return error.BenchmarkDuplicateKey;
             }
             self.retainPreparedStringBytes();
             std.mem.doNotOptimizeAway(self.tree.len());
@@ -323,21 +353,49 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             self.record(deleted);
         }
 
-        pub fn deleteRangeAtAll(self: *Self) !void {
-            const removed = try self.tree.deleteRangeAt(self.allocator, 0, self.items, .{ .no_return = true });
-            if (removed.removed_count != self.items) return error.BenchmarkMissingKey;
+        pub fn deleteRangeAtPartial(self: *Self) !void {
+            const count = partialRangeCount(self.items);
+            const start = partialRangeStart(self.items, count);
+            const removed = try self.tree.deleteRangeAt(self.allocator, start, count, .{ .no_return = true });
+            if (removed.removed_count != count) return error.BenchmarkMissingKey;
             self.record(removed.removed_count);
         }
 
-        pub fn deleteRangeAll(self: *Self) !void {
-            const first = self.tree.front() orelse return error.BenchmarkMissingKey;
-            const last = self.tree.back() orelse return error.BenchmarkMissingKey;
-            const removed = try self.tree.deleteRange(self.allocator, first.key, last.key, .{ .max_inclusive = true, .no_return = true });
-            if (removed.removed_count != self.items) return error.BenchmarkMissingKey;
+        pub fn deleteRangePartial(self: *Self) !void {
+            const bounds = self.partialRangeBounds() orelse return error.BenchmarkMissingKey;
+            const count = partialRangeCount(self.items);
+            const removed = try self.tree.deleteRange(self.allocator, bounds.first, bounds.last, .{ .max_inclusive = true, .no_return = true });
+            if (removed.removed_count != count) return error.BenchmarkMissingKey;
             self.record(removed.removed_count);
         }
 
-        pub fn clearAll(self: *Self) !void {
+        pub fn deleteRangeAtReturning(self: *Self) !void {
+            const count = partialRangeCount(self.items);
+            const start = partialRangeStart(self.items, count);
+            const removed = try self.tree.deleteRangeAt(self.allocator, start, count, .{});
+            defer removed.deinit(self.allocator);
+            if (removed.removed_count != count or removed.len() != count) return error.BenchmarkMissingKey;
+            self.record(removed.removed_count);
+        }
+
+        pub fn deleteRangeReturning(self: *Self) !void {
+            const bounds = self.partialRangeBounds() orelse return error.BenchmarkMissingKey;
+            const count = partialRangeCount(self.items);
+            const removed = try self.tree.deleteRange(self.allocator, bounds.first, bounds.last, .{ .max_inclusive = true });
+            defer removed.deinit(self.allocator);
+            if (removed.removed_count != count or removed.len() != count) return error.BenchmarkMissingKey;
+            self.record(removed.removed_count);
+        }
+
+        fn partialRangeBounds(self: *Self) ?struct { first: K, last: K } {
+            const count = partialRangeCount(self.items);
+            const start = partialRangeStart(self.items, count);
+            const first = self.tree.getAt(start) orelse return null;
+            const last = self.tree.getAt(start + count - 1) orelse return null;
+            return .{ .first = first.key, .last = last.key };
+        }
+
+        pub fn releaseAll(self: *Self) !void {
             self.tree.clear(self.allocator);
             self.record(self.items);
         }
@@ -353,6 +411,14 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             std.mem.doNotOptimizeAway(self.checksum);
         }
     };
+}
+
+fn partialRangeCount(items: usize) usize {
+    return @max(1, items / 10);
+}
+
+fn partialRangeStart(items: usize, count: usize) usize {
+    return (items - count) / 2;
 }
 
 fn makeKeySlice(comptime K: type, allocator: Allocator, items: usize) ![]K {

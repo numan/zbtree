@@ -12,6 +12,15 @@ const CollectContext = struct {
     len: usize = 0,
 };
 
+const DynamicCollectContext = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(Pair) = .empty,
+
+    fn deinit(ctx: *@This()) void {
+        ctx.items.deinit(ctx.allocator);
+    }
+};
+
 fn collect(ctx: *CollectContext, key: i32, value: i32) !void {
     ctx.items[ctx.len] = .{ .key = key, .value = value };
     ctx.len += 1;
@@ -20,6 +29,10 @@ fn collect(ctx: *CollectContext, key: i32, value: i32) !void {
 fn collectUntil(ctx: *CollectContext, key: i32, value: i32) !bool {
     try collect(ctx, key, value);
     return ctx.len < 3;
+}
+
+fn collectDynamic(ctx: *DynamicCollectContext, key: i32, value: i32) !void {
+    try ctx.items.append(ctx.allocator, .{ .key = key, .value = value });
 }
 
 test "map stores one value per key" {
@@ -80,6 +93,49 @@ test "map ordered access and traversal" {
     try testing.expectEqual(@as(i32, 4), limited.items[2].key);
 }
 
+test "map edge push wrappers preserve order and reject duplicates" {
+    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    var m = IntMap.init();
+    defer m.deinit(testing.allocator);
+
+    for ([_]i32{ 3, 2, 1 }) |key| {
+        try testing.expect(try m.pushFront(testing.allocator, key, key * 10));
+    }
+    try testing.expect(!try m.pushFront(testing.allocator, 1, 10));
+    try testing.expect(!try m.pushFront(testing.allocator, 2, 20));
+
+    for ([_]i32{ 4, 5, 6 }) |key| {
+        try testing.expect(try m.pushBack(testing.allocator, key, key * 10));
+    }
+    try testing.expect(!try m.pushBack(testing.allocator, 6, 60));
+    try testing.expect(!try m.pushBack(testing.allocator, 5, 50));
+
+    try testing.expectEqual(@as(usize, 6), m.len());
+    for (0..6) |i| {
+        const key: i32 = @intCast(i + 1);
+        try expectMapEntry(m.getAt(i), key, key * 10);
+    }
+    try m.checkInvariants();
+}
+
+test "map deleteAt uses edge semantics for first and last items" {
+    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    var m = IntMap.init();
+    defer m.deinit(testing.allocator);
+
+    for (0..200) |i| {
+        const key: i32 = @intCast(i);
+        try testing.expect(try m.insert(testing.allocator, key, -key));
+    }
+
+    try expectMapEntry(try m.deleteAt(testing.allocator, 0), 0, 0);
+    try expectMapEntry(try m.deleteAt(testing.allocator, m.len() - 1), 199, -199);
+    try testing.expectEqual(@as(usize, 198), m.len());
+    try expectMapEntry(m.front(), 1, -1);
+    try expectMapEntry(m.back(), 198, -198);
+    try m.checkInvariants();
+}
+
 test "map copy-on-write isolates replacements and deletion" {
     const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
     var original = IntMap.init();
@@ -124,9 +180,13 @@ test "map range deletion returns removed entries" {
     const removed = try m.deleteRange(testing.allocator, 3, 6, .{ .max_inclusive = true });
     defer removed.deinit(testing.allocator);
 
+    var removed_items = DynamicCollectContext{ .allocator = testing.allocator };
+    defer removed_items.deinit();
+    try removed.ascent(*DynamicCollectContext, &removed_items, collectDynamic);
+
     try testing.expectEqual(@as(usize, 4), removed.removed_count);
-    try testing.expectEqual(@as(usize, 4), removed.items.len);
-    for (removed.items, 3..) |item, expected_usize| {
+    try testing.expectEqual(@as(usize, 4), removed_items.items.items.len);
+    for (removed_items.items.items, 3..) |item, expected_usize| {
         const expected: i32 = @intCast(expected_usize);
         try testing.expectEqual(expected, item.key);
         try testing.expectEqual(expected * 10, item.value);
@@ -168,9 +228,13 @@ fn expectMapEntry(entry: anytype, key: i32, value: i32) !void {
 }
 
 fn expectRemovedSorted(removed: anytype, first: i32, count: usize) !void {
+    var removed_items = DynamicCollectContext{ .allocator = testing.allocator };
+    defer removed_items.deinit();
+    try removed.ascent(*DynamicCollectContext, &removed_items, collectDynamic);
+
     try testing.expectEqual(count, removed.removed_count);
-    try testing.expectEqual(count, removed.items.len);
-    for (removed.items, 0..) |item, i| {
+    try testing.expectEqual(count, removed_items.items.items.len);
+    for (removed_items.items.items, 0..) |item, i| {
         const key: i32 = first + @as(i32, @intCast(i));
         try testing.expectEqual(key, item.key);
         try testing.expectEqual(-key, item.value);
@@ -359,7 +423,10 @@ test "map deleteRangeAt honors bounds options and no_return" {
         defer removed.deinit(testing.allocator);
         try testing.expectEqual(1000, removed.removed_count);
         try testing.expectEqual(9000, m.len());
-        for (removed.items, 0..) |item, i| {
+        var removed_items = DynamicCollectContext{ .allocator = testing.allocator };
+        defer removed_items.deinit();
+        try removed.ascent(*DynamicCollectContext, &removed_items, collectDynamic);
+        for (removed_items.items.items, 0..) |item, i| {
             const key: i32 = @intCast(i + 3000);
             try testing.expectEqual(key, item.key);
             try testing.expectEqual(key, item.value);
@@ -395,7 +462,7 @@ test "map deleteRangeAt honors bounds options and no_return" {
         const removed = try m.deleteRangeAt(testing.allocator, 3000, 1000, .{ .max_inclusive = true, .no_return = true });
         defer removed.deinit(testing.allocator);
         try testing.expectEqual(1001, removed.removed_count);
-        try testing.expectEqual(0, removed.items.len);
+        try testing.expectEqual(0, removed.chunk_count);
         try testing.expectEqual(8999, m.len());
     }
     try m.checkInvariants();
