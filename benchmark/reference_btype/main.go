@@ -38,84 +38,255 @@ func main() {
 }
 
 func benchMap[T keyType](items, runs int) {
-	var tree *btype.Map[T, struct{}]
-	fmt.Printf("Benchmarking %d items, %s keys, %d times, using median\n", items, reflect.TypeFor[T]().Name(), runs)
-	bench(
-		func() { tree = btype.NewMap[T, struct{}]() },
-		func(key T) { assert2(tree.Insert(key, struct{}{})) },
-		func(key T) { assert2(tree.Get(key)) },
-		runs,
-		items,
-	)
+	keyName := reflect.TypeFor[T]().Name()
+	if keyName == "" {
+		keyName = reflect.TypeFor[T]().String()
+	}
+	ctx := benchContext[T]{rng: rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano()))), items: items}
+
+	fmt.Printf("Benchmarking %d items, %s keys, %d times, using median\n", items, keyName, runs)
+	runBench("insert(seq)", items, runs, ctx.preInsertSeq, ctx.insertAll)
+	runBench("insert(rand)", items, runs, ctx.preInsertRand, ctx.insertAll)
+	runBench("get(seq)", items, runs, ctx.preFullSeq, ctx.getAll)
+	runBench("get(rand)", items, runs, ctx.preFullRand, ctx.getAll)
+	runBench("set(existing)", items, runs, ctx.preFullRand, ctx.setAll)
+	runBench("replace", items, runs, ctx.preFullRand, ctx.replaceAll)
+	runBench("seek", items, runs, ctx.preFullRand, ctx.seekAll)
+	runBench("seekNext", items, runs, ctx.preFullRand, ctx.seekNextAll)
+	runBench("seekPrev", items, runs, ctx.preFullRand, ctx.seekPrevAll)
+	runBench("indexOf", items, runs, ctx.preFullRand, ctx.indexOfAll)
+	runBench("getAt", items, runs, ctx.preFullSeq, ctx.getAtAll)
+	runBench("delete(rand)", items, runs, ctx.preFullRand, ctx.deleteAll)
+	runBench("deleteAt(front)", items, runs, ctx.preFullSeq, ctx.deleteAtFrontAll)
+	runBench("popFront", items, runs, ctx.preFullSeq, ctx.popFrontAll)
+	runBench("popBack", items, runs, ctx.preFullSeq, ctx.popBackAll)
+	runBench("deleteRangeAt", items, runs, ctx.preFullSeq, ctx.deleteRangeAtAll)
+	runBench("deleteRange", items, runs, ctx.preFullSeq, ctx.deleteRangeAll)
+	runBench("clear", items, runs, ctx.preFullSeq, ctx.clearAll)
+	runBench("copy", 1, runs, ctx.preFullSeq, ctx.copyOnce)
 	fmt.Println()
 }
 
-func bench[T keyType](clear func(), insert func(key T), get func(key T), runs, items int) {
-	seed := uint64(time.Now().UnixNano())
-	rng := rand.New(rand.NewPCG(0, seed))
-	var keys []T
-
-	run("insert(seq)", runs, func() {
-		clear()
-		keys = randKeys[T](rng, items)
-		slices.SortFunc(keys, cmp.Compare[T])
-	}, func() {
-		for i := range items {
-			insert(keys[i])
-		}
-	}, func(elapsed float64) {
-		writeOutput(items, time.Duration(elapsed*float64(time.Second)))
-	})
-
-	run("insert(rand)", runs, func() {
-		clear()
-		keys = randKeys[T](rng, items)
-		shuffle(rng, keys)
-	}, func() {
-		for i := range items {
-			insert(keys[i])
-		}
-	}, func(elapsed float64) {
-		writeOutput(items, time.Duration(elapsed*float64(time.Second)))
-	})
-
-	run("get(seq)", runs, func() {
-		keys = randKeys[T](rng, items)
-		slices.SortFunc(keys, cmp.Compare[T])
-	}, func() {
-		for i := range items {
-			get(keys[i])
-		}
-	}, func(elapsed float64) {
-		writeOutput(items, time.Duration(elapsed*float64(time.Second)))
-	})
-
-	run("get(rand)", runs, func() {
-		keys = randKeys[T](rng, items)
-		shuffle(rng, keys)
-	}, func() {
-		for i := range items {
-			get(keys[i])
-		}
-	}, func(elapsed float64) {
-		writeOutput(items, time.Duration(elapsed*float64(time.Second)))
-	})
+type benchContext[T keyType] struct {
+	rng      *rand.Rand
+	items    int
+	tree     *btype.Map[T, struct{}]
+	keys     []T
+	checksum int
 }
 
-func run(label string, runs int, pre, op func(), done func(float64)) {
-	runtime.GC()
-	elapsed := make([]float64, 0, runs)
-	for range runs {
-		if pre != nil {
-			pre()
+func (c *benchContext[T]) preInsertSeq() {
+	c.tree = btype.NewMap[T, struct{}]()
+	c.keys = randKeys[T](c.rng, c.items)
+	slices.SortFunc(c.keys, cmp.Compare[T])
+}
+
+func (c *benchContext[T]) preInsertRand() {
+	c.tree = btype.NewMap[T, struct{}]()
+	c.keys = randKeys[T](c.rng, c.items)
+	shuffle(c.rng, c.keys)
+}
+
+func (c *benchContext[T]) preFullSeq() {
+	c.fillTree(false)
+}
+
+func (c *benchContext[T]) preFullRand() {
+	c.fillTree(true)
+}
+
+func (c *benchContext[T]) fillTree(randomOrder bool) {
+	if randomOrder {
+		c.preInsertRand()
+	} else {
+		c.preInsertSeq()
+	}
+	c.insertAll()
+}
+
+func (c *benchContext[T]) insertAll() {
+	for _, key := range c.keys {
+		_, ok := c.tree.Insert(key, struct{}{})
+		assert(ok)
+	}
+	runtime.KeepAlive(c.tree.Len())
+}
+
+func (c *benchContext[T]) getAll() {
+	found := 0
+	for _, key := range c.keys {
+		_, ok := c.tree.Get(key)
+		assert(ok)
+		found++
+	}
+	c.record(found)
+}
+
+func (c *benchContext[T]) setAll() {
+	for _, key := range c.keys {
+		c.tree.Set(key, struct{}{})
+	}
+	runtime.KeepAlive(c.tree.Len())
+}
+
+func (c *benchContext[T]) replaceAll() {
+	found := 0
+	for _, key := range c.keys {
+		_, ok := c.tree.Replace(key, struct{}{})
+		assert(ok)
+		found++
+	}
+	c.record(found)
+}
+
+func (c *benchContext[T]) seekAll() {
+	found := 0
+	for _, key := range c.keys {
+		_, _, ok := c.tree.Seek(key)
+		assert(ok)
+		found++
+	}
+	c.record(found)
+}
+
+func (c *benchContext[T]) seekNextAll() {
+	found := 0
+	for _, key := range c.keys {
+		_, _, ok := c.tree.SeekNext(key)
+		if ok {
+			found++
 		}
+	}
+	c.record(found)
+}
+
+func (c *benchContext[T]) seekPrevAll() {
+	found := 0
+	for _, key := range c.keys {
+		_, _, ok := c.tree.SeekPrev(key)
+		if ok {
+			found++
+		}
+	}
+	c.record(found)
+}
+
+func (c *benchContext[T]) indexOfAll() {
+	found := 0
+	for _, key := range c.keys {
+		_, ok := c.tree.IndexOf(key)
+		assert(ok)
+		found++
+	}
+	c.record(found)
+}
+
+func (c *benchContext[T]) getAtAll() {
+	found := 0
+	for i := range c.items {
+		_, _, ok := c.tree.GetAt(i)
+		assert(ok)
+		found++
+	}
+	c.record(found)
+}
+
+func (c *benchContext[T]) deleteAll() {
+	deleted := 0
+	for _, key := range c.keys {
+		_, ok := c.tree.Delete(key)
+		assert(ok)
+		deleted++
+	}
+	c.record(deleted)
+}
+
+func (c *benchContext[T]) deleteAtFrontAll() {
+	deleted := 0
+	for {
+		_, _, ok := c.tree.DeleteAt(0)
+		if !ok {
+			break
+		}
+		deleted++
+	}
+	assert(deleted == c.items)
+	c.record(deleted)
+}
+
+func (c *benchContext[T]) popFrontAll() {
+	deleted := 0
+	for {
+		_, _, ok := c.tree.PopFront()
+		if !ok {
+			break
+		}
+		deleted++
+	}
+	assert(deleted == c.items)
+	c.record(deleted)
+}
+
+func (c *benchContext[T]) popBackAll() {
+	deleted := 0
+	for {
+		_, _, ok := c.tree.PopBack()
+		if !ok {
+			break
+		}
+		deleted++
+	}
+	assert(deleted == c.items)
+	c.record(deleted)
+}
+
+func (c *benchContext[T]) deleteRangeAtAll() {
+	removed := c.tree.DeleteRangeAtOptions(0, c.items, btype.DeleteRangeOptions{NoReturn: true})
+	assert(removed.Len() == 0)
+	assert(c.tree.Len() == 0)
+	c.record(c.items)
+}
+
+func (c *benchContext[T]) deleteRangeAll() {
+	first, _, ok := c.tree.Front()
+	assert(ok)
+	last, _, ok := c.tree.Back()
+	assert(ok)
+	removed := c.tree.DeleteRangeOptions(first, last, btype.DeleteRangeOptions{MaxInclusive: true, NoReturn: true})
+	assert(removed.Len() == 0)
+	assert(c.tree.Len() == 0)
+	c.record(c.items)
+}
+
+func (c *benchContext[T]) clearAll() {
+	c.tree.Clear()
+	c.record(c.items)
+}
+
+func (c *benchContext[T]) copyOnce() {
+	copy := c.tree.Copy()
+	copy.Release()
+	c.record(1)
+}
+
+func (c *benchContext[T]) record(value int) {
+	c.checksum += value
+	runtime.KeepAlive(c.checksum)
+}
+
+func runBench(label string, ops, runs int, pre, op func()) {
+	runtime.GC()
+	elapsed := make([]time.Duration, 0, runs)
+	for range runs {
+		pre()
 		start := time.Now()
 		op()
-		elapsed = append(elapsed, time.Since(start).Seconds())
+		elapsed = append(elapsed, time.Since(start))
 	}
 	slices.Sort(elapsed)
+	median := elapsed[runs/2]
 	fmt.Printf("%-19s", label)
-	done(elapsed[runs/2])
+	writeOutput(ops, median)
 }
 
 func randKeys[T keyType](rng *rand.Rand, items int) []T {
@@ -151,9 +322,9 @@ func shuffle[T any](rng *rand.Rand, slice []T) {
 	}
 }
 
-func writeOutput(items int, elapsed time.Duration) {
+func writeOutput(ops int, elapsed time.Duration) {
 	fmt.Printf(" %s ops in %7.3f secs %7.1f ns/op %13s op/sec\n",
-		commaize(items), elapsed.Seconds(), float64(elapsed)/float64(items), commaize(int(float64(items)/elapsed.Seconds())))
+		commaize(ops), elapsed.Seconds(), float64(elapsed)/float64(ops), commaize(int(float64(ops)/elapsed.Seconds())))
 }
 
 func commaize(n int) string {
@@ -167,7 +338,7 @@ func commaize(n int) string {
 	return s2
 }
 
-func assert2(_ any, ok bool) {
+func assert(ok bool) {
 	if !ok {
 		panic("assertion failed")
 	}

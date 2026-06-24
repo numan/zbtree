@@ -68,16 +68,32 @@ fn addBenchStep(
         .optimize = optimize,
         .zbtree_module = zbtree_module,
     });
+    const compare_exe = b.addExecutable(.{
+        .name = "zbtree_ds-bench-compare",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmark/compare_summary.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
 
     const bench_step = b.step("bench", "Benchmark zbtree_ds against tidwall/btype");
 
     const zig_bench_cmd = b.addRunArtifact(bench_exe);
-    bench_step.dependOn(&zig_bench_cmd.step);
+    zig_bench_cmd.has_side_effects = true;
+    const zig_output = zig_bench_cmd.captureStdOut(.{ .basename = "zig-bench.txt" });
 
     const go_bench_cmd = b.addSystemCommand(&.{ "go", "run", "." });
     go_bench_cmd.setCwd(b.path("benchmark/reference_btype"));
-    go_bench_cmd.step.dependOn(&zig_bench_cmd.step);
-    bench_step.dependOn(&go_bench_cmd.step);
+    go_bench_cmd.has_side_effects = true;
+    const go_output = go_bench_cmd.captureStdOut(.{ .basename = "go-bench.txt" });
+
+    const compare_cmd = b.addRunArtifact(compare_exe);
+    compare_cmd.step.dependOn(&zig_bench_cmd.step);
+    compare_cmd.step.dependOn(&go_bench_cmd.step);
+    compare_cmd.addFileArg(zig_output);
+    compare_cmd.addFileArg(go_output);
+    bench_step.dependOn(&compare_cmd.step);
 
     if (b.args) |args| {
         zig_bench_cmd.addArgs(args);

@@ -471,10 +471,10 @@ pub fn Tree(
         // current subtree size.
         fn insertChildAt(node: *Node, index: usize, child: *Node) void {
             const branch = node.branch.?;
-            std.debug.assert(index <= node.len);
+            std.debug.assert(index <= node.len + 1);
 
-            mem.copyBackwards(?*Node, branch.children[index + 1 .. node.len + 1], branch.children[index..node.len]);
-            mem.copyBackwards(usize, branch.counts[index + 1 .. node.len + 1], branch.counts[index..node.len]);
+            mem.copyBackwards(?*Node, branch.children[index + 1 .. node.len + 2], branch.children[index .. node.len + 1]);
+            mem.copyBackwards(usize, branch.counts[index + 1 .. node.len + 2], branch.counts[index .. node.len + 1]);
 
             branch.children[index] = child;
             branch.counts[index] = subtreeCount(child);
@@ -497,8 +497,8 @@ pub fn Tree(
             const branch = parent.branch.?;
             const split = try self.splitNode(gpa, branch.children[child_index].?);
 
-            insertItemAt(parent, child_index, split.key, split.value);
             insertChildAt(parent, child_index + 1, split.right);
+            insertItemAt(parent, child_index, split.key, split.value);
             branch.counts[child_index] = subtreeCount(branch.children[child_index]);
         }
 
@@ -1243,10 +1243,12 @@ pub fn Tree(
 
             _ = removeItemAt(parent, left_index);
             var i = left_index + 1;
-            while (i <= parent.len + 1) : (i += 1) {
+            while (i <= parent.len) : (i += 1) {
                 branch.children[i] = branch.children[i + 1];
                 branch.counts[i] = branch.counts[i + 1];
             }
+            branch.children[parent.len + 1] = null;
+            branch.counts[parent.len + 1] = 0;
             branch.counts[left_index] = subtreeCount(left);
             self.destroyNode(gpa, right);
         }

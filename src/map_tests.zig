@@ -434,6 +434,23 @@ test "map seek neighbors and indexed traversal across split tree" {
     try m.checkInvariants();
 }
 
+test "void map supports large random deletion" {
+    const VoidMap = map.Map(i32, void, .{ .use_string_prefix = false });
+    var m = VoidMap.init();
+    defer m.deinit(testing.allocator);
+
+    const keys = fillPermutation(10000, 0x5eed_0006);
+    for (keys) |key| try testing.expect(try m.insert(testing.allocator, key, {}));
+    try m.checkInvariants();
+
+    for (keys, 0..) |key, i| {
+        _ = try m.delete(testing.allocator, key) orelse return error.MissingBenchmarkKey;
+        if (i % 251 == 0) try m.checkInvariants();
+    }
+    try testing.expectEqual(0, m.len());
+    try m.checkInvariants();
+}
+
 test "map copy-on-write isolates value replacements across many entries" {
     const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
     var original = IntMap.init();

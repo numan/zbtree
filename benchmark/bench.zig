@@ -26,30 +26,9 @@ pub fn main(init: std.process.Init) !void {
     defer stdout.flush() catch {};
 
     try stdout.print("\nzbtree_ds (Zig)\n", .{});
-    try benchType(
-        order.OrderedKey(i32, void),
-        "int32",
-        options,
-        allocator,
-        init.io,
-        stdout,
-    );
-    try benchType(
-        order.OrderedKey(u64, void),
-        "uint64",
-        options,
-        allocator,
-        init.io,
-        stdout,
-    );
-    try benchType(
-        order.OrderedKey([]const u8, void),
-        "string",
-        options,
-        allocator,
-        init.io,
-        stdout,
-    );
+    try benchType(order.OrderedKey(i32, void), "int32", options, allocator, init.io, stdout);
+    try benchType(order.OrderedKey(u64, void), "uint64", options, allocator, init.io, stdout);
+    try benchType(order.OrderedKey([]const u8, void), "string", options, allocator, init.io, stdout);
 }
 
 fn parseOptions(init: std.process.Init, arena: Allocator) !Options {
@@ -109,50 +88,26 @@ fn benchType(
     defer ctx.deinit();
 
     try stdout.print("Benchmarking {d} items, {s} keys, {d} times, using median\n", .{ options.items, key_name, options.runs });
-    try runBenchmark(
-        Ctx,
-        &ctx,
-        "insert(seq)",
-        options.runs,
-        Ctx.preInsertSeq,
-        Ctx.insertAll,
-        allocator,
-        io,
-        stdout,
-    );
-    try runBenchmark(
-        Ctx,
-        &ctx,
-        "insert(rand)",
-        options.runs,
-        Ctx.preInsertRand,
-        Ctx.insertAll,
-        allocator,
-        io,
-        stdout,
-    );
-    try runBenchmark(
-        Ctx,
-        &ctx,
-        "get(seq)",
-        options.runs,
-        Ctx.preGetSeq,
-        Ctx.getAll,
-        allocator,
-        io,
-        stdout,
-    );
-    try runBenchmark(
-        Ctx,
-        &ctx,
-        "get(rand)",
-        options.runs,
-        Ctx.preGetRand,
-        Ctx.getAll,
-        allocator,
-        io,
-        stdout,
-    );
+
+    try runBenchmark(Ctx, &ctx, "insert(seq)", options.items, options.runs, Ctx.preInsertSeq, Ctx.insertAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "insert(rand)", options.items, options.runs, Ctx.preInsertRand, Ctx.insertAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "get(seq)", options.items, options.runs, Ctx.preFullSeq, Ctx.getAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "get(rand)", options.items, options.runs, Ctx.preFullRand, Ctx.getAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "set(existing)", options.items, options.runs, Ctx.preFullRand, Ctx.setAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "replace", options.items, options.runs, Ctx.preFullRand, Ctx.replaceAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "seek", options.items, options.runs, Ctx.preFullRand, Ctx.seekAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "seekNext", options.items, options.runs, Ctx.preFullRand, Ctx.seekNextAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "seekPrev", options.items, options.runs, Ctx.preFullRand, Ctx.seekPrevAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "indexOf", options.items, options.runs, Ctx.preFullRand, Ctx.indexOfAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "getAt", options.items, options.runs, Ctx.preFullSeq, Ctx.getAtAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "delete(rand)", options.items, options.runs, Ctx.preFullRand, Ctx.deleteAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "deleteAt(front)", options.items, options.runs, Ctx.preFullSeq, Ctx.deleteAtFrontAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "popFront", options.items, options.runs, Ctx.preFullSeq, Ctx.popFrontAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "popBack", options.items, options.runs, Ctx.preFullSeq, Ctx.popBackAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "deleteRangeAt", options.items, options.runs, Ctx.preFullSeq, Ctx.deleteRangeAtAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "deleteRange", options.items, options.runs, Ctx.preFullSeq, Ctx.deleteRangeAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "clear", options.items, options.runs, Ctx.preFullSeq, Ctx.clearAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "copy", 1, options.runs, Ctx.preFullSeq, Ctx.copyOnce, allocator, io, stdout);
     try stdout.print("\n", .{});
 }
 
@@ -167,7 +122,6 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
         keys: []K = &.{},
         string_bytes: if (K == []const u8) []u8 else void = if (K == []const u8) &.{} else {},
         checksum: usize = 0,
-
         resident_string_bytes: if (K == []const u8) []u8 else void = if (K == []const u8) &.{} else {},
 
         fn deinit(self: *Self) void {
@@ -226,6 +180,24 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             }
         }
 
+        fn retainPreparedStringBytes(self: *Self) void {
+            if (K == []const u8) {
+                self.freeResidentStringBytes();
+                self.resident_string_bytes = self.string_bytes;
+                self.string_bytes = &.{};
+            }
+        }
+
+        fn fillTree(self: *Self, random_order: bool) !void {
+            self.tree.clear(self.allocator);
+            self.freeResidentStringBytes();
+            try self.prepareKeys(random_order);
+            for (self.keys) |key| {
+                if (!try self.tree.insert(self.allocator, key, {})) return error.BenchmarkDuplicateKey;
+            }
+            self.retainPreparedStringBytes();
+        }
+
         pub fn preInsertSeq(self: *Self) !void {
             self.tree.clear(self.allocator);
             self.freeResidentStringBytes();
@@ -238,23 +210,19 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             try self.prepareKeys(true);
         }
 
-        pub fn preGetSeq(self: *Self) !void {
-            try self.prepareKeys(false);
+        pub fn preFullSeq(self: *Self) !void {
+            try self.fillTree(false);
         }
 
-        pub fn preGetRand(self: *Self) !void {
-            try self.prepareKeys(true);
+        pub fn preFullRand(self: *Self) !void {
+            try self.fillTree(true);
         }
 
         pub fn insertAll(self: *Self) !void {
             for (self.keys) |key| {
                 if (!try self.tree.insert(self.allocator, key, {})) return error.BenchmarkDuplicateKey;
             }
-            if (K == []const u8) {
-                self.freeResidentStringBytes();
-                self.resident_string_bytes = self.string_bytes;
-                self.string_bytes = &.{};
-            }
+            self.retainPreparedStringBytes();
             std.mem.doNotOptimizeAway(self.tree.len());
         }
 
@@ -264,7 +232,124 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
                 _ = self.tree.get(key) orelse return error.BenchmarkMissingKey;
                 found += 1;
             }
-            self.checksum +%= found;
+            self.record(found);
+        }
+
+        pub fn setAll(self: *Self) !void {
+            for (self.keys) |key| _ = try self.tree.set(self.allocator, key, {});
+            std.mem.doNotOptimizeAway(self.tree.len());
+        }
+
+        pub fn replaceAll(self: *Self) !void {
+            var found: usize = 0;
+            for (self.keys) |key| {
+                if (try self.tree.replace(self.allocator, key, {})) |_| {
+                    found += 1;
+                } else return error.BenchmarkMissingKey;
+            }
+            self.record(found);
+        }
+
+        pub fn seekAll(self: *Self) !void {
+            var found: usize = 0;
+            for (self.keys) |key| {
+                _ = self.tree.seek(key) orelse return error.BenchmarkMissingKey;
+                found += 1;
+            }
+            self.record(found);
+        }
+
+        pub fn seekNextAll(self: *Self) !void {
+            var found: usize = 0;
+            for (self.keys) |key| {
+                if (self.tree.seekNext(key)) |_| found += 1;
+            }
+            self.record(found);
+        }
+
+        pub fn seekPrevAll(self: *Self) !void {
+            var found: usize = 0;
+            for (self.keys) |key| {
+                if (self.tree.seekPrev(key)) |_| found += 1;
+            }
+            self.record(found);
+        }
+
+        pub fn indexOfAll(self: *Self) !void {
+            var found: usize = 0;
+            for (self.keys) |key| {
+                _ = self.tree.indexOf(key) orelse return error.BenchmarkMissingKey;
+                found += 1;
+            }
+            self.record(found);
+        }
+
+        pub fn getAtAll(self: *Self) !void {
+            var found: usize = 0;
+            for (0..self.items) |i| {
+                _ = self.tree.getAt(i) orelse return error.BenchmarkMissingKey;
+                found += 1;
+            }
+            self.record(found);
+        }
+
+        pub fn deleteAll(self: *Self) !void {
+            var deleted: usize = 0;
+            for (self.keys) |key| {
+                _ = try self.tree.delete(self.allocator, key) orelse return error.BenchmarkMissingKey;
+                deleted += 1;
+            }
+            self.record(deleted);
+        }
+
+        pub fn deleteAtFrontAll(self: *Self) !void {
+            var deleted: usize = 0;
+            while (try self.tree.deleteAt(self.allocator, 0)) |_| deleted += 1;
+            if (deleted != self.items) return error.BenchmarkMissingKey;
+            self.record(deleted);
+        }
+
+        pub fn popFrontAll(self: *Self) !void {
+            var deleted: usize = 0;
+            while (try self.tree.popFront(self.allocator)) |_| deleted += 1;
+            if (deleted != self.items) return error.BenchmarkMissingKey;
+            self.record(deleted);
+        }
+
+        pub fn popBackAll(self: *Self) !void {
+            var deleted: usize = 0;
+            while (try self.tree.popBack(self.allocator)) |_| deleted += 1;
+            if (deleted != self.items) return error.BenchmarkMissingKey;
+            self.record(deleted);
+        }
+
+        pub fn deleteRangeAtAll(self: *Self) !void {
+            const removed = try self.tree.deleteRangeAt(self.allocator, 0, self.items, .{ .no_return = true });
+            if (removed.removed_count != self.items) return error.BenchmarkMissingKey;
+            self.record(removed.removed_count);
+        }
+
+        pub fn deleteRangeAll(self: *Self) !void {
+            const first = self.tree.front() orelse return error.BenchmarkMissingKey;
+            const last = self.tree.back() orelse return error.BenchmarkMissingKey;
+            const removed = try self.tree.deleteRange(self.allocator, first.key, last.key, .{ .max_inclusive = true, .no_return = true });
+            if (removed.removed_count != self.items) return error.BenchmarkMissingKey;
+            self.record(removed.removed_count);
+        }
+
+        pub fn clearAll(self: *Self) !void {
+            self.tree.clear(self.allocator);
+            self.record(self.items);
+        }
+
+        pub fn copyOnce(self: *Self) !void {
+            var copied = self.tree.copy();
+            copied.deinit(self.allocator);
+            self.record(1);
+        }
+
+        fn record(self: *Self, value: usize) void {
+            self.checksum +%= value;
             std.mem.doNotOptimizeAway(self.checksum);
         }
     };
@@ -281,6 +366,7 @@ fn runBenchmark(
     comptime Ctx: type,
     ctx: *Ctx,
     label: []const u8,
+    ops: usize,
     runs: usize,
     comptime pre: fn (*Ctx) anyerror!void,
     comptime op: fn (*Ctx) anyerror!void,
@@ -300,23 +386,24 @@ fn runBenchmark(
     }
 
     std.sort.pdq(u64, elapsed, {}, lessU64);
-    try writeResult(stdout, label, ctx.items, elapsed[runs / 2]);
+    const median = elapsed[runs / 2];
+    try writeResult(stdout, label, ops, median);
 }
 
 fn benchTime(io: Io) i96 {
     return Io.Clock.awake.now(io).nanoseconds;
 }
 
-fn writeResult(stdout: anytype, label: []const u8, items: usize, elapsed_ns: u64) !void {
+fn writeResult(stdout: anytype, label: []const u8, ops: usize, elapsed_ns: u64) !void {
     try stdout.print("{s}", .{label});
     var padding = if (label.len < 19) 19 - label.len else 1;
     while (padding > 0) : (padding -= 1) try stdout.writeAll(" ");
 
     const secs = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-    const ns_per_op = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(items));
-    const ops_per_sec: usize = @intFromFloat(@as(f64, @floatFromInt(items)) / secs);
+    const ns_per_op = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(ops));
+    const ops_per_sec: usize = if (elapsed_ns == 0) 0 else @intFromFloat(@as(f64, @floatFromInt(ops)) / secs);
 
-    try writeCommaized(stdout, items);
+    try writeCommaized(stdout, ops);
     try stdout.print(" ops in {d:.3} secs {d:.1} ns/op ", .{ secs, ns_per_op });
     try writeCommaized(stdout, ops_per_sec);
     try stdout.print(" op/sec\n", .{});
