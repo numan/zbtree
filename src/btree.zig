@@ -1,5 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
+const node_storage = @import("node_storage.zig");
 const testing = std.testing;
 
 pub const SearchMode = enum {
@@ -45,54 +46,15 @@ pub fn Tree(
 
         const compare = config.compare;
 
-        /// Maximum number of child pointers in an internal node.
-        pub const fanout: usize = 64;
-        /// Maximum number of key/value items stored directly in one node.
-        pub const max_items: usize = fanout - 1;
-        /// Minimum item count for non-root nodes after the tree has split.
-        pub const min_items: usize = max_items / 2;
+        const storage = node_storage.NodeStorage(K, V, config.use_string_prefix);
 
-        // A node stores sorted key/value items. If `branch` is null it is a
-        // leaf; otherwise `branch` stores the child pointers between items.
-        const Node = struct {
-            const NodeSelf = @This();
+        pub const fanout = storage.fanout;
+        pub const max_items = storage.max_items;
+        pub const min_items = storage.min_items;
 
-            keys: [max_items]K = undefined,
-            values: [max_items]V = undefined,
-            len: u8 = 0,
-            branch: ?*Branch = null,
-            rc: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-            fn init() NodeSelf {
-                return .{};
-            }
-
-            fn isLeaf(node: *const Node) bool {
-                return node.branch == null;
-            }
-        };
-
-        // Extra data for internal nodes. `children[i]` contains items that sort
-        // before `keys[i]`, and `children[len]` contains items after the last
-        // key. `counts[i]` is the total number of items in `children[i]`.
-        const Branch = struct {
-            const BranchSelf = @This();
-
-            children: [fanout]?*Node = [_]?*Node{null} ** fanout,
-            counts: [fanout]usize = [_]usize{0} ** fanout,
-            prefixes: if (config.use_string_prefix) [max_items]u64 else void = if (config.use_string_prefix) [_]u64{0} ** max_items else {},
-
-            fn init() BranchSelf {
-                return .{};
-            }
-        };
-
-        // Internal nodes are allocated as one object so the hot Node fields and
-        // Branch metadata are colocated and require one allocator call.
-        const InternalNode = struct {
-            node: Node,
-            branch: Branch,
-        };
+        const Node = storage.Node;
+        const Branch = storage.Branch;
+        const InternalNode = storage.InternalNode;
 
         // Result of searching inside one node. `index` is either the matching
         // item index or the insertion/child-descent position.
