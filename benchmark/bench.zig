@@ -76,7 +76,7 @@ fn benchType(
     stdout: anytype,
 ) !void {
     const K = Order.Key;
-    const Map = map.Map(K, void, .{ .use_string_prefix = Order.use_string_prefix });
+    const Map = map.Map(K, usize, .{ .use_string_prefix = Order.use_string_prefix });
     const Ctx = BenchContext(K, Map);
 
     var ctx = Ctx{
@@ -84,6 +84,7 @@ fn benchType(
         .prng = std.Random.DefaultPrng.init(0xdecafbad),
         .items = options.items,
         .tree = Map.init(),
+        .copy_batch_ops = copyBatchCount(options.items),
     };
     defer ctx.deinit();
 
@@ -101,7 +102,7 @@ fn benchType(
     try runBenchmark(Ctx, &ctx, "seekNext", options.items, options.runs, Ctx.preFullRand, Ctx.seekNextAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "seekPrev", options.items, options.runs, Ctx.preFullRand, Ctx.seekPrevAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "indexOf", options.items, options.runs, Ctx.preFullRand, Ctx.indexOfAll, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "getAt", options.items, options.runs, Ctx.preFullSeq, Ctx.getAtAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "getAt", options.items, options.runs, Ctx.preFullRand, Ctx.getAtAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "delete(rand)", options.items, options.runs, Ctx.preFullRand, Ctx.deleteAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "deleteAt(front)", options.items, options.runs, Ctx.preFullSeq, Ctx.deleteAtFrontAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "popFront", options.items, options.runs, Ctx.preFullSeq, Ctx.popFrontAll, allocator, io, stdout);
@@ -109,8 +110,8 @@ fn benchType(
     const range_ops = partialRangeCount(options.items);
     try runBenchmark(Ctx, &ctx, "deleteRangeAt(ret)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangeAtReturning, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "deleteRange(ret)", range_ops, options.runs, Ctx.preFullSeq, Ctx.deleteRangeReturning, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "release", options.items, options.runs, Ctx.preFullSeq, Ctx.releaseAll, allocator, io, stdout);
-    try runBenchmark(Ctx, &ctx, "copy", 1, options.runs, Ctx.preFullSeq, Ctx.copyOnce, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "release", ctx.copy_batch_ops, options.runs, Ctx.preReleaseCopies, Ctx.releaseMany, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "copy", ctx.copy_batch_ops, options.runs, Ctx.preFullSeq, Ctx.copyMany, allocator, io, stdout);
     try stdout.print("\n", .{});
 }
 
@@ -123,7 +124,10 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
         items: usize,
         tree: Map,
         pending_removed: ?Map.DeleteRangeResult = null,
+        copied_trees: []Map = &.{},
         keys: []K = &.{},
+        indices: []usize = &.{},
+        copy_batch_ops: usize,
         string_bytes: if (K == []const u8) []u8 else void = if (K == []const u8) &.{} else {},
         checksum: usize = 0,
         resident_string_bytes: if (K == []const u8) []u8 else void = if (K == []const u8) &.{} else {},
@@ -132,6 +136,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             self.cleanupUntimed();
             self.tree.deinit(self.allocator);
             self.freeKeys();
+            self.freeIndices();
             self.freeResidentStringBytes();
         }
 
@@ -140,6 +145,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
                 removed.deinit(self.allocator);
                 self.pending_removed = null;
             }
+            self.freeCopiedTrees();
         }
 
         fn freeKeys(self: *Self) void {
@@ -154,6 +160,17 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             if (self.resident_string_bytes.len == 0) return;
             self.allocator.free(self.resident_string_bytes);
             self.resident_string_bytes = &.{};
+        }
+
+        fn freeIndices(self: *Self) void {
+            if (self.indices.len != 0) self.allocator.free(self.indices);
+            self.indices = &.{};
+        }
+
+        fn freeCopiedTrees(self: *Self) void {
+            for (self.copied_trees) |*copied| copied.deinit(self.allocator);
+            if (self.copied_trees.len != 0) self.allocator.free(self.copied_trees);
+            self.copied_trees = &.{};
         }
 
         fn makeKeys(self: *Self, random_order: bool) !void {
@@ -192,6 +209,13 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             }
         }
 
+        fn prepareIndices(self: *Self, random_order: bool) !void {
+            self.freeIndices();
+            self.indices = try self.allocator.alloc(usize, self.items);
+            for (self.indices, 0..) |*index, i| index.* = i;
+            if (random_order) self.prng.random().shuffle(usize, self.indices);
+        }
+
         fn retainPreparedStringBytes(self: *Self) void {
             if (K == []const u8) {
                 self.freeResidentStringBytes();
@@ -204,8 +228,9 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             self.tree.clear(self.allocator);
             self.freeResidentStringBytes();
             try self.prepareKeys(random_order);
-            for (self.keys) |key| {
-                if (!try self.tree.insert(self.allocator, key, {})) return error.BenchmarkDuplicateKey;
+            try self.prepareIndices(random_order);
+            for (self.keys, 0..) |key, i| {
+                if (!try self.tree.insert(self.allocator, key, valueForOrdinal(i))) return error.BenchmarkDuplicateKey;
             }
             self.retainPreparedStringBytes();
         }
@@ -239,125 +264,149 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             try self.fillTree(true);
         }
 
+        pub fn preReleaseCopies(self: *Self) !void {
+            try self.fillTree(false);
+            self.freeCopiedTrees();
+            self.copied_trees = try self.allocator.alloc(Map, self.copy_batch_ops);
+            for (self.copied_trees) |*copied| copied.* = self.tree.copy();
+        }
+
         pub fn insertAll(self: *Self) !void {
-            for (self.keys) |key| {
-                if (!try self.tree.insert(self.allocator, key, {})) return error.BenchmarkDuplicateKey;
+            for (self.keys, 0..) |key, i| {
+                if (!try self.tree.insert(self.allocator, key, valueForOrdinal(i))) return error.BenchmarkDuplicateKey;
             }
             self.retainPreparedStringBytes();
-            std.mem.doNotOptimizeAway(self.tree.len());
+            self.record(self.tree.len());
         }
 
         pub fn pushBackAll(self: *Self) !void {
-            for (self.keys) |key| {
-                if (!try self.tree.pushBack(self.allocator, key, {})) return error.BenchmarkDuplicateKey;
+            for (self.keys, 0..) |key, i| {
+                if (!try self.tree.pushBack(self.allocator, key, valueForOrdinal(i))) return error.BenchmarkDuplicateKey;
             }
             self.retainPreparedStringBytes();
-            std.mem.doNotOptimizeAway(self.tree.len());
+            self.record(self.tree.len());
         }
 
         pub fn pushFrontAll(self: *Self) !void {
-            for (self.keys) |key| {
-                if (!try self.tree.pushFront(self.allocator, key, {})) return error.BenchmarkDuplicateKey;
+            for (self.keys, 0..) |key, i| {
+                if (!try self.tree.pushFront(self.allocator, key, valueForOrdinal(i))) return error.BenchmarkDuplicateKey;
             }
             self.retainPreparedStringBytes();
-            std.mem.doNotOptimizeAway(self.tree.len());
+            self.record(self.tree.len());
         }
 
         pub fn getAll(self: *Self) !void {
-            var found: usize = 0;
+            var digest: usize = 0;
             for (self.keys) |key| {
-                _ = self.tree.get(key) orelse return error.BenchmarkMissingKey;
-                found += 1;
+                const value = self.tree.get(key) orelse return error.BenchmarkMissingKey;
+                digest +%= self.keyDigest(key) ^ value;
             }
-            self.record(found);
+            self.record(digest);
         }
 
         pub fn setAll(self: *Self) !void {
-            for (self.keys) |key| _ = try self.tree.set(self.allocator, key, {});
-            std.mem.doNotOptimizeAway(self.tree.len());
+            var digest: usize = 0;
+            for (self.keys, 0..) |key, i| {
+                const new_value = valueForOrdinal(self.items + i);
+                const old_value = try self.tree.set(self.allocator, key, new_value) orelse return error.BenchmarkMissingKey;
+                digest +%= self.keyDigest(key) ^ old_value ^ new_value;
+            }
+            self.record(digest +% self.tree.len());
         }
 
         pub fn replaceAll(self: *Self) !void {
-            var found: usize = 0;
-            for (self.keys) |key| {
-                if (try self.tree.replace(self.allocator, key, {})) |_| {
-                    found += 1;
-                } else return error.BenchmarkMissingKey;
+            var digest: usize = 0;
+            for (self.keys, 0..) |key, i| {
+                const new_value = valueForOrdinal(self.items * 2 + i);
+                const old_value = try self.tree.replace(self.allocator, key, new_value) orelse return error.BenchmarkMissingKey;
+                digest +%= self.keyDigest(key) ^ old_value ^ new_value;
             }
-            self.record(found);
+            self.record(digest);
         }
 
         pub fn seekAll(self: *Self) !void {
-            var found: usize = 0;
+            var digest: usize = 0;
             for (self.keys) |key| {
-                _ = self.tree.seek(key) orelse return error.BenchmarkMissingKey;
-                found += 1;
+                const entry = self.tree.seek(key) orelse return error.BenchmarkMissingKey;
+                digest +%= self.entryDigest(entry);
             }
-            self.record(found);
+            self.record(digest);
         }
 
         pub fn seekNextAll(self: *Self) !void {
-            var found: usize = 0;
+            var digest: usize = 0;
             for (self.keys) |key| {
-                if (self.tree.seekNext(key)) |_| found += 1;
+                if (self.tree.seekNext(key)) |entry| digest +%= self.entryDigest(entry);
             }
-            self.record(found);
+            self.record(digest);
         }
 
         pub fn seekPrevAll(self: *Self) !void {
-            var found: usize = 0;
+            var digest: usize = 0;
             for (self.keys) |key| {
-                if (self.tree.seekPrev(key)) |_| found += 1;
+                if (self.tree.seekPrev(key)) |entry| digest +%= self.entryDigest(entry);
             }
-            self.record(found);
+            self.record(digest);
         }
 
         pub fn indexOfAll(self: *Self) !void {
-            var found: usize = 0;
+            var digest: usize = 0;
             for (self.keys) |key| {
-                _ = self.tree.indexOf(key) orelse return error.BenchmarkMissingKey;
-                found += 1;
+                const index = self.tree.indexOf(key) orelse return error.BenchmarkMissingKey;
+                digest +%= self.keyDigest(key) ^ index;
             }
-            self.record(found);
+            self.record(digest);
         }
 
         pub fn getAtAll(self: *Self) !void {
-            var found: usize = 0;
-            for (0..self.items) |i| {
-                _ = self.tree.getAt(i) orelse return error.BenchmarkMissingKey;
-                found += 1;
+            var digest: usize = 0;
+            for (self.indices) |index| {
+                const entry = self.tree.getAt(index) orelse return error.BenchmarkMissingKey;
+                digest +%= self.entryDigest(entry) ^ index;
             }
-            self.record(found);
+            self.record(digest);
         }
 
         pub fn deleteAll(self: *Self) !void {
-            var deleted: usize = 0;
+            var digest: usize = 0;
             for (self.keys) |key| {
-                _ = try self.tree.delete(self.allocator, key) orelse return error.BenchmarkMissingKey;
-                deleted += 1;
+                const value = try self.tree.delete(self.allocator, key) orelse return error.BenchmarkMissingKey;
+                digest +%= self.keyDigest(key) ^ value;
             }
-            self.record(deleted);
+            self.record(digest);
         }
 
         pub fn deleteAtFrontAll(self: *Self) !void {
+            var digest: usize = 0;
             var deleted: usize = 0;
-            while (try self.tree.deleteAt(self.allocator, 0)) |_| deleted += 1;
+            while (try self.tree.deleteAt(self.allocator, 0)) |entry| {
+                digest +%= self.entryDigest(entry);
+                deleted += 1;
+            }
             if (deleted != self.items) return error.BenchmarkMissingKey;
-            self.record(deleted);
+            self.record(digest);
         }
 
         pub fn popFrontAll(self: *Self) !void {
+            var digest: usize = 0;
             var deleted: usize = 0;
-            while (try self.tree.popFront(self.allocator)) |_| deleted += 1;
+            while (try self.tree.popFront(self.allocator)) |entry| {
+                digest +%= self.entryDigest(entry);
+                deleted += 1;
+            }
             if (deleted != self.items) return error.BenchmarkMissingKey;
-            self.record(deleted);
+            self.record(digest);
         }
 
         pub fn popBackAll(self: *Self) !void {
+            var digest: usize = 0;
             var deleted: usize = 0;
-            while (try self.tree.popBack(self.allocator)) |_| deleted += 1;
+            while (try self.tree.popBack(self.allocator)) |entry| {
+                digest +%= self.entryDigest(entry);
+                deleted += 1;
+            }
             if (deleted != self.items) return error.BenchmarkMissingKey;
-            self.record(deleted);
+            self.record(digest);
         }
 
         pub fn deleteRangeAtReturning(self: *Self) !void {
@@ -368,6 +417,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
                 removed.deinit(self.allocator);
                 return error.BenchmarkMissingKey;
             }
+            try removed.ascent(*Self, self, consumeRemoved);
             self.pending_removed = removed;
             self.record(removed.removed_count);
         }
@@ -380,6 +430,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
                 removed.deinit(self.allocator);
                 return error.BenchmarkMissingKey;
             }
+            try removed.ascent(*Self, self, consumeRemoved);
             self.pending_removed = removed;
             self.record(removed.removed_count);
         }
@@ -392,15 +443,49 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             return .{ .first = first.key, .last = last.key };
         }
 
-        pub fn releaseAll(self: *Self) !void {
-            self.tree.clear(self.allocator);
-            self.record(self.items);
+        pub fn releaseMany(self: *Self) !void {
+            var digest: usize = 0;
+            for (self.copied_trees) |*copied| {
+                digest +%= copied.len();
+                copied.deinit(self.allocator);
+                copied.* = Map.init();
+            }
+            self.record(digest);
         }
 
-        pub fn copyOnce(self: *Self) !void {
-            var copied = self.tree.copy();
-            copied.deinit(self.allocator);
-            self.record(1);
+        pub fn copyMany(self: *Self) !void {
+            var digest: usize = 0;
+            for (0..self.copy_batch_ops) |_| {
+                var copied = self.tree.copy();
+                digest +%= copied.len();
+                copied.deinit(self.allocator);
+            }
+            self.record(digest);
+        }
+
+        fn consumeRemoved(self: *Self, key: K, value: usize) !void {
+            self.checksum +%= digestKey(key) ^ value;
+        }
+
+        fn entryDigest(self: *Self, entry: Map.Entry) usize {
+            return self.keyDigest(entry.key) ^ entry.value;
+        }
+
+        fn keyDigest(_: *Self, key: K) usize {
+            return digestKey(key);
+        }
+
+        fn digestKey(key: K) usize {
+            if (K == []const u8) {
+                var hash: u64 = 1469598103934665603;
+                for (key) |byte| {
+                    hash ^= byte;
+                    hash *%= 1099511628211;
+                }
+                return @truncate(hash);
+            }
+            const hash: u64 = @as(u64, @intCast(key)) *% 11400714819323198485;
+            return @truncate(hash);
         }
 
         fn record(self: *Self, value: usize) void {
@@ -412,6 +497,14 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
 
 fn partialRangeCount(items: usize) usize {
     return @max(1, items / 10);
+}
+
+fn copyBatchCount(items: usize) usize {
+    return @max(@as(usize, 1024), @min(items, 16_384));
+}
+
+fn valueForOrdinal(index: usize) usize {
+    return index +% 1;
 }
 
 fn partialRangeStart(items: usize, count: usize) usize {

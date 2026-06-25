@@ -226,6 +226,14 @@ pub fn Map(
             };
         }
 
+        fn usePrimitiveOrderedKeyFastSearch() bool {
+            if (K == []const u8) return false;
+            return switch (@typeInfo(K)) {
+                .int, .comptime_int, .float, .comptime_float => true,
+                else => false,
+            };
+        }
+
         fn setPrefix(node: *Node, index: usize) void {
             if (config.use_string_prefix) {
                 if (node.branch) |branch| branch.prefixes[index] = stringPrefix(node.keys[index]);
@@ -347,6 +355,7 @@ pub fn Map(
 
             if (comptime K != []const u8) {
                 if (comptime useBinarySearch()) return searchOrderedKeyBinary(node, key);
+                if (comptime usePrimitiveOrderedKeyFastSearch()) return searchPrimitiveOrderedKeyLinear(node, key);
                 return searchOrderedKeyLinear(node, key);
             }
 
@@ -360,6 +369,7 @@ pub fn Map(
             }
 
             if (comptime useBinarySearch()) return searchOrderedKeyBinary(node, key);
+            if (comptime usePrimitiveOrderedKeyFastSearch()) return searchPrimitiveOrderedKeyLinear(node, key);
             return searchOrderedKeyLinear(node, key);
         }
 
@@ -408,6 +418,18 @@ pub fn Map(
             while (true) : (i += 1) {
                 if (!orderedKeyLess(node.keys[i], key)) return SearchResult.init(i, orderedKeyEqual(node.keys[i], key));
             }
+        }
+
+        inline fn searchPrimitiveOrderedKeyLinear(node: *const Node, key: K) SearchResult {
+            if (node.len == 0) return SearchResult.init(0, false);
+
+            const last = node.len - 1;
+            if (key > node.keys[last]) return SearchResult.init(node.len, false);
+            if (key == node.keys[last]) return SearchResult.init(last, true);
+
+            var i: usize = 0;
+            while (key > node.keys[i]) : (i += 1) {}
+            return SearchResult.init(i, key == node.keys[i]);
         }
 
         fn searchOrderedKeyBinary(node: *const Node, key: K) SearchResult {
