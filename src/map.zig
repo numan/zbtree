@@ -1171,7 +1171,7 @@ pub fn Map(
                 node.values[found.index] = replacement.value;
                 setPrefix(node, found.index);
                 branch.counts[found.index] -= 1;
-                try self.rebalanceChild(gpa, node, found.index);
+                if (branch.children[found.index].?.len < min_items) try self.rebalanceChild(gpa, node, found.index);
                 return old;
             }
 
@@ -1179,7 +1179,7 @@ pub fn Map(
             const old = try self.deleteFromNodeWithPrefix(gpa, branch.children[found.index].?, key, val, prefix);
             if (old != null) {
                 branch.counts[found.index] -= 1;
-                try self.rebalanceChild(gpa, node, found.index);
+                if (branch.children[found.index].?.len < min_items) try self.rebalanceChild(gpa, node, found.index);
             }
 
             return old;
@@ -1203,7 +1203,7 @@ pub fn Map(
                 node.values[found.index] = replacement.value;
                 setPrefix(node, found.index);
                 branch.counts[found.index] -= 1;
-                try self.rebalanceChild(gpa, node, found.index);
+                if (branch.children[found.index].?.len < min_items) try self.rebalanceChild(gpa, node, found.index);
                 return old;
             }
 
@@ -1211,7 +1211,7 @@ pub fn Map(
             const old = try self.deleteKeyOnlyFromNodeWithPrefix(gpa, branch.children[found.index].?, key, prefix);
             if (old != null) {
                 branch.counts[found.index] -= 1;
-                try self.rebalanceChild(gpa, node, found.index);
+                if (branch.children[found.index].?.len < min_items) try self.rebalanceChild(gpa, node, found.index);
             }
 
             return old;
@@ -1303,16 +1303,29 @@ pub fn Map(
             const left = branch.children[left_index].?;
             const right = branch.children[left_index + 1].?;
 
-            insertItemAt(left, left.len, parent.keys[left_index], parent.values[left_index]);
-            for (0..right.len) |i| insertItemAt(left, left.len, right.keys[i], right.values[i]);
+            const left_len = left.len;
+            const right_len = right.len;
+            const merged_len = left_len + 1 + right_len;
+
+            left.keys[left_len] = parent.keys[left_index];
+            left.values[left_len] = parent.values[left_index];
+            @memcpy(left.keys[left_len + 1 .. merged_len], right.keys[0..right_len]);
+            @memcpy(left.values[left_len + 1 .. merged_len], right.values[0..right_len]);
+            left.len = @intCast(merged_len);
+
             if (right.branch) |right_branch| {
                 const left_branch = left.branch.?;
-                for (0..right.len + 1) |i| {
-                    left_branch.children[left.len - right.len + i] = right_branch.children[i];
-                    left_branch.counts[left.len - right.len + i] = right_branch.counts[i];
-                    right_branch.children[i] = null;
+                @memcpy(left_branch.children[left_len + 1 .. merged_len + 1], right_branch.children[0 .. right_len + 1]);
+                @memcpy(left_branch.counts[left_len + 1 .. merged_len + 1], right_branch.counts[0 .. right_len + 1]);
+                @memset(right_branch.children[0 .. right_len + 1], null);
+                @memset(right_branch.counts[0 .. right_len + 1], 0);
+
+                if (config.use_string_prefix) {
+                    left_branch.prefixes[left_len] = stringPrefix(parent.keys[left_index]);
+                    @memcpy(left_branch.prefixes[left_len + 1 .. merged_len], right_branch.prefixes[0..right_len]);
                 }
             }
+            right.len = 0;
 
             _ = removeItemAt(parent, left_index);
             var i = left_index + 1;
@@ -1539,7 +1552,7 @@ pub fn Map(
             try self.makeUniqueChild(gpa, node, 0);
             const removed = try self.deleteMinFromNode(gpa, branch.children[0].?);
             branch.counts[0] -= 1;
-            try self.rebalanceChild(gpa, node, 0);
+            if (branch.children[0].?.len < min_items) try self.rebalanceChild(gpa, node, 0);
             return removed;
         }
 
@@ -1551,7 +1564,7 @@ pub fn Map(
             try self.makeUniqueChild(gpa, node, child_index);
             const removed = try self.deleteMaxFromNode(gpa, branch.children[child_index].?);
             branch.counts[child_index] -= 1;
-            try self.rebalanceChild(gpa, node, child_index);
+            if (branch.children[child_index].?.len < min_items) try self.rebalanceChild(gpa, node, child_index);
             return removed;
         }
 
@@ -1566,7 +1579,7 @@ pub fn Map(
                     try self.makeUniqueChild(gpa, node, i);
                     const removed = try self.deleteAtFromNode(gpa, branch.children[i].?, remaining);
                     branch.counts[i] -= 1;
-                    try self.rebalanceChild(gpa, node, i);
+                    if (branch.children[i].?.len < min_items) try self.rebalanceChild(gpa, node, i);
                     return removed;
                 }
 
@@ -1580,7 +1593,7 @@ pub fn Map(
                     node.keys[i] = replacement.key;
                     node.values[i] = replacement.value;
                     setPrefix(node, i);
-                    try self.rebalanceChild(gpa, node, i);
+                    if (branch.children[i].?.len < min_items) try self.rebalanceChild(gpa, node, i);
                     return old;
                 }
                 remaining -= 1;
@@ -1590,7 +1603,7 @@ pub fn Map(
             try self.makeUniqueChild(gpa, node, child_index);
             const removed = try self.deleteAtFromNode(gpa, branch.children[child_index].?, remaining);
             branch.counts[child_index] -= 1;
-            try self.rebalanceChild(gpa, node, child_index);
+            if (branch.children[child_index].?.len < min_items) try self.rebalanceChild(gpa, node, child_index);
             return removed;
         }
 
