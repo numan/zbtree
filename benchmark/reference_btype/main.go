@@ -16,6 +16,8 @@ import (
 	"github.com/tidwall/btype"
 )
 
+const warmupRuns = 2
+
 type keyType interface {
 	~int32 | ~uint64 | ~string
 }
@@ -42,31 +44,41 @@ func benchMap[T keyType](items, runs int) {
 	if keyName == "" {
 		keyName = reflect.TypeFor[T]().String()
 	}
-	ctx := benchContext[T]{rng: rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano()))), items: items, copyBatchOps: copyBatchCount(items)}
+	ctx := benchContext[T]{items: items, copyBatchOps: copyBatchCount(items)}
+	run := func(label string, ops int, pre, op func()) {
+		runBench(label, ops, runs, func() {
+			seed := benchmarkSeed(keyName, label)
+			ctx.rng = rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+		}, pre, op)
+	}
 
 	fmt.Printf("Benchmarking %d items, %s keys, %d times, using median\n", items, keyName, runs)
-	runBench("insert(seq)", items, runs, ctx.preInsertSeq, ctx.insertAll)
-	runBench("pushBack(seq)", items, runs, ctx.prePushBackSeq, ctx.pushBackAll)
-	runBench("pushFront(seq)", items, runs, ctx.prePushFrontSeq, ctx.pushFrontAll)
-	runBench("insert(rand)", items, runs, ctx.preInsertRand, ctx.insertAll)
-	runBench("get(seq)", items, runs, ctx.preFullSeq, ctx.getAll)
-	runBench("get(rand)", items, runs, ctx.preFullRand, ctx.getAll)
-	runBench("set(existing)", items, runs, ctx.preFullRand, ctx.setAll)
-	runBench("replace", items, runs, ctx.preFullRand, ctx.replaceAll)
-	runBench("seek", items, runs, ctx.preFullRand, ctx.seekAll)
-	runBench("seekNext", items, runs, ctx.preFullRand, ctx.seekNextAll)
-	runBench("seekPrev", items, runs, ctx.preFullRand, ctx.seekPrevAll)
-	runBench("indexOf", items, runs, ctx.preFullRand, ctx.indexOfAll)
-	runBench("getAt", items, runs, ctx.preFullRand, ctx.getAtAll)
-	runBench("delete(rand)", items, runs, ctx.preFullRand, ctx.deleteAll)
-	runBench("deleteAt(front)", items, runs, ctx.preFullSeq, ctx.deleteAtFrontAll)
-	runBench("popFront", items, runs, ctx.preFullSeq, ctx.popFrontAll)
-	runBench("popBack", items, runs, ctx.preFullSeq, ctx.popBackAll)
+	run("insert(seq)", items, ctx.preInsertSeq, ctx.insertAll)
+	run("pushBack(seq)", items, ctx.prePushBackSeq, ctx.pushBackAll)
+	run("pushFront(seq)", items, ctx.prePushFrontSeq, ctx.pushFrontAll)
+	run("insert(rand)", items, ctx.preInsertRand, ctx.insertAll)
+	run("get(seq)", items, ctx.preFullSeq, ctx.getAll)
+	run("get(rand)", items, ctx.preFullRand, ctx.getAll)
+	run("getMut(rand)", items, ctx.preFullRand, ctx.getMutAll)
+	run("set(existing)", items, ctx.preFullRand, ctx.setAll)
+	run("replace", items, ctx.preFullRand, ctx.replaceAll)
+	run("seek", items, ctx.preFullRand, ctx.seekAll)
+	run("seekNext", items, ctx.preFullRand, ctx.seekNextAll)
+	run("seekPrev", items, ctx.preFullRand, ctx.seekPrevAll)
+	run("indexOf", items, ctx.preFullRand, ctx.indexOfAll)
+	run("getAt", items, ctx.preFullRand, ctx.getAtAll)
+	run("getAtMut", items, ctx.preFullRand, ctx.getAtMutAll)
+	run("ascentMut", items, ctx.preFullRand, ctx.ascentMutAll)
+	run("descentMut", items, ctx.preFullRand, ctx.descentMutAll)
+	run("delete(rand)", items, ctx.preFullRand, ctx.deleteAll)
+	run("deleteAt(front)", items, ctx.preFullSeq, ctx.deleteAtFrontAll)
+	run("popFront", items, ctx.preFullSeq, ctx.popFrontAll)
+	run("popBack", items, ctx.preFullSeq, ctx.popBackAll)
 	rangeOps := partialRangeCount(items)
-	runBench("deleteRangeAt(ret)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangeAtReturning)
-	runBench("deleteRange(ret)", rangeOps, runs, ctx.preFullSeq, ctx.deleteRangeReturning)
-	runBench("release", ctx.copyBatchOps, runs, ctx.preReleaseCopies, ctx.releaseMany)
-	runBench("copy", ctx.copyBatchOps, runs, ctx.preFullSeq, ctx.copyMany)
+	run("deleteRangeAt(ret)", rangeOps, ctx.preFullSeq, ctx.deleteRangeAtReturning)
+	run("deleteRange(ret)", rangeOps, ctx.preFullSeq, ctx.deleteRangeReturning)
+	run("release", ctx.copyBatchOps, ctx.preReleaseCopies, ctx.releaseMany)
+	run("copy", ctx.copyBatchOps, ctx.preFullSeq, ctx.copyMany)
 	fmt.Println()
 }
 
@@ -170,6 +182,16 @@ func (c *benchContext[T]) getAll() {
 	c.record(digest)
 }
 
+func (c *benchContext[T]) getMutAll() {
+	digest := 0
+	for _, key := range c.keys {
+		value, ok := c.tree.GetMut(key)
+		assert(ok)
+		digest += keyDigest(key) ^ value
+	}
+	c.record(digest)
+}
+
 func (c *benchContext[T]) setAll() {
 	digest := 0
 	for i, key := range c.keys {
@@ -242,6 +264,32 @@ func (c *benchContext[T]) getAtAll() {
 		digest += keyDigest(key) ^ value ^ index
 	}
 	c.record(digest)
+}
+
+func (c *benchContext[T]) getAtMutAll() {
+	digest := 0
+	for _, index := range c.indices {
+		key, value, ok := c.tree.GetAtMut(index)
+		assert(ok)
+		digest += keyDigest(key) ^ value ^ index
+	}
+	c.record(digest)
+}
+
+func (c *benchContext[T]) ascentMutAll() {
+	digest := 0
+	for key, value := range c.tree.AllMut() {
+		digest += keyDigest(key) ^ value
+	}
+	c.record(digest + c.tree.Len())
+}
+
+func (c *benchContext[T]) descentMutAll() {
+	digest := 0
+	for key, value := range c.tree.BackwardMut() {
+		digest += keyDigest(key) ^ value
+	}
+	c.record(digest + c.tree.Len())
 }
 
 func (c *benchContext[T]) deleteAll() {
@@ -363,10 +411,17 @@ func (c *benchContext[T]) record(value int) {
 	runtime.KeepAlive(c.checksum)
 }
 
-func runBench(label string, ops, runs int, pre, op func()) {
+func runBench(label string, ops, runs int, reset, pre, op func()) {
 	runtime.GC()
+	for range warmupRuns {
+		reset()
+		pre()
+		op()
+	}
+
 	elapsed := make([]time.Duration, 0, runs)
 	for range runs {
+		reset()
 		pre()
 		start := time.Now()
 		op()
@@ -376,6 +431,21 @@ func runBench(label string, ops, runs int, pre, op func()) {
 	median := elapsed[runs/2]
 	fmt.Printf("%-19s", label)
 	writeOutput(ops, median)
+}
+
+func benchmarkSeed(keyName, label string) uint64 {
+	seed := uint64(1469598103934665603)
+	seed = mixSeed(seed, keyName)
+	seed = mixSeed(seed, label)
+	return seed
+}
+
+func mixSeed(seed uint64, text string) uint64 {
+	for i := 0; i < len(text); i++ {
+		seed ^= uint64(text[i])
+		seed *= 1099511628211
+	}
+	return seed
 }
 
 func partialRangeCount(items int) int {

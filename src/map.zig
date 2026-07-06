@@ -115,6 +115,15 @@ pub fn Map(
             }
         };
 
+        pub const EntryMut = struct {
+            key: K,
+            value: *V,
+
+            fn init(key: K, value: *V) @This() {
+                return .{ .key = key, .value = value };
+            }
+        };
+
         /// Owned result returned by range deletion operations.
         ///
         /// Returned entries are stored lazily as detached tree chunks plus small
@@ -686,6 +695,24 @@ pub fn Map(
             }
         }
 
+        /// Looks up an item by key and returns a mutable pointer to its stored value.
+        ///
+        /// Copy-on-write paths are cloned before the pointer is returned. The
+        /// pointer is valid until the next structural mutation of this map.
+        pub fn getMut(self: *Self, gpa: mem.Allocator, key: K) !?*V {
+            try self.makeUniqueRoot(gpa);
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (found.found) return &node.values[found.index];
+                if (node.branch) |branch| {
+                    try self.makeUniqueChild(gpa, node, found.index);
+                    node = branch.children[found.index].?;
+                } else return null;
+            }
+        }
+
         /// Visits every item in ascending sort order.
         ///
         /// The callback receives `(context, key, value)`. Any callback error is
@@ -718,6 +745,45 @@ pub fn Map(
             }
 
             try visitAsc(CtxType, branch.children[node.len].?, ctx, yield);
+        }
+
+        /// Visits every item in ascending sort order and yields mutable values.
+        ///
+        /// Copy-on-write paths are cloned before values are yielded. Callbacks
+        /// must not structurally mutate the map while iteration is active.
+        pub fn ascentMut(
+            self: *Self,
+            gpa: mem.Allocator,
+            comptime CtxType: type,
+            context: CtxType,
+            comptime yield: fn (CtxType, K, *V) anyerror!void,
+        ) !void {
+            try self.makeUniqueRoot(gpa);
+            if (self.root) |root| try self.visitAscMut(gpa, CtxType, root, context, yield);
+        }
+
+        fn visitAscMut(
+            self: *Self,
+            gpa: mem.Allocator,
+            comptime CtxType: type,
+            node: *Node,
+            ctx: CtxType,
+            comptime yield: fn (CtxType, K, *V) anyerror!void,
+        ) !void {
+            if (node.isLeaf()) {
+                for (0..node.len) |i| try yield(ctx, node.keys[i], &node.values[i]);
+                return;
+            }
+
+            const branch = node.branch.?;
+            for (0..node.len) |i| {
+                try self.makeUniqueChild(gpa, node, i);
+                try self.visitAscMut(gpa, CtxType, branch.children[i].?, ctx, yield);
+                try yield(ctx, node.keys[i], &node.values[i]);
+            }
+
+            try self.makeUniqueChild(gpa, node, node.len);
+            try self.visitAscMut(gpa, CtxType, branch.children[node.len].?, ctx, yield);
         }
 
         /// Visits every item in descending sort order.
@@ -757,6 +823,51 @@ pub fn Map(
                 i -= 1;
                 try yield(ctx, node.keys[i], node.values[i]);
                 try visitDesc(CtxType, branch.children[i].?, ctx, yield);
+            }
+        }
+
+        /// Visits every item in descending sort order and yields mutable values.
+        ///
+        /// Copy-on-write paths are cloned before values are yielded. Callbacks
+        /// must not structurally mutate the map while iteration is active.
+        pub fn descentMut(
+            self: *Self,
+            gpa: mem.Allocator,
+            comptime CtxType: type,
+            context: CtxType,
+            comptime yield: fn (CtxType, K, *V) anyerror!void,
+        ) !void {
+            try self.makeUniqueRoot(gpa);
+            if (self.root) |root| try self.visitDescMut(gpa, CtxType, root, context, yield);
+        }
+
+        fn visitDescMut(
+            self: *Self,
+            gpa: mem.Allocator,
+            comptime CtxType: type,
+            node: *Node,
+            ctx: CtxType,
+            comptime yield: fn (CtxType, K, *V) anyerror!void,
+        ) !void {
+            if (node.isLeaf()) {
+                var i = node.len;
+                while (i > 0) {
+                    i -= 1;
+                    try yield(ctx, node.keys[i], &node.values[i]);
+                }
+                return;
+            }
+
+            const branch = node.branch.?;
+            try self.makeUniqueChild(gpa, node, node.len);
+            try self.visitDescMut(gpa, CtxType, branch.children[node.len].?, ctx, yield);
+
+            var i = node.len;
+            while (i > 0) {
+                i -= 1;
+                try yield(ctx, node.keys[i], &node.values[i]);
+                try self.makeUniqueChild(gpa, node, i);
+                try self.visitDescMut(gpa, CtxType, branch.children[i].?, ctx, yield);
             }
         }
 
@@ -847,6 +958,37 @@ pub fn Map(
                     if (remaining == 0) return Entry.init(node.keys[i], node.values[i]);
                     remaining -= 1;
                 } else {
+                    node = branch.children[node.len].?;
+                }
+            }
+        }
+
+        /// Returns a mutable value pointer for the item at zero-based sorted position `index`.
+        ///
+        /// Copy-on-write paths are cloned before the pointer is returned. The
+        /// pointer is valid until the next structural mutation of this map.
+        pub fn getAtMut(self: *Self, gpa: mem.Allocator, index: usize) !?EntryMut {
+            if (index >= self.count) return null;
+            try self.makeUniqueRoot(gpa);
+
+            var node = self.root.?;
+            var remaining = index;
+
+            while (true) {
+                if (node.isLeaf()) return EntryMut.init(node.keys[remaining], &node.values[remaining]);
+
+                const branch = node.branch.?;
+                for (0..node.len) |i| {
+                    if (remaining < branch.counts[i]) {
+                        try self.makeUniqueChild(gpa, node, i);
+                        node = branch.children[i].?;
+                        break;
+                    }
+                    remaining -= branch.counts[i];
+                    if (remaining == 0) return EntryMut.init(node.keys[i], &node.values[i]);
+                    remaining -= 1;
+                } else {
+                    try self.makeUniqueChild(gpa, node, node.len);
                     node = branch.children[node.len].?;
                 }
             }

@@ -35,6 +35,14 @@ fn collectDynamic(ctx: *DynamicCollectContext, key: i32, value: i32) !void {
     try ctx.items.append(ctx.allocator, .{ .key = key, .value = value });
 }
 
+fn addKeyToValue(_: void, key: i32, value: *i32) !void {
+    value.* += key;
+}
+
+fn subtractKeyFromValue(_: void, key: i32, value: *i32) !void {
+    value.* -= key;
+}
+
 test "map stores one value per key" {
     const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
     var m = IntMap.init();
@@ -522,6 +530,76 @@ test "void map supports large random deletion" {
     }
     try testing.expectEqual(0, m.len());
     try m.checkInvariants();
+}
+
+test "map mutable accessors update values without changing order" {
+    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    var m = IntMap.init();
+    defer m.deinit(testing.allocator);
+
+    for ([_]i32{ 5, 1, 3, 2, 4 }) |key| {
+        try testing.expect(try m.insert(testing.allocator, key, key * 10));
+    }
+
+    const missing = try m.getMut(testing.allocator, 99);
+    try testing.expectEqual(@as(?*i32, null), missing);
+
+    const value = (try m.getMut(testing.allocator, 3)).?;
+    value.* = 300;
+
+    const indexed = (try m.getAtMut(testing.allocator, 1)).?;
+    try testing.expectEqual(@as(i32, 2), indexed.key);
+    indexed.value.* = 200;
+
+    try testing.expectEqual(@as(?i32, 300), m.get(3));
+    try testing.expectEqual(@as(?i32, 200), m.get(2));
+
+    try m.ascentMut(testing.allocator, void, {}, addKeyToValue);
+    try testing.expectEqual(@as(?i32, 11), m.get(1));
+    try testing.expectEqual(@as(?i32, 202), m.get(2));
+    try testing.expectEqual(@as(?i32, 303), m.get(3));
+    try testing.expectEqual(@as(?i32, 44), m.get(4));
+    try testing.expectEqual(@as(?i32, 55), m.get(5));
+
+    try m.descentMut(testing.allocator, void, {}, subtractKeyFromValue);
+    for (1..6) |i| {
+        const key: i32 = @intCast(i);
+        const expected: i32 = if (key == 2) 200 else if (key == 3) 300 else key * 10;
+        try testing.expectEqual(@as(?i32, expected), m.get(key));
+        try testing.expectEqual(key, m.getAt(i - 1).?.key);
+    }
+    try m.checkInvariants();
+}
+
+test "map mutable accessors clone copy-on-write values before mutation" {
+    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    var original = IntMap.init();
+    defer original.deinit(testing.allocator);
+
+    for (0..256) |i| {
+        const key: i32 = @intCast(i);
+        try testing.expect(try original.insert(testing.allocator, key, key));
+    }
+
+    var copied = original.copy();
+    defer copied.deinit(testing.allocator);
+
+    (try copied.getMut(testing.allocator, 42)).?.* = -42;
+    (try copied.getAtMut(testing.allocator, 100)).?.value.* = -100;
+    try copied.ascentMut(testing.allocator, void, {}, addKeyToValue);
+
+    try testing.expectEqual(@as(?i32, 42), original.get(42));
+    try testing.expectEqual(@as(?i32, 100), original.get(100));
+    try testing.expectEqual(@as(?i32, 0), copied.get(42));
+    try testing.expectEqual(@as(?i32, 0), copied.get(100));
+
+    for (0..256) |i| {
+        const key: i32 = @intCast(i);
+        try testing.expectEqual(@as(?i32, key), original.get(key));
+        if (key != 42 and key != 100) try testing.expectEqual(@as(?i32, key * 2), copied.get(key));
+    }
+    try original.checkInvariants();
+    try copied.checkInvariants();
 }
 
 test "map copy-on-write isolates value replacements across many entries" {

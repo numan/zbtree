@@ -6,6 +6,8 @@ const order = zbtree_ds.order;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+const warmup_runs = 2;
+
 const Options = struct {
     items: usize,
     runs: usize,
@@ -79,13 +81,7 @@ fn benchType(
     const Map = map.Map(K, usize, .{ .use_string_prefix = Order.use_string_prefix });
     const Ctx = BenchContext(K, Map);
 
-    var ctx = Ctx{
-        .allocator = allocator,
-        .prng = std.Random.DefaultPrng.init(0xdecafbad),
-        .items = options.items,
-        .tree = Map.init(),
-        .copy_batch_ops = copyBatchCount(options.items),
-    };
+    var ctx = Ctx.init(allocator, options.items, benchmarkSeed(key_name, "type"));
     defer ctx.deinit();
 
     try stdout.print("Benchmarking {d} items, {s} keys, {d} times, using median\n", .{ options.items, key_name, options.runs });
@@ -96,6 +92,7 @@ fn benchType(
     try runBenchmark(Ctx, &ctx, "insert(rand)", options.items, options.runs, Ctx.preInsertRand, Ctx.insertAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "get(seq)", options.items, options.runs, Ctx.preFullSeq, Ctx.getAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "get(rand)", options.items, options.runs, Ctx.preFullRand, Ctx.getAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "getMut(rand)", options.items, options.runs, Ctx.preFullRand, Ctx.getMutAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "set(existing)", options.items, options.runs, Ctx.preFullRand, Ctx.setAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "replace", options.items, options.runs, Ctx.preFullRand, Ctx.replaceAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "seek", options.items, options.runs, Ctx.preFullRand, Ctx.seekAll, allocator, io, stdout);
@@ -103,6 +100,9 @@ fn benchType(
     try runBenchmark(Ctx, &ctx, "seekPrev", options.items, options.runs, Ctx.preFullRand, Ctx.seekPrevAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "indexOf", options.items, options.runs, Ctx.preFullRand, Ctx.indexOfAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "getAt", options.items, options.runs, Ctx.preFullRand, Ctx.getAtAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "getAtMut", options.items, options.runs, Ctx.preFullRand, Ctx.getAtMutAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "ascentMut", options.items, options.runs, Ctx.preFullRand, Ctx.ascentMutAll, allocator, io, stdout);
+    try runBenchmark(Ctx, &ctx, "descentMut", options.items, options.runs, Ctx.preFullRand, Ctx.descentMutAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "delete(rand)", options.items, options.runs, Ctx.preFullRand, Ctx.deleteAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "deleteAt(front)", options.items, options.runs, Ctx.preFullSeq, Ctx.deleteAtFrontAll, allocator, io, stdout);
     try runBenchmark(Ctx, &ctx, "popFront", options.items, options.runs, Ctx.preFullSeq, Ctx.popFrontAll, allocator, io, stdout);
@@ -131,6 +131,16 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
         string_bytes: if (K == []const u8) []u8 else void = if (K == []const u8) &.{} else {},
         checksum: usize = 0,
         resident_string_bytes: if (K == []const u8) []u8 else void = if (K == []const u8) &.{} else {},
+
+        fn init(allocator: Allocator, items: usize, seed: u64) Self {
+            return .{
+                .allocator = allocator,
+                .prng = std.Random.DefaultPrng.init(seed),
+                .items = items,
+                .tree = Map.init(),
+                .copy_batch_ops = copyBatchCount(items),
+            };
+        }
 
         fn deinit(self: *Self) void {
             self.cleanupUntimed();
@@ -304,6 +314,15 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             self.record(digest);
         }
 
+        pub fn getMutAll(self: *Self) !void {
+            var digest: usize = 0;
+            for (self.keys) |key| {
+                const value = (try self.tree.getMut(self.allocator, key)) orelse return error.BenchmarkMissingKey;
+                digest +%= self.keyDigest(key) ^ value.*;
+            }
+            self.record(digest);
+        }
+
         pub fn setAll(self: *Self) !void {
             var digest: usize = 0;
             for (self.keys, 0..) |key, i| {
@@ -365,6 +384,25 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
                 digest +%= self.entryDigest(entry) ^ index;
             }
             self.record(digest);
+        }
+
+        pub fn getAtMutAll(self: *Self) !void {
+            var digest: usize = 0;
+            for (self.indices) |index| {
+                const entry = (try self.tree.getAtMut(self.allocator, index)) orelse return error.BenchmarkMissingKey;
+                digest +%= self.keyDigest(entry.key) ^ entry.value.* ^ index;
+            }
+            self.record(digest);
+        }
+
+        pub fn ascentMutAll(self: *Self) !void {
+            try self.tree.ascentMut(self.allocator, *Self, self, consumeMutEntry);
+            self.record(self.tree.len());
+        }
+
+        pub fn descentMutAll(self: *Self) !void {
+            try self.tree.descentMut(self.allocator, *Self, self, consumeMutEntry);
+            self.record(self.tree.len());
         }
 
         pub fn deleteAll(self: *Self) !void {
@@ -467,6 +505,10 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             self.checksum +%= digestKey(key) ^ value;
         }
 
+        fn consumeMutEntry(self: *Self, key: K, value: *usize) !void {
+            self.checksum +%= digestKey(key) ^ value.*;
+        }
+
         fn entryDigest(self: *Self, entry: Map.Entry) usize {
             return self.keyDigest(entry.key) ^ entry.value;
         }
@@ -507,6 +549,22 @@ fn valueForOrdinal(index: usize) usize {
     return index +% 1;
 }
 
+fn benchmarkSeed(type_name: []const u8, label: []const u8) u64 {
+    var seed: u64 = 1469598103934665603;
+    seed = mixSeed(seed, type_name);
+    seed = mixSeed(seed, label);
+    return seed;
+}
+
+fn mixSeed(seed: u64, bytes: []const u8) u64 {
+    var value = seed;
+    for (bytes) |byte| {
+        value ^= byte;
+        value *%= 1099511628211;
+    }
+    return value;
+}
+
 fn partialRangeStart(items: usize, count: usize) usize {
     return (items - count) / 2;
 }
@@ -533,22 +591,35 @@ fn runBenchmark(
     const elapsed = try allocator.alloc(u64, runs);
     defer allocator.free(elapsed);
 
-    for (elapsed) |*sample| {
-        ctx.cleanupUntimed();
-        try pre(ctx);
-        const start = benchTime(io);
-        op(ctx) catch |err| {
-            ctx.cleanupUntimed();
-            return err;
-        };
-        const end = benchTime(io);
-        sample.* = @intCast(end - start);
-        ctx.cleanupUntimed();
-    }
+    const seed = benchmarkSeed(@typeName(Ctx), label);
+    for (0..warmup_runs) |_| _ = try runBenchmarkSample(Ctx, ctx.items, seed, pre, op, io);
+
+    for (elapsed) |*sample| sample.* = try runBenchmarkSample(Ctx, ctx.items, seed, pre, op, io);
 
     std.sort.pdq(u64, elapsed, {}, lessU64);
     const median = elapsed[runs / 2];
     try writeResult(stdout, label, ops, median);
+}
+
+fn runBenchmarkSample(
+    comptime Ctx: type,
+    items: usize,
+    seed: u64,
+    comptime pre: fn (*Ctx) anyerror!void,
+    comptime op: fn (*Ctx) anyerror!void,
+    io: Io,
+) !u64 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var ctx = Ctx.init(arena.allocator(), items, seed);
+    defer ctx.deinit();
+
+    try pre(&ctx);
+    const start = benchTime(io);
+    try op(&ctx);
+    const end = benchTime(io);
+    return @intCast(end - start);
 }
 
 fn benchTime(io: Io) i96 {
