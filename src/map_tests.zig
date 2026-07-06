@@ -91,6 +91,12 @@ test "map ordered access and traversal" {
     try testing.expectEqual(@as(usize, 3), limited.len);
     try testing.expectEqual(@as(i32, 2), limited.items[0].key);
     try testing.expectEqual(@as(i32, 4), limited.items[2].key);
+
+    var oversized_descend = CollectContext{};
+    try m.descendAt(*CollectContext, m.len(), &oversized_descend, collectUntil);
+    try testing.expectEqual(@as(usize, 3), oversized_descend.len);
+    try testing.expectEqual(@as(i32, 5), oversized_descend.items[0].key);
+    try testing.expectEqual(@as(i32, 3), oversized_descend.items[2].key);
 }
 
 test "map edge push wrappers preserve order and reject duplicates" {

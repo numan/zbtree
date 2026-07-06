@@ -1018,7 +1018,8 @@ pub fn Map(
         /// Visits items in descending order starting at sorted position `index`.
         ///
         /// The callback returns `true` to continue or `false` to stop early.
-        /// If the tree is empty or `index` is out of range, nothing is visited.
+        /// If the tree is empty, nothing is visited. If `index` is out of range,
+        /// traversal starts from the last item.
         pub fn descendAt(
             self: *const Self,
             comptime CtxType: type,
@@ -1026,8 +1027,9 @@ pub fn Map(
             context: CtxType,
             comptime yield: fn (CtxType, K, V) anyerror!bool,
         ) !void {
-            if (self.count == 0 or index >= self.count) return;
-            _ = try visitDescFrom(CtxType, self.root.?, index, context, yield);
+            if (self.count == 0) return;
+            const start = if (index >= self.count) self.count - 1 else index;
+            _ = try visitDescFrom(CtxType, self.root.?, start, context, yield);
         }
 
         // Finds a slot that may be mutated by cloning each shared node on the

@@ -1473,8 +1473,15 @@ test "ascendAt and descendAt start at an index and stop when yield returns false
 
     var out_of_range = CollectLimitContext{ .limit = 5 };
     try tree.ascendAt(*CollectLimitContext, 100, &out_of_range, collectPairUntilLimit);
-    try tree.descendAt(*CollectLimitContext, 100, &out_of_range, collectPairUntilLimit);
     try testing.expectEqual(0, out_of_range.len);
+
+    try tree.descendAt(*CollectLimitContext, 100, &out_of_range, collectPairUntilLimit);
+    try testing.expectEqual(5, out_of_range.len);
+    for (out_of_range.items[0..out_of_range.len], 0..) |pair, i| {
+        const key: isize = @intCast(99 - i);
+        try testing.expectEqual(key, pair.key);
+        try testing.expectEqual(key * 10, pair.value);
+    }
 }
 
 fn fillSequentialTree(comptime IntTree: type, tree: *IntTree, count: usize) !void {
@@ -1546,9 +1553,9 @@ test "descendAt starts correctly at every index in a multi-level tree" {
         try testing.expectEqual(@min(@as(usize, 4), index + 1), ctx.seen);
     }
 
-    var out_of_range = VerifyDescendingContext{ .next = tree.len };
+    var out_of_range = VerifyDescendingContext{ .next = tree.len - 1, .limit = 4 };
     try tree.descendAt(*VerifyDescendingContext, tree.len, &out_of_range, verifyDescending);
-    try testing.expectEqual(0, out_of_range.seen);
+    try testing.expectEqual(4, out_of_range.seen);
 }
 
 test "descendAt continues across multi-level child boundaries" {
