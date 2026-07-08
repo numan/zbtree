@@ -166,6 +166,151 @@ fn acceptKeyNinetyEight(key: isize, value: isize) bool {
     return true;
 }
 
+fn addKeyToValue(_: void, key: isize, value: *isize) !void {
+    value.* += key;
+}
+
+fn subtractKeyFromValue(_: void, key: isize, value: *isize) !void {
+    value.* -= key;
+}
+
+fn fillPermutation(comptime N: usize, seed: u64) [N]isize {
+    var keys: [N]isize = undefined;
+    for (&keys, 0..) |*key, i| key.* = @intCast(i);
+    var prng = std.Random.DefaultPrng.init(seed);
+    prng.random().shuffle(isize, &keys);
+    return keys;
+}
+
+test "ordered-key btree ignores value tie breakers for identity" {
+    const OrderedTree = btree.Tree(isize, isize, .{
+        .compare = compareIntKeyThenValue,
+        .ordering = .ordered_key,
+        .use_string_prefix = false,
+    });
+    var tree = OrderedTree.init();
+    defer tree.deinit(testing.allocator);
+
+    try testing.expect(try tree.insertKey(testing.allocator, 10, 100));
+    try testing.expect(!try tree.insertKey(testing.allocator, 10, 200));
+    try testing.expectEqual(@as(usize, 1), tree.len);
+    try testing.expectEqual(@as(?isize, 100), tree.getKey(10));
+
+    try testing.expectEqual(@as(?isize, 100), try tree.setKey(testing.allocator, 10, 200));
+    try testing.expectEqual(@as(?isize, 200), tree.getKey(10));
+    try testing.expectEqual(@as(?isize, null), try tree.setKey(testing.allocator, 20, 300));
+    try testing.expectEqual(@as(usize, 2), tree.len);
+
+    try testing.expectEqual(@as(?isize, 200), try tree.replaceKey(testing.allocator, 10, 111));
+    try testing.expectEqual(@as(?isize, null), try tree.replaceKey(testing.allocator, 30, 333));
+    try testing.expectEqual(@as(?isize, 111), tree.getKey(10));
+
+    try testing.expectEqual(@as(?isize, 111), try tree.deleteKey(testing.allocator, 10));
+    try testing.expectEqual(@as(?isize, null), tree.getKey(10));
+    try testing.expectEqual(@as(usize, 1), tree.len);
+    try tree.checkInvariants();
+}
+
+test "ordered-key btree supports ordered access and key-bounded range deletion" {
+    const OrderedTree = btree.Tree(isize, isize, .{
+        .compare = compareIntKey,
+        .ordering = .ordered_key,
+        .use_string_prefix = false,
+    });
+    var tree = OrderedTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for ([_]isize{ 5, 1, 3, 2, 4, 0, 6 }) |key| {
+        try testing.expect(try tree.insertKey(testing.allocator, key, key * 10));
+    }
+
+    try testing.expectEqual(@as(isize, 0), tree.front().?.key);
+    try testing.expectEqual(@as(isize, 6), tree.back().?.key);
+    try testing.expectEqual(@as(?usize, 3), tree.indexOfKey(3));
+    try testing.expectEqual(@as(isize, 4), tree.seekKey(4).?.key);
+    try testing.expectEqual(@as(isize, 4), tree.seekNextKey(3).?.key);
+    try testing.expectEqual(@as(isize, 2), tree.seekPrevKey(3).?.key);
+    try testing.expectEqual(@as(isize, 3), tree.getAt(3).?.key);
+
+    const removed = try tree.deleteRangeKey(testing.allocator, 2, 5, .{ .max_inclusive = true });
+    defer removed.deinit(testing.allocator);
+
+    var removed_items = CollectContext{};
+    try removed.ascent(*CollectContext, &removed_items, collectPair);
+    try testing.expectEqual(@as(usize, 4), removed.removed_count);
+    try testing.expectEqual(@as(usize, 4), removed_items.len);
+    for (removed_items.items[0..removed_items.len], 2..) |item, expected_usize| {
+        const expected: isize = @intCast(expected_usize);
+        try testing.expectEqual(expected, item.key);
+        try testing.expectEqual(expected * 10, item.value);
+    }
+    try testing.expectEqual(@as(?isize, null), tree.getKey(2));
+    try testing.expectEqual(@as(?isize, null), tree.getKey(5));
+    try testing.expectEqual(@as(usize, 3), tree.len);
+    try tree.checkInvariants();
+}
+
+test "ordered-key btree mutable accessors clone copy-on-write paths" {
+    const OrderedTree = btree.Tree(isize, isize, .{
+        .compare = compareIntKey,
+        .ordering = .ordered_key,
+        .use_string_prefix = false,
+    });
+    var original = OrderedTree.init();
+    defer original.deinit(testing.allocator);
+
+    for (0..256) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try original.insertKey(testing.allocator, key, key));
+    }
+
+    var copied = original.copy();
+    defer copied.deinit(testing.allocator);
+
+    (try copied.getKeyMut(testing.allocator, 42)).?.* = -42;
+    (try copied.getAtMut(testing.allocator, 100)).?.value.* = -100;
+    try copied.ascentMut(testing.allocator, void, {}, addKeyToValue);
+    try copied.descentMut(testing.allocator, void, {}, subtractKeyFromValue);
+
+    try testing.expectEqual(@as(?isize, 42), original.getKey(42));
+    try testing.expectEqual(@as(?isize, 100), original.getKey(100));
+    try testing.expectEqual(@as(?isize, -42), copied.getKey(42));
+    try testing.expectEqual(@as(?isize, -100), copied.getKey(100));
+
+    for (0..256) |i| {
+        const key: isize = @intCast(i);
+        try testing.expectEqual(@as(?isize, key), original.getKey(key));
+        if (key != 42 and key != 100) try testing.expectEqual(@as(?isize, key), copied.getKey(key));
+    }
+    try original.checkInvariants();
+    try copied.checkInvariants();
+}
+
+test "ordered-key string btree uses prefix routing with key-only APIs" {
+    const StringTree = btree.Tree([]const u8, usize, .{
+        .compare = compareStringKey,
+        .ordering = .ordered_key,
+        .use_string_prefix = true,
+    });
+    var tree = StringTree.init();
+    defer tree.deinit(testing.allocator);
+
+    var buffers: [2000][16]u8 = undefined;
+    const keys = fillPermutation(2000, 0x5eed_1001);
+    for (keys, 0..) |permuted, i| {
+        const key = try std.fmt.bufPrint(&buffers[i], "{d}", .{permuted});
+        try testing.expectEqual(null, tree.getKey(key));
+        try testing.expect(try tree.insertKey(testing.allocator, key, @intCast(permuted)));
+        try testing.expect(!try tree.insertKey(testing.allocator, key, 999_999));
+        try testing.expectEqual(@as(usize, @intCast(permuted)), tree.getKey(key));
+        if (i % 301 == 0) try tree.checkInvariants();
+    }
+
+    try testing.expectEqual(@as(usize, 2000), tree.len);
+    try testing.expect(tree.seekKey("1000") != null);
+    try tree.checkInvariants();
+}
+
 test "empty btree has expected constants" {
     const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
     const tree = IntTree.init();

@@ -14,9 +14,23 @@ pub const DeleteRangeOptions = struct {
     max_inclusive: bool = false,
 };
 
+pub const Ordering = enum {
+    compare,
+    ordered_key,
+};
+
+pub fn orderedKeySupported(comptime K: type) bool {
+    if (K == []const u8) return true;
+    return switch (@typeInfo(K)) {
+        .int, .comptime_int, .float, .comptime_float, .bool, .@"enum" => true,
+        else => false,
+    };
+}
+
 pub fn TreeConfig(comptime K: type, comptime V: type) type {
     return struct {
         compare: fn (K, V, K, V) std.math.Order,
+        ordering: Ordering = .compare,
         use_string_prefix: bool = true,
 
         search_mode: SearchMode = .auto,
@@ -40,6 +54,9 @@ pub fn Tree(
         if (config.use_string_prefix and K != []const u8) {
             @compileError("config.use_string_prefix requires key type to be []const u8 (string)");
         }
+        if (config.ordering == .ordered_key and !orderedKeySupported(K)) {
+            @compileError("ordered_key trees require key type to be one of: int, float, bool, enum, []const u8 (string)");
+        }
     }
     return struct {
         const Self = @This();
@@ -52,9 +69,9 @@ pub fn Tree(
         pub const max_items = storage.max_items;
         pub const min_items = storage.min_items;
 
-        const Node = storage.Node;
-        const Branch = storage.Branch;
-        const InternalNode = storage.InternalNode;
+        pub const Node = storage.Node;
+        pub const Branch = storage.Branch;
+        pub const InternalNode = storage.InternalNode;
 
         // Result of searching inside one node. `index` is either the matching
         // item index or the insertion/child-descent position.
@@ -89,7 +106,7 @@ pub fn Tree(
             }
         };
 
-        const RankResult = struct {
+        pub const RankResult = struct {
             index: usize,
             found: bool,
 
@@ -103,6 +120,15 @@ pub fn Tree(
             value: V,
 
             fn init(key: K, value: V) @This() {
+                return .{ .key = key, .value = value };
+            }
+        };
+
+        pub const EntryMut = struct {
+            key: K,
+            value: *V,
+
+            fn init(key: K, value: *V) @This() {
                 return .{ .key = key, .value = value };
             }
         };
@@ -174,7 +200,46 @@ pub fn Tree(
             return value;
         }
 
+        fn orderedKeyCompare(a: K, b: K) std.math.Order {
+            if (comptime K == []const u8) {
+                return mem.order(u8, a, b);
+            }
+
+            return switch (@typeInfo(K)) {
+                .bool => if (a == b) .eq else if (!a and b) .lt else .gt,
+                .@"enum" => blk: {
+                    const a_ = @intFromEnum(a);
+                    const b_ = @intFromEnum(b);
+                    break :blk if (a_ == b_) .eq else if (a_ < b_) .lt else .gt;
+                },
+                else => if (a < b) .lt else if (a > b) .gt else .eq,
+            };
+        }
+
+        fn orderedKeyLess(a: K, b: K) bool {
+            if (comptime K == []const u8) return mem.order(u8, a, b) == .lt;
+            return switch (@typeInfo(K)) {
+                .bool => !a and b,
+                .@"enum" => @intFromEnum(a) < @intFromEnum(b),
+                else => a < b,
+            };
+        }
+
+        fn orderedKeyEqual(a: K, b: K) bool {
+            if (comptime K == []const u8) return mem.eql(u8, a, b);
+            return a == b;
+        }
+
+        fn requireOrderedKeyMode() void {
+            if (comptime config.ordering != .ordered_key) {
+                @compileError("this method is only available when TreeConfig.ordering is .ordered_key");
+            }
+        }
+
         fn keyCompare(a_key: K, a_value: V, b_key: K, b_value: V) std.math.Order {
+            if (comptime config.ordering == .ordered_key) {
+                return orderedKeyCompare(a_key, b_key);
+            }
             return compare(a_key, a_value, b_key, b_value);
         }
 
@@ -186,7 +251,15 @@ pub fn Tree(
             };
         }
 
-        fn setPrefix(node: *Node, index: usize) void {
+        fn usePrimitiveOrderedKeyFastSearch() bool {
+            if (K == []const u8) return false;
+            return switch (@typeInfo(K)) {
+                .int, .comptime_int, .float, .comptime_float => true,
+                else => false,
+            };
+        }
+
+        pub fn setPrefix(node: *Node, index: usize) void {
             if (config.use_string_prefix) {
                 if (node.branch) |branch| branch.prefixes[index] = stringPrefix(node.keys[index]);
             }
@@ -198,9 +271,20 @@ pub fn Tree(
             return .{};
         }
 
+        pub fn isEmpty(self: *const Self) bool {
+            return self.len == 0;
+        }
+
+        pub fn insertFirstItem(self: *Self, gpa: mem.Allocator, key: K, value: V) !void {
+            std.debug.assert(self.root == null);
+            self.root = try self.newNode(gpa, true);
+            insertItemAt(self.root.?, 0, key, value);
+            self.len = 1;
+        }
+
         // Allocates one node. Internal nodes colocate Branch data in the same
         // allocation as the Node.
-        fn newNode(self: *Self, gpa: mem.Allocator, leaf: bool) !*Node {
+        pub fn newNode(self: *Self, gpa: mem.Allocator, leaf: bool) !*Node {
             _ = self;
 
             if (leaf) {
@@ -264,7 +348,7 @@ pub fn Tree(
 
         // Splits a full root and creates a new root above it, increasing the
         // tree height by one.
-        fn splitRoot(self: *Self, gpa: mem.Allocator) !void {
+        pub fn splitRoot(self: *Self, gpa: mem.Allocator) !void {
             const old_root = self.root.?;
             const split = try self.splitNode(gpa, old_root);
             const new_root = try self.newNode(gpa, false);
@@ -293,12 +377,26 @@ pub fn Tree(
 
         //TODO: Should we inline this?
         fn searchNodeWithPrefix(node: *const Node, key: K, value: V, prefix: u64) SearchResult {
+            if (comptime config.ordering == .ordered_key) {
+                return searchKeyOnlyWithPrefix(node, key, prefix);
+            }
+
             if (comptime config.use_string_prefix) {
                 if (!node.isLeaf()) return seachBranchWithPrefixes(node, key, value, prefix);
             }
 
             if (comptime useBinarySearch()) return searchNodeBinary(node, key, value);
             return searchNodeLinear(node, key, value);
+        }
+
+        fn searchKeyOnlyWithPrefix(node: *const Node, key: K, prefix: u64) SearchResult {
+            if (comptime config.use_string_prefix) {
+                if (!node.isLeaf()) return searchBranchByKeyPrefix(node, key, prefix);
+            }
+
+            if (comptime useBinarySearch()) return searchOrderedKeyBinary(node, key);
+            if (comptime usePrimitiveOrderedKeyFastSearch()) return searchPrimitiveOrderedKeyLinear(node, key);
+            return searchOrderedKeyLinear(node, key);
         }
 
         fn seachBranchWithPrefixes(node: *const Node, key: []const u8, value: V, wanted: u64) SearchResult {
@@ -316,6 +414,69 @@ pub fn Tree(
             }
 
             return SearchResult.init(i, false);
+        }
+
+        fn searchBranchByKeyPrefix(node: *const Node, key: []const u8, wanted: u64) SearchResult {
+            const branch = node.branch.?;
+            if (wanted > branch.prefixes[node.len - 1]) return SearchResult.init(node.len, false);
+
+            var i: usize = 0;
+            while (i < node.len) : (i += 1) {
+                const prefix = branch.prefixes[i];
+                if (prefix < wanted) continue;
+                if (prefix > wanted) return SearchResult.init(i, false);
+
+                const c = orderedKeyCompare(node.keys[i], key);
+                if (c == .gt or c == .eq) return SearchResult.init(i, c == .eq);
+            }
+
+            return SearchResult.init(i, false);
+        }
+
+        fn searchOrderedKeyLinear(node: *const Node, key: K) SearchResult {
+            if (node.len == 0) return SearchResult.init(0, false);
+
+            const last = node.len - 1;
+            if (orderedKeyLess(node.keys[last], key)) return SearchResult.init(node.len, false);
+            if (orderedKeyEqual(node.keys[last], key)) return SearchResult.init(last, true);
+
+            var i: usize = 0;
+            while (true) : (i += 1) {
+                if (!orderedKeyLess(node.keys[i], key)) return SearchResult.init(i, orderedKeyEqual(node.keys[i], key));
+            }
+        }
+
+        inline fn searchPrimitiveOrderedKeyLinear(node: *const Node, key: K) SearchResult {
+            if (node.len == 0) return SearchResult.init(0, false);
+
+            const last = node.len - 1;
+            if (key > node.keys[last]) return SearchResult.init(node.len, false);
+            if (key == node.keys[last]) return SearchResult.init(last, true);
+
+            var i: usize = 0;
+            while (key > node.keys[i]) : (i += 1) {}
+            return SearchResult.init(i, key == node.keys[i]);
+        }
+
+        fn searchOrderedKeyBinary(node: *const Node, key: K) SearchResult {
+            if (node.len == 0) return SearchResult.init(0, false);
+
+            const last = node.len - 1;
+            if (orderedKeyLess(node.keys[last], key)) return SearchResult.init(node.len, false);
+            if (orderedKeyEqual(node.keys[last], key)) return SearchResult.init(last, true);
+
+            var low: usize = 0;
+            var high: usize = last;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (orderedKeyLess(node.keys[mid], key)) {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+
+            return SearchResult.init(low, orderedKeyEqual(node.keys[low], key));
         }
 
         fn searchNodeLinear(node: *const Node, key: K, value: V) SearchResult {
@@ -357,7 +518,7 @@ pub fn Tree(
             return SearchResult.init(low, keyCompare(node.keys[low], node.values[low], key, value) == .eq);
         }
         // Inserts one item into a non-full node by shifting later items right.
-        fn insertItemAt(node: *Node, index: usize, key: K, value: V) void {
+        pub fn insertItemAt(node: *Node, index: usize, key: K, value: V) void {
             std.debug.assert(node.len < max_items);
 
             if (index < node.len) {
@@ -402,7 +563,7 @@ pub fn Tree(
 
         // Splits a full child before descending into it. This keeps insertion
         // simple because recursion always enters a non-full node.
-        fn splitChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
+        pub fn splitChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
             const branch = parent.branch.?;
             const split = try self.splitNode(gpa, branch.children[child_index].?);
 
@@ -490,6 +651,39 @@ pub fn Tree(
             branch.counts[child_index] += 1;
         }
 
+        fn insertKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V, prefix: u64) !bool {
+            const found = searchKeyOnlyWithPrefix(node, key, prefix);
+            if (found.found) return false;
+
+            if (node.isLeaf()) {
+                insertItemAt(node, found.index, key, value);
+                return true;
+            }
+
+            const branch = node.branch.?;
+            var child_index = found.index;
+            try self.makeUniqueChild(gpa, node, child_index);
+            if (branch.children[child_index].?.len == max_items) {
+                try self.splitChild(gpa, node, child_index);
+                const cmp = orderedKeyCompare(node.keys[child_index], key);
+                if (cmp == .eq) return false;
+                if (cmp == .lt) child_index += 1;
+            }
+
+            const child = branch.children[child_index].?;
+            if (child.isLeaf()) {
+                const child_found = searchKeyOnlyWithPrefix(child, key, prefix);
+                if (child_found.found) return false;
+                insertItemAt(child, child_found.index, key, value);
+                branch.counts[child_index] += 1;
+                return true;
+            }
+
+            const inserted = try self.insertKeyOnlyIntoNonFull(gpa, child, key, value, prefix);
+            if (inserted) branch.counts[child_index] += 1;
+            return inserted;
+        }
+
         pub fn insert(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
             try self.makeUniqueRoot(gpa);
             if (self.root == null) {
@@ -506,6 +700,23 @@ pub fn Tree(
             return inserted;
         }
 
+        pub inline fn insertKey(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {
+            requireOrderedKeyMode();
+            try self.makeUniqueRoot(gpa);
+            if (self.root == null) {
+                self.root = try self.newNode(gpa, true);
+                insertItemAt(self.root.?, 0, key, value);
+                self.len = 1;
+                return true;
+            }
+
+            if (self.root.?.len == max_items) try self.splitRoot(gpa);
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const inserted = try self.insertKeyOnlyIntoNonFull(gpa, self.root.?, key, value, prefix);
+            if (inserted) self.len += 1;
+            return inserted;
+        }
+
         /// Looks up an item equal to `key`/`value` and returns its stored value.
         /// Returns `null` when no equal item exists.
         pub fn get(self: *const Self, key: K, value: V) ?V {
@@ -515,6 +726,49 @@ pub fn Tree(
                 const found = searchNodeWithPrefix(node, key, value, prefix);
                 if (found.found) return node.values[found.index];
                 if (node.branch) |branch| node = branch.children[found.index].? else return null;
+            }
+        }
+
+        pub inline fn getKey(self: *const Self, key: K) ?V {
+            requireOrderedKeyMode();
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (found.found) return node.values[found.index];
+                if (node.branch) |branch| node = branch.children[found.index].? else return null;
+            }
+        }
+
+        /// Looks up an item and returns a mutable pointer to its stored value.
+        ///
+        /// Copy-on-write paths are cloned before the pointer is returned. The
+        /// pointer is valid until the next structural mutation of this tree.
+        pub fn getMut(self: *Self, gpa: mem.Allocator, key: K, value: V) !?*V {
+            try self.makeUniqueRoot(gpa);
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            while (true) {
+                const found = searchNodeWithPrefix(node, key, value, prefix);
+                if (found.found) return &node.values[found.index];
+                if (node.branch) |branch| {
+                    try self.makeUniqueChild(gpa, node, found.index);
+                    node = branch.children[found.index].?;
+                } else return null;
+            }
+        }
+
+        pub inline fn getKeyMut(self: *Self, gpa: mem.Allocator, key: K) !?*V {
+            try self.makeUniqueRoot(gpa);
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (found.found) return &node.values[found.index];
+                if (node.branch) |branch| {
+                    try self.makeUniqueChild(gpa, node, found.index);
+                    node = branch.children[found.index].?;
+                } else return null;
             }
         }
 
@@ -550,6 +804,45 @@ pub fn Tree(
             }
 
             try visitAsc(CtxType, branch.children[node.len].?, ctx, yield);
+        }
+
+        /// Visits every item in ascending sort order and yields mutable values.
+        ///
+        /// Copy-on-write paths are cloned before values are yielded. Callbacks
+        /// must not structurally mutate the tree while iteration is active.
+        pub fn ascentMut(
+            self: *Self,
+            gpa: mem.Allocator,
+            comptime CtxType: type,
+            context: CtxType,
+            comptime yield: fn (CtxType, K, *V) anyerror!void,
+        ) !void {
+            try self.makeUniqueRoot(gpa);
+            if (self.root) |root| try self.visitAscMut(gpa, CtxType, root, context, yield);
+        }
+
+        fn visitAscMut(
+            self: *Self,
+            gpa: mem.Allocator,
+            comptime CtxType: type,
+            node: *Node,
+            ctx: CtxType,
+            comptime yield: fn (CtxType, K, *V) anyerror!void,
+        ) !void {
+            if (node.isLeaf()) {
+                for (0..node.len) |i| try yield(ctx, node.keys[i], &node.values[i]);
+                return;
+            }
+
+            const branch = node.branch.?;
+            for (0..node.len) |i| {
+                try self.makeUniqueChild(gpa, node, i);
+                try self.visitAscMut(gpa, CtxType, branch.children[i].?, ctx, yield);
+                try yield(ctx, node.keys[i], &node.values[i]);
+            }
+
+            try self.makeUniqueChild(gpa, node, node.len);
+            try self.visitAscMut(gpa, CtxType, branch.children[node.len].?, ctx, yield);
         }
 
         /// Visits every item in descending sort order.
@@ -589,6 +882,51 @@ pub fn Tree(
                 i -= 1;
                 try yield(ctx, node.keys[i], node.values[i]);
                 try visitDesc(CtxType, branch.children[i].?, ctx, yield);
+            }
+        }
+
+        /// Visits every item in descending sort order and yields mutable values.
+        ///
+        /// Copy-on-write paths are cloned before values are yielded. Callbacks
+        /// must not structurally mutate the tree while iteration is active.
+        pub fn descentMut(
+            self: *Self,
+            gpa: mem.Allocator,
+            comptime CtxType: type,
+            context: CtxType,
+            comptime yield: fn (CtxType, K, *V) anyerror!void,
+        ) !void {
+            try self.makeUniqueRoot(gpa);
+            if (self.root) |root| try self.visitDescMut(gpa, CtxType, root, context, yield);
+        }
+
+        fn visitDescMut(
+            self: *Self,
+            gpa: mem.Allocator,
+            comptime CtxType: type,
+            node: *Node,
+            ctx: CtxType,
+            comptime yield: fn (CtxType, K, *V) anyerror!void,
+        ) !void {
+            if (node.isLeaf()) {
+                var i = node.len;
+                while (i > 0) {
+                    i -= 1;
+                    try yield(ctx, node.keys[i], &node.values[i]);
+                }
+                return;
+            }
+
+            const branch = node.branch.?;
+            try self.makeUniqueChild(gpa, node, node.len);
+            try self.visitDescMut(gpa, CtxType, branch.children[node.len].?, ctx, yield);
+
+            var i = node.len;
+            while (i > 0) {
+                i -= 1;
+                try yield(ctx, node.keys[i], &node.values[i]);
+                try self.makeUniqueChild(gpa, node, i);
+                try self.visitDescMut(gpa, CtxType, branch.children[i].?, ctx, yield);
             }
         }
 
@@ -655,6 +993,58 @@ pub fn Tree(
             }
         }
 
+        pub inline fn seekKey(self: *const Self, key: K) ?Entry {
+            requireOrderedKeyMode();
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            var candidate: ?Entry = null;
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (found.index < node.len) candidate = Entry.init(node.keys[found.index], node.values[found.index]);
+                if (found.found) return candidate;
+                if (node.branch) |branch| node = branch.children[found.index].? else return candidate;
+            }
+        }
+
+        pub inline fn seekNextKey(self: *const Self, key: K) ?Entry {
+            requireOrderedKeyMode();
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            var candidate: ?Entry = null;
+
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (!found.found and found.index < node.len) candidate = Entry.init(node.keys[found.index], node.values[found.index]);
+
+                if (found.found) {
+                    if (node.branch) |branch| return minEntry(branch.children[found.index + 1].?);
+                    return if (found.index + 1 < node.len) Entry.init(node.keys[found.index + 1], node.values[found.index + 1]) else candidate;
+                }
+
+                if (node.branch) |branch| node = branch.children[found.index].? else return candidate;
+            }
+        }
+
+        pub inline fn seekPrevKey(self: *const Self, key: K) ?Entry {
+            requireOrderedKeyMode();
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            var candidate: ?Entry = null;
+
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (found.found) {
+                    if (node.branch) |branch| return maxEntry(branch.children[found.index].?);
+                    return if (found.index == 0) candidate else Entry.init(node.keys[found.index - 1], node.values[found.index - 1]);
+                }
+                if (found.index > 0) {
+                    const candidate_index = found.index - 1;
+                    candidate = Entry.init(node.keys[candidate_index], node.values[candidate_index]);
+                }
+                if (node.branch) |branch| node = branch.children[found.index].? else return candidate;
+            }
+        }
+
         /// Returns the item at zero-based sorted position `index`.
         ///
         /// The per-child subtree counts let this skip whole child subtrees while
@@ -684,6 +1074,37 @@ pub fn Tree(
             }
         }
 
+        /// Returns a mutable value pointer for the item at zero-based sorted position `index`.
+        ///
+        /// Copy-on-write paths are cloned before the pointer is returned. The
+        /// pointer is valid until the next structural mutation of this tree.
+        pub fn getAtMut(self: *Self, gpa: mem.Allocator, index: usize) !?EntryMut {
+            if (index >= self.len) return null;
+            try self.makeUniqueRoot(gpa);
+
+            var node = self.root.?;
+            var remaining = index;
+
+            while (true) {
+                if (node.isLeaf()) return EntryMut.init(node.keys[remaining], &node.values[remaining]);
+
+                const branch = node.branch.?;
+                for (0..node.len) |i| {
+                    if (remaining < branch.counts[i]) {
+                        try self.makeUniqueChild(gpa, node, i);
+                        node = branch.children[i].?;
+                        break;
+                    }
+                    remaining -= branch.counts[i];
+                    if (remaining == 0) return EntryMut.init(node.keys[i], &node.values[i]);
+                    remaining -= 1;
+                } else {
+                    try self.makeUniqueChild(gpa, node, node.len);
+                    node = branch.children[node.len].?;
+                }
+            }
+        }
+
         /// Returns the zero-based sorted position of `key`/`val`.
         /// Returns `null` when no equal item exists.
         pub fn indexOf(self: *const Self, key: K, val: V) ?usize {
@@ -693,6 +1114,23 @@ pub fn Tree(
 
             while (true) {
                 const found = searchNodeWithPrefix(node, key, val, prefix);
+                if (node.isLeaf()) return if (found.found) skipped + found.index else null;
+
+                const branch = node.branch.?;
+                for (0..found.index) |i| skipped += branch.counts[i] + 1;
+                if (found.found) return skipped + branch.counts[found.index];
+                node = branch.children[found.index].?;
+            }
+        }
+
+        pub inline fn indexOfKey(self: *const Self, key: K) ?usize {
+            requireOrderedKeyMode();
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            var skipped: usize = 0;
+
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
                 if (node.isLeaf()) return if (found.found) skipped + found.index else null;
 
                 const branch = node.branch.?;
@@ -880,6 +1318,21 @@ pub fn Tree(
             }
         }
 
+        fn findKeySlotForWrite(self: *Self, gpa: mem.Allocator, key: K) !?Slot {
+            requireOrderedKeyMode();
+            try self.makeUniqueRoot(gpa);
+            var node = self.root orelse return null;
+            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (found.found) return Slot.init(node, found.index);
+                if (node.branch) |branch| {
+                    try self.makeUniqueChild(gpa, node, found.index);
+                    node = branch.children[found.index].?;
+                } else return null;
+            }
+        }
+
         /// Replaces the stored value for an item equal to `key`/`val`.
         ///
         /// Returns the old value when an equal item exists, or `null` when no
@@ -909,8 +1362,28 @@ pub fn Tree(
             return null;
         }
 
+        pub inline fn replaceKey(self: *Self, gpa: mem.Allocator, key: K, value: V) !?V {
+            const slot = (try self.findKeySlotForWrite(gpa, key)) orelse return null;
+            const old = slot.node.values[slot.index];
+            slot.node.values[slot.index] = value;
+            return old;
+        }
+
+        pub inline fn setKey(self: *Self, gpa: mem.Allocator, key: K, value: V) !?V {
+            if (try self.findKeySlotForWrite(gpa, key)) |slot| {
+                const old = slot.node.values[slot.index];
+                slot.node.keys[slot.index] = key;
+                slot.node.values[slot.index] = value;
+                setPrefix(slot.node, slot.index);
+                return old;
+            }
+
+            _ = try self.insertKey(gpa, key, value);
+            return null;
+        }
+
         // Removes and returns the item at `index`, shifting later items left.
-        fn removeItemAt(node: *Node, index: usize) Entry {
+        pub fn removeItemAt(node: *Node, index: usize) Entry {
             const removed = Entry.init(node.keys[index], node.values[index]);
 
             if (index + 1 < node.len) {
@@ -949,6 +1422,11 @@ pub fn Tree(
             return self.deleteUnique(gpa, key, val);
         }
 
+        pub inline fn deleteKey(self: *Self, gpa: mem.Allocator, key: K) !?V {
+            requireOrderedKeyMode();
+            return self.delete(gpa, key, undefined);
+        }
+
         // Deletes from a tree whose root has already been made unique for a
         // copy-on-write mutation. Handles length updates and root collapse.
         fn deleteUnique(self: *Self, gpa: mem.Allocator, key: K, val: V) !?V {
@@ -960,7 +1438,7 @@ pub fn Tree(
             return old;
         }
 
-        fn collapseEmptyRoot(self: *Self, gpa: mem.Allocator) void {
+        pub fn collapseEmptyRoot(self: *Self, gpa: mem.Allocator) void {
             if (self.root) |root| {
                 if (root.len == 0) {
                     if (root.branch) |branch| {
@@ -1012,7 +1490,7 @@ pub fn Tree(
 
         // Restores the minimum size rule for `parent`'s child at `child_index`
         // by borrowing from a sibling when possible or merging siblings.
-        fn rebalanceChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
+        pub fn rebalanceChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
             if (parent.len == 0) return;
 
             const branch = parent.branch.?;
@@ -1311,7 +1789,7 @@ pub fn Tree(
             return try self.replaceAtInNode(gpa, self.root.?, index, key, value);
         }
 
-        fn collapseRootIfNeeded(self: *Self, gpa: mem.Allocator) void {
+        pub fn collapseRootIfNeeded(self: *Self, gpa: mem.Allocator) void {
             while (self.root) |root| {
                 if (root.len != 0) return;
 
@@ -1336,7 +1814,7 @@ pub fn Tree(
             return removed;
         }
 
-        fn deleteMaxFromNode(self: *Self, gpa: mem.Allocator, node: *Node) !Entry {
+        pub fn deleteMaxFromNode(self: *Self, gpa: mem.Allocator, node: *Node) !Entry {
             if (node.isLeaf()) return removeItemAt(node, node.len - 1);
 
             const branch = node.branch.?;
@@ -1690,7 +2168,7 @@ pub fn Tree(
             return builder.result(gpa, removed);
         }
 
-        fn deleteRangeByRank(self: *Self, gpa: mem.Allocator, min_rank: RankResult, max_rank: RankResult, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
+        pub fn deleteRangeByRank(self: *Self, gpa: mem.Allocator, min_rank: RankResult, max_rank: RankResult, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
             var start = min_rank.index;
             if (opts.min_exclusive and min_rank.found) start += 1;
 
@@ -1711,6 +2189,17 @@ pub fn Tree(
             comptime opts: DeleteRangeOptions,
         ) !DeleteRangeResult {
             return self.deleteRangeByRank(gpa, self.rankOf(min_key, min_value), self.rankOf(max_key, max_value), opts);
+        }
+
+        pub inline fn deleteRangeKey(
+            self: *Self,
+            gpa: mem.Allocator,
+            min_key: K,
+            max_key: K,
+            comptime opts: DeleteRangeOptions,
+        ) !DeleteRangeResult {
+            requireOrderedKeyMode();
+            return self.deleteRange(gpa, min_key, undefined, max_key, undefined, opts);
         }
 
         /// Removes every item and releases all nodes owned by this tree.
@@ -1832,7 +2321,7 @@ pub fn Tree(
         }
 
         // Clones the root when it is shared with another copy-on-write tree.
-        fn makeUniqueRoot(self: *Self, gpa: mem.Allocator) !void {
+        pub fn makeUniqueRoot(self: *Self, gpa: mem.Allocator) !void {
             if (!self.copied) return;
             const root = self.root orelse return;
             if (root.rc.load(.monotonic) == 0) return;
@@ -1842,7 +2331,7 @@ pub fn Tree(
 
         // Clones an internal child when it is shared with another
         // copy-on-write tree.
-        fn makeUniqueChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
+        pub fn makeUniqueChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
             if (!self.copied) return;
             const branch = parent.branch.?;
             const child = branch.children[child_index].?;
