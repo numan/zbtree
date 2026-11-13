@@ -33,7 +33,7 @@ fn releaseBytes(gpa: std.mem.Allocator, value: []const u8) void {
 const Color = enum { red, green, blue };
 
 fn compareColorKey(a_key: Color, _: usize, b_key: Color, _: usize) std.math.Order {
-    return std.math.order(@intFromEnum(a_key), @intFromEnum(b_key));
+    return std.math.order(@backingInt(a_key), @backingInt(b_key));
 }
 
 const Pair = struct {

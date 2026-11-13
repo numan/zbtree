@@ -41,9 +41,9 @@ pub fn NodeStorage(
         pub const Branch = struct {
             const BranchSelf = @This();
 
-            children: [fanout]?*Node = [_]?*Node{null} ** fanout,
-            counts: [fanout]usize = [_]usize{0} ** fanout,
-            prefixes: if (use_string_prefix) [max_items]u64 else void = if (use_string_prefix) [_]u64{0} ** max_items else {},
+            children: [fanout]?*Node = @splat(null),
+            counts: [fanout]usize = @splat(0),
+            prefixes: if (use_string_prefix) [max_items]u64 else void = if (use_string_prefix) @splat(0) else {},
 
             pub fn init() BranchSelf {
                 return .{};

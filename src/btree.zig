@@ -208,8 +208,8 @@ pub fn Tree(
             return switch (@typeInfo(K)) {
                 .bool => if (a == b) .eq else if (!a and b) .lt else .gt,
                 .@"enum" => blk: {
-                    const a_ = @intFromEnum(a);
-                    const b_ = @intFromEnum(b);
+                    const a_ = @backingInt(a);
+                    const b_ = @backingInt(b);
                     break :blk if (a_ == b_) .eq else if (a_ < b_) .lt else .gt;
                 },
                 else => if (a < b) .lt else if (a > b) .gt else .eq,
@@ -220,7 +220,7 @@ pub fn Tree(
             if (comptime K == []const u8) return mem.order(u8, a, b) == .lt;
             return switch (@typeInfo(K)) {
                 .bool => !a and b,
-                .@"enum" => @intFromEnum(a) < @intFromEnum(b),
+                .@"enum" => @backingInt(a) < @backingInt(b),
                 else => a < b,
             };
         }
@@ -2356,7 +2356,7 @@ pub fn Tree(
         }
 
         fn stringPrefix(key: []const u8) u64 {
-            var bytes: [8]u8 = [_]u8{0} ** 8;
+            var bytes: [8]u8 = @splat(0);
             const n = @min(bytes.len, key.len);
             @memcpy(bytes[0..n], key[0..n]);
             return mem.readInt(u64, &bytes, .big);

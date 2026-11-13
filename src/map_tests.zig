@@ -327,8 +327,8 @@ test "map randomized operations match sorted oracle" {
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
-    var present = [_]bool{false} ** OracleKeyCount;
-    var values = [_]i32{0} ** OracleKeyCount;
+    var present: [OracleKeyCount]bool = @splat(false);
+    var values: [OracleKeyCount]i32 = @splat(0);
     var prng = std.Random.DefaultPrng.init(0x5eed_cafe);
     const random = prng.random();
 

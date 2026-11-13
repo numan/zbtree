@@ -52,7 +52,7 @@ fn addRunStep(b: *std.Build, exe: *std.Build.Step.Compile) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_step.dependOn(&run_cmd.step);
 
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
 }
 
 fn addBenchStep(
@@ -95,10 +95,8 @@ fn addBenchStep(
     compare_cmd.addFileArg(go_output);
     bench_step.dependOn(&compare_cmd.step);
 
-    if (b.args) |args| {
-        zig_bench_cmd.addArgs(args);
-        go_bench_cmd.addArgs(args);
-    }
+    zig_bench_cmd.addPassthruArgs();
+    go_bench_cmd.addPassthruArgs();
 }
 
 fn addTestStep(
