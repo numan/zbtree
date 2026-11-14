@@ -1594,6 +1594,7 @@ pub fn Tree(
             branch.children[parent.len + 1] = null;
             branch.counts[parent.len + 1] = 0;
             branch.counts[left_index] = subtreeCount(left);
+            right.len = 0;
             self.destroyNode(gpa, right);
         }
 

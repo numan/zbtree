@@ -1095,6 +1095,24 @@ test "deleteRange result owns removed values" {
     try tree.checkInvariants();
 }
 
+test "delete releases each owned value once when merging nodes" {
+    const ByteTree = btree.Tree(isize, []const u8, .{
+        .compare = compareIntKeyOwnedBytes,
+        .use_string_prefix = false,
+        .release_value = releaseBytes,
+    });
+    var tree = ByteTree.init();
+    defer tree.deinit(testing.allocator);
+
+    for (0..200) |i| {
+        try testing.expect(try tree.insert(testing.allocator, @intCast(i), try testing.allocator.dupe(u8, "value")));
+    }
+    for (0..150) |i| {
+        testing.allocator.free((try tree.delete(testing.allocator, @intCast(i), "")).?);
+    }
+    try tree.checkInvariants();
+}
+
 test "deleteRange removes key-bounded ranges" {
     const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
     var tree = IntTree.init();
