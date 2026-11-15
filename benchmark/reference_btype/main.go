@@ -32,8 +32,8 @@ func main() {
 		panic("items and runs must be greater than zero")
 	}
 
-	runtime.GOMAXPROCS(1)
 	fmt.Println("tidwall/btype (Go, btype.Map)")
+	fmt.Printf("config: go=%s GOMAXPROCS=%d warmups=%d\n", runtime.Version(), runtime.GOMAXPROCS(0), warmupRuns)
 	benchMap[int32](*items, *runs)
 	benchMap[uint64](*items, *runs)
 	benchMap[string](*items, *runs)
@@ -412,20 +412,22 @@ func (c *benchContext[T]) record(value int) {
 }
 
 func runBench(label string, ops, runs int, reset, pre, op func()) {
-	runtime.GC()
-	for range warmupRuns {
+	runSample := func() time.Duration {
 		reset()
 		pre()
+		runtime.GC()
+		start := time.Now()
 		op()
+		return time.Since(start)
+	}
+
+	for range warmupRuns {
+		runSample()
 	}
 
 	elapsed := make([]time.Duration, 0, runs)
 	for range runs {
-		reset()
-		pre()
-		start := time.Now()
-		op()
-		elapsed = append(elapsed, time.Since(start))
+		elapsed = append(elapsed, runSample())
 	}
 	slices.Sort(elapsed)
 	median := elapsed[runs/2]
