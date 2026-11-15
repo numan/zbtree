@@ -5,3 +5,4 @@ zig-pkg/
 
 # OS files
 .DS_Store
+.worktrees/
