@@ -142,7 +142,7 @@ pub fn Map(
             return mem.readInt(u64, &bytes, .big);
         }
 
-        fn searchNodeWithPrefix(node: *const Node, key: K, prefix: u64) SearchResult {
+        inline fn searchNodeWithPrefix(node: *const Node, key: K, prefix: u64) SearchResult {
             if (comptime config.use_string_prefix) {
                 if (!node.isLeaf()) return searchBranchByKeyPrefix(node, key, prefix);
             }
@@ -408,7 +408,8 @@ pub fn Map(
                 if (node.isLeaf()) return .{ .index = found.index + skipped, .found = found.found };
 
                 const branch = node.branch.?;
-                for (0..found.index) |i| skipped += branch.counts[i] + 1;
+                skipped += found.index;
+                for (0..found.index) |i| skipped += branch.counts[i];
                 if (found.found) return .{ .index = skipped + branch.counts[found.index], .found = true };
                 node = branch.children[found.index].?;
             }
@@ -575,7 +576,8 @@ pub fn Map(
                 if (node.isLeaf()) return if (found.found) skipped + found.index else null;
 
                 const branch = node.branch.?;
-                for (0..found.index) |i| skipped += branch.counts[i] + 1;
+                skipped += found.index;
+                for (0..found.index) |i| skipped += branch.counts[i];
                 if (found.found) return skipped + branch.counts[found.index];
                 node = branch.children[found.index].?;
             }
