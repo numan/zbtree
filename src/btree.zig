@@ -613,41 +613,40 @@ pub fn Tree(
         fn insertIntoNonFullWithPrefix(
             self: *Self,
             gpa: mem.Allocator,
-            node: *Node,
+            root: *Node,
             key: K,
             value: V,
             prefix: u64,
         ) !bool {
-            const found = searchNodeWithPrefix(node, key, value, prefix);
-            if (found.found) return false;
+            var path: Path = .init();
+            var node = root;
 
-            if (node.isLeaf()) {
-                insertItemAt(node, found.index, key, value);
-                return true;
+            while (true) {
+                const found = searchNodeWithPrefix(node, key, value, prefix);
+                if (found.found) return false;
+
+                if (node.isLeaf()) {
+                    insertItemAt(node, found.index, key, value);
+                    path.incrementCounts();
+                    return true;
+                }
+
+                const branch = node.branch.?;
+
+                var child_index = found.index;
+                try self.makeUniqueChild(gpa, node, child_index);
+                if (branch.children[child_index].?.len == max_items) {
+                    try self.splitChild(gpa, node, child_index);
+                    const cmp = keyCompare(node.keys[child_index], node.values[child_index], key, value);
+                    switch (cmp) {
+                        .eq => return false,
+                        .lt => child_index += 1,
+                        else => {},
+                    }
+                }
+                path.push(node, child_index);
+                node = branch.children[child_index].?;
             }
-
-            const branch = node.branch.?;
-            var child_index = found.index;
-            try self.makeUniqueChild(gpa, node, child_index);
-            if (branch.children[child_index].?.len == max_items) {
-                try self.splitChild(gpa, node, child_index);
-                const cmp = keyCompare(node.keys[child_index], node.values[child_index], key, value);
-                if (cmp == .eq) return false;
-                if (cmp == .lt) child_index += 1;
-            }
-
-            const child = branch.children[child_index].?;
-            if (child.isLeaf()) {
-                const child_found = searchNodeWithPrefix(child, key, value, prefix);
-                if (child_found.found) return false;
-                insertItemAt(child, child_found.index, key, value);
-                branch.counts[child_index] += 1;
-                return true;
-            }
-
-            const inserted = try self.insertIntoNonFullWithPrefix(gpa, child, key, value, prefix);
-            if (inserted) branch.counts[child_index] += 1;
-            return inserted;
         }
 
         fn insertLeftEdgeIntoNonFull(self: *Self, gpa: mem.Allocator, root: *Node, key: K, value: V) !void {
@@ -684,37 +683,37 @@ pub fn Tree(
             path.incrementCounts();
         }
 
-        fn insertKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V, prefix: u64) !bool {
-            const found = searchKeyOnlyWithPrefix(node, key, prefix);
-            if (found.found) return false;
+        fn insertKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, root: *Node, key: K, value: V, prefix: u64) !bool {
+            var path: Path = .init();
+            var node = root;
 
-            if (node.isLeaf()) {
-                insertItemAt(node, found.index, key, value);
-                return true;
+            while (true) {
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (found.found) return false;
+
+                if (node.isLeaf()) {
+                    insertItemAt(node, found.index, key, value);
+                    path.incrementCounts();
+                    return true;
+                }
+
+                const branch = node.branch.?;
+
+                var child_index = found.index;
+                try self.makeUniqueChild(gpa, node, child_index);
+                if (branch.children[child_index].?.len == max_items) {
+                    try self.splitChild(gpa, node, child_index);
+                    const cmp = orderedKeyCompare(node.keys[child_index], key);
+                    switch (cmp) {
+                        .eq => return false,
+                        .lt => child_index += 1,
+                        else => {},
+                    }
+                }
+
+                path.push(node, child_index);
+                node = branch.children[child_index].?;
             }
-
-            const branch = node.branch.?;
-            var child_index = found.index;
-            try self.makeUniqueChild(gpa, node, child_index);
-            if (branch.children[child_index].?.len == max_items) {
-                try self.splitChild(gpa, node, child_index);
-                const cmp = orderedKeyCompare(node.keys[child_index], key);
-                if (cmp == .eq) return false;
-                if (cmp == .lt) child_index += 1;
-            }
-
-            const child = branch.children[child_index].?;
-            if (child.isLeaf()) {
-                const child_found = searchKeyOnlyWithPrefix(child, key, prefix);
-                if (child_found.found) return false;
-                insertItemAt(child, child_found.index, key, value);
-                branch.counts[child_index] += 1;
-                return true;
-            }
-
-            const inserted = try self.insertKeyOnlyIntoNonFull(gpa, child, key, value, prefix);
-            if (inserted) branch.counts[child_index] += 1;
-            return inserted;
         }
 
         pub fn insert(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {

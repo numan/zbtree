@@ -706,6 +706,51 @@ test "string map handles long common-prefix keys and copied deletions" {
     }
 }
 
+test "string map set replaces only the value and keeps the stored key" {
+    const PrefixMap = map.Map([]const u8, usize, .{});
+    const NoPrefixMap = map.Map([]const u8, usize, .{ .use_string_prefix = false });
+
+    inline for (.{ PrefixMap, NoPrefixMap }) |StringMap| {
+        var m = StringMap.init();
+        defer m.deinit(testing.allocator);
+
+        // 95 ascending inserts leave one separator in the root and a full
+        // right leaf whose median is "k-063".
+        var stored: [95][8]u8 = undefined;
+        var aliases: [95][8]u8 = undefined;
+        for (&stored, 0..) |*buffer, i| {
+            const key = try std.fmt.bufPrint(buffer, "k-{d:0>3}", .{i});
+            try testing.expect(try m.insert(testing.allocator, key, i));
+            if (i == 0) {
+                // Existing key in a root leaf.
+                const same = try std.fmt.bufPrint(&aliases[i], "k-{d:0>3}", .{i});
+                try testing.expectEqual(0, try m.set(testing.allocator, same, 1000));
+            }
+        }
+        try testing.expectEqual(1, m.tree.root.?.len);
+
+        // Existing key promoted by the split that set performs on the way down.
+        const median = try std.fmt.bufPrint(&aliases[63], "k-{d:0>3}", .{63});
+        try testing.expectEqual(63, try m.set(testing.allocator, median, 1063));
+        try testing.expectEqual(2, m.tree.root.?.len);
+
+        // Existing keys in branches and leaves.
+        for (1..stored.len) |i| {
+            if (i == 63) continue;
+            const same = try std.fmt.bufPrint(&aliases[i], "k-{d:0>3}", .{i});
+            try testing.expectEqual(i, try m.set(testing.allocator, same, i + 1000));
+        }
+
+        try testing.expectEqual(stored.len, m.len());
+        for (&stored, 0..) |*buffer, i| {
+            const entry = m.getAt(i).?;
+            try testing.expectEqual(@as([*]const u8, buffer), entry.key.ptr);
+            try testing.expectEqual(i + 1000, entry.value);
+        }
+        try m.checkInvariants();
+    }
+}
+
 test "map traversal callbacks stop early and propagate errors" {
     const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
     var m = IntMap.init();

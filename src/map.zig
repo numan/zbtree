@@ -62,6 +62,7 @@ pub fn Map(
     return struct {
         const Self = @This();
         const Node = Base.Node;
+        const Path = Base.Path;
 
         const SearchResult = struct {
             index: usize,
@@ -263,87 +264,67 @@ pub fn Map(
             return SearchResult.init(low, orderedKeyEqual(node.keys[low], key));
         }
 
-        fn insertKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V, prefix: u64) !bool {
-            const found = searchNodeWithPrefix(node, key, prefix);
-            if (found.found) return false;
+        fn insertKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, root: *Node, key: K, value: V, prefix: u64) !bool {
+            var path: Path = .init();
+            var node = root;
 
-            if (node.isLeaf()) {
-                Base.insertItemAt(node, found.index, key, value);
-                return true;
+            while (true) {
+                const found = searchNodeWithPrefix(node, key, prefix);
+                if (found.found) return false;
+
+                const branch = node.branch orelse {
+                    Base.insertItemAt(node, found.index, key, value);
+                    path.incrementCounts();
+                    return true;
+                };
+
+                var child_index = found.index;
+                if (self.tree.copied) try self.tree.makeUniqueChild(gpa, node, child_index);
+                if (branch.children[child_index].?.len == max_items) {
+                    try self.tree.splitChild(gpa, node, child_index);
+                    const cmp = orderedKeyCompare(node.keys[child_index], key);
+                    if (cmp == .eq) return false;
+                    if (cmp == .lt) child_index += 1;
+                }
+
+                path.push(node, child_index);
+                node = branch.children[child_index].?;
             }
-
-            const branch = node.branch.?;
-            var child_index = found.index;
-            if (self.tree.copied) try self.tree.makeUniqueChild(gpa, node, child_index);
-            if (branch.children[child_index].?.len == max_items) {
-                try self.tree.splitChild(gpa, node, child_index);
-                const cmp = orderedKeyCompare(node.keys[child_index], key);
-                if (cmp == .eq) return false;
-                if (cmp == .lt) child_index += 1;
-            }
-
-            const child = branch.children[child_index].?;
-            if (child.isLeaf()) {
-                const child_found = searchNodeWithPrefix(child, key, prefix);
-                if (child_found.found) return false;
-                Base.insertItemAt(child, child_found.index, key, value);
-                branch.counts[child_index] += 1;
-                return true;
-            }
-
-            const inserted = try self.insertKeyOnlyIntoNonFull(gpa, child, key, value, prefix);
-            if (inserted) branch.counts[child_index] += 1;
-            return inserted;
         }
 
-        fn setKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V, prefix: u64) !SetResult {
-            const found = searchNodeWithPrefix(node, key, prefix);
-            if (found.found) {
-                const old = node.values[found.index];
-                node.keys[found.index] = key;
-                node.values[found.index] = value;
-                Base.setPrefix(node, found.index);
-                return .{ .old = old, .inserted = false };
-            }
+        // Replaces the value at `index` and keeps the stored key.
+        fn replaceValueAt(node: *Node, index: usize, value: V) SetResult {
+            const old = node.values[index];
+            node.values[index] = value;
+            return .{ .old = old, .inserted = false };
+        }
 
-            if (node.isLeaf()) {
-                Base.insertItemAt(node, found.index, key, value);
-                return .{ .old = null, .inserted = true };
-            }
+        fn setKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, root: *Node, key: K, value: V, prefix: u64) !SetResult {
+            var path: Path = .init();
+            var node = root;
 
-            const branch = node.branch.?;
-            var child_index = found.index;
-            if (self.tree.copied) try self.tree.makeUniqueChild(gpa, node, child_index);
-            if (branch.children[child_index].?.len == max_items) {
-                try self.tree.splitChild(gpa, node, child_index);
-                const cmp = orderedKeyCompare(node.keys[child_index], key);
-                if (cmp == .eq) {
-                    const old = node.values[child_index];
-                    node.keys[child_index] = key;
-                    node.values[child_index] = value;
-                    Base.setPrefix(node, child_index);
-                    return .{ .old = old, .inserted = false };
+            while (true) {
+                const found = searchNodeWithPrefix(node, key, prefix);
+                if (found.found) return replaceValueAt(node, found.index, value);
+
+                const branch = node.branch orelse {
+                    Base.insertItemAt(node, found.index, key, value);
+                    path.incrementCounts();
+                    return .{ .old = null, .inserted = true };
+                };
+
+                var child_index = found.index;
+                if (self.tree.copied) try self.tree.makeUniqueChild(gpa, node, child_index);
+                if (branch.children[child_index].?.len == max_items) {
+                    try self.tree.splitChild(gpa, node, child_index);
+                    const cmp = orderedKeyCompare(node.keys[child_index], key);
+                    if (cmp == .eq) return replaceValueAt(node, child_index, value);
+                    if (cmp == .lt) child_index += 1;
                 }
-                if (cmp == .lt) child_index += 1;
-            }
 
-            const child = branch.children[child_index].?;
-            if (child.isLeaf()) {
-                const child_found = searchNodeWithPrefix(child, key, prefix);
-                if (child_found.found) {
-                    const old = child.values[child_found.index];
-                    child.keys[child_found.index] = key;
-                    child.values[child_found.index] = value;
-                    return .{ .old = old, .inserted = false };
-                }
-                Base.insertItemAt(child, child_found.index, key, value);
-                branch.counts[child_index] += 1;
-                return .{ .old = null, .inserted = true };
+                path.push(node, child_index);
+                node = branch.children[child_index].?;
             }
-
-            const result = try self.setKeyOnlyIntoNonFull(gpa, child, key, value, prefix);
-            if (result.inserted) branch.counts[child_index] += 1;
-            return result;
         }
 
         fn findKeySlotForWrite(self: *Self, gpa: mem.Allocator, key: K) !?Slot {
@@ -622,12 +603,7 @@ pub fn Map(
             const root = self.tree.root.?;
             if (root.isLeaf()) {
                 const found = searchNodeWithPrefix(root, key, prefix);
-                if (found.found) {
-                    const old = root.values[found.index];
-                    root.keys[found.index] = key;
-                    root.values[found.index] = value;
-                    return old;
-                }
+                if (found.found) return replaceValueAt(root, found.index, value).old;
 
                 Base.insertItemAt(root, found.index, key, value);
                 self.tree.len += 1;

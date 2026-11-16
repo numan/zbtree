@@ -227,3 +227,80 @@ test "edge pushes on a copy leave the original unchanged" {
     defer gpa.free(model);
     try expectMatchesModel(&original, model);
 }
+
+test "duplicate inserts are rejected at every depth without touching counts" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+
+    // Random order fills nodes close to max_items, so duplicate inserts often
+    // split a full child first and then hit the promoted median (cmp == .eq).
+    var prng = std.Random.DefaultPrng.init(42);
+    const keys = try gpa.alloc(isize, deep_n);
+    defer gpa.free(keys);
+    for (keys, 0..) |*k, i| k.* = @intCast(i);
+    prng.random().shuffle(isize, keys);
+    for (keys) |k| try testing.expect(try tree.insert(gpa, k, k * 10));
+
+    prng.random().shuffle(isize, keys);
+    for (keys, 0..) |k, i| {
+        try testing.expect(!try tree.insert(gpa, k, 0));
+        if (i % 5_000 == 0) try tree.checkInvariants();
+    }
+    try testing.expectEqual(deep_n, tree.len);
+    const model = try newModel(gpa, deep_n, deep_n);
+    defer gpa.free(model);
+    try expectMatchesModel(&tree, model);
+}
+
+test "ordered-key insertKey matches a model on a deep tree" {
+    const TreeType = KeyTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+    const key_space = deep_n * 2;
+    const model = try newModel(gpa, key_space, 0);
+    defer gpa.free(model);
+
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..deep_n * 2) |_| {
+        const k = prng.random().uintLessThan(usize, key_space);
+        const key: isize = @intCast(k);
+        try testing.expectEqual(!model[k], try tree.insertKey(gpa, key, key * 10));
+        model[k] = true;
+    }
+    try expectMatchesModel(&tree, model);
+}
+
+test "map insert and set match a model, copy stays frozen" {
+    const MapType = IntMap;
+    const gpa = testing.allocator;
+    var m = MapType.init();
+    defer m.deinit(gpa);
+    try fillDeep(MapType, &m, gpa, deep_n);
+    var snapshot = m.copy();
+    defer snapshot.deinit(gpa);
+
+    const key_space = deep_n + 20_000;
+    const model = try newModel(gpa, key_space, deep_n);
+    defer gpa.free(model);
+
+    var prng = std.Random.DefaultPrng.init(99);
+    const random = prng.random();
+    for (0..30_000) |_| {
+        const k = random.uintLessThan(usize, key_space);
+        const key: isize = @intCast(k);
+        if (random.boolean()) {
+            try testing.expectEqual(!model[k], try m.insert(gpa, key, key * 10));
+        } else {
+            const old = try m.set(gpa, key, key * 10);
+            try testing.expectEqual(model[k], old != null);
+        }
+        model[k] = true;
+    }
+    try expectMatchesModel(&m, model);
+    const snapshot_model = try newModel(gpa, key_space, deep_n);
+    defer gpa.free(snapshot_model);
+    try expectMatchesModel(&snapshot, snapshot_model);
+}
