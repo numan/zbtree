@@ -68,10 +68,41 @@ pub fn Tree(
         pub const fanout = storage.fanout;
         pub const max_items = storage.max_items;
         pub const min_items = storage.min_items;
+        pub const max_height = storage.max_height;
 
         pub const Node = storage.Node;
         pub const Branch = storage.Branch;
         pub const InternalNode = storage.InternalNode;
+
+        /// Used to define a the path ta get from root to leaf.
+        /// `child` is the index of the child the walk entered.
+        pub const PathEntry = struct {
+            node: *Node,
+            child: usize,
+        };
+
+        pub const Path = struct {
+            entries: [max_height]PathEntry = undefined,
+            len: usize = 0,
+
+            pub fn init() Path {
+                return .{};
+            }
+
+            pub fn push(path: *Path, node: *Node, child: usize) void {
+                std.debug.assert(path.len < max_height);
+                path.entries[path.len] = .{ .node = node, .child = child };
+                path.len += 1;
+            }
+
+            pub fn slice(path: *const Path) []const PathEntry {
+                return path.entries[0..path.len];
+            }
+
+            pub fn incrementCounts(path: *const Path) void {
+                for (path.slice()) |entry| entry.node.branch.?.counts[entry.child] += 1;
+            }
+        };
 
         // Result of searching inside one node. `index` is either the matching
         // item index or the insertion/child-descent position.
@@ -619,36 +650,38 @@ pub fn Tree(
             return inserted;
         }
 
-        fn insertLeftEdgeIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V) !void {
-            if (node.isLeaf()) {
-                insertItemAt(node, 0, key, value);
-                return;
+        fn insertLeftEdgeIntoNonFull(self: *Self, gpa: mem.Allocator, root: *Node, key: K, value: V) !void {
+            var path: Path = .init();
+            var node = root;
+
+            while (node.branch) |branch| {
+                try self.makeUniqueChild(gpa, node, 0);
+                if (branch.children[0].?.len == max_items) try self.splitChild(gpa, node, 0);
+                path.push(node, 0);
+                node = branch.children[0].?;
             }
-
-            const branch = node.branch.?;
-            try self.makeUniqueChild(gpa, node, 0);
-            if (branch.children[0].?.len == max_items) try self.splitChild(gpa, node, 0);
-
-            try self.insertLeftEdgeIntoNonFull(gpa, branch.children[0].?, key, value);
-            branch.counts[0] += 1;
+            insertItemAt(node, 0, key, value);
+            path.incrementCounts();
         }
 
-        fn insertRightEdgeIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V) !void {
-            if (node.isLeaf()) {
-                insertItemAt(node, node.len, key, value);
-                return;
+        fn insertRightEdgeIntoNonFull(self: *Self, gpa: mem.Allocator, root: *Node, key: K, value: V) !void {
+            var path: Path = .init();
+            var node = root;
+
+            while (node.branch) |branch| {
+                var child_index = node.len;
+                try self.makeUniqueChild(gpa, node, child_index);
+                if (branch.children[child_index].?.len == max_items) {
+                    try self.splitChild(gpa, node, child_index);
+                    child_index += 1;
+                }
+
+                path.push(node, child_index);
+                node = branch.children[child_index].?;
             }
 
-            const branch = node.branch.?;
-            var child_index: usize = node.len;
-            try self.makeUniqueChild(gpa, node, child_index);
-            if (branch.children[child_index].?.len == max_items) {
-                try self.splitChild(gpa, node, child_index);
-                child_index += 1;
-            }
-
-            try self.insertRightEdgeIntoNonFull(gpa, branch.children[child_index].?, key, value);
-            branch.counts[child_index] += 1;
+            insertItemAt(node, node.len, key, value);
+            path.incrementCounts();
         }
 
         fn insertKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V, prefix: u64) !bool {
@@ -1748,35 +1781,43 @@ pub fn Tree(
             return true;
         }
 
-        fn replaceAtInNode(self: *Self, gpa: mem.Allocator, node: *Node, index: usize, key: K, value: V) !Entry {
-            if (node.isLeaf()) {
-                const old = Entry.init(node.keys[index], node.values[index]);
-                node.keys[index] = key;
-                node.values[index] = value;
-                return old;
-            }
-
-            const branch = node.branch.?;
+        fn replaceAtInNode(self: *Self, gpa: mem.Allocator, root: *Node, index: usize, key: K, value: V) !Entry {
             var remaining = index;
-            for (0..node.len) |i| {
-                const child_count = branch.counts[i];
-                if (remaining < child_count) {
-                    try self.makeUniqueChild(gpa, node, i);
-                    return self.replaceAtInNode(gpa, branch.children[i].?, remaining, key, value);
-                }
-                remaining -= child_count;
-                if (remaining == 0) {
-                    const old = Entry.init(node.keys[i], node.values[i]);
-                    node.keys[i] = key;
-                    node.values[i] = value;
-                    setPrefix(node, i);
+            var node = root;
+            decend: while (true) {
+                if (node.isLeaf()) {
+                    const old: Entry = .init(node.keys[remaining], node.values[remaining]);
+                    node.keys[remaining] = key;
+                    node.values[remaining] = value;
                     return old;
                 }
-                remaining -= 1;
-            }
 
-            try self.makeUniqueChild(gpa, node, node.len);
-            return self.replaceAtInNode(gpa, branch.children[node.len].?, remaining, key, value);
+                const branch = node.branch.?;
+
+                for (0..node.len) |i| {
+                    const child_count = branch.counts[i];
+                    if (remaining < child_count) {
+                        try self.makeUniqueChild(gpa, node, i);
+                        node = branch.children[i].?;
+                        continue :decend;
+                    }
+
+                    remaining -= child_count;
+
+                    if (remaining == 0) {
+                        const old: Entry = .init(node.keys[i], node.values[i]);
+                        node.keys[i] = key;
+                        node.values[i] = value;
+                        setPrefix(node, i);
+                        return old;
+                    }
+
+                    remaining -= 1;
+                }
+
+                try self.makeUniqueChild(gpa, node, node.len);
+                node = branch.children[node.len].?;
+            }
         }
 
         /// Replaces the item at sorted position `index`.

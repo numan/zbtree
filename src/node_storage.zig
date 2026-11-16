@@ -14,6 +14,9 @@ pub fn NodeStorage(
         pub const max_items: usize = fanout - 1;
         /// Minimum item count for non-root nodes after the tree has split.
         pub const min_items: usize = max_items / 2;
+        /// Upper bound on tree height in levels. A tree taller than this would
+        /// have to hold than maxInt(usize) items.
+        pub const max_height: usize = 16;
 
         // A node stores sorted key/value items. If `branch` is null it is a
         // leaf; otherwise `branch` stores the child pointers between items.
