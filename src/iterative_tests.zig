@@ -304,3 +304,117 @@ test "map insert and set match a model, copy stays frozen" {
     defer gpa.free(snapshot_model);
     try expectMatchesModel(&snapshot, snapshot_model);
 }
+
+test "deleting every key in random order keeps invariants" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+    try fillDeep(TreeType, &tree, gpa, deep_n);
+    var snapshot = tree.copy();
+    defer snapshot.deinit(gpa);
+
+    const keys = try gpa.alloc(isize, deep_n);
+    defer gpa.free(keys);
+    for (keys, 0..) |*k, i| k.* = @intCast(i);
+    var prng = std.Random.DefaultPrng.init(3);
+    prng.random().shuffle(isize, keys);
+
+    for (keys, 0..) |k, i| {
+        try testing.expectEqual(k * 10, (try tree.delete(gpa, k, 0)).?);
+        try testing.expect((try tree.delete(gpa, k, 0)) == null); // missing key: no-op
+        if (i % 5_000 == 0) try tree.checkInvariants();
+    }
+    try testing.expectEqual(0, tree.len);
+    try testing.expect(tree.root == null);
+
+    const model = try newModel(gpa, deep_n, deep_n);
+    defer gpa.free(model);
+    try expectMatchesModel(&snapshot, model);
+}
+
+test "popFront and popBack drain a deep tree in order" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+    try fillDeep(TreeType, &tree, gpa, deep_n);
+    var snapshot = tree.copy();
+    defer snapshot.deinit(gpa);
+
+    var lo: isize = 0;
+    var hi: isize = @intCast(deep_n - 1);
+    var i: usize = 0;
+    while (lo <= hi) : (i += 1) {
+        const first = (try tree.popFront(gpa)).?;
+        try testing.expectEqual(lo, first.key);
+        lo += 1;
+        if (lo > hi) break;
+        const last = (try tree.popBack(gpa)).?;
+        try testing.expectEqual(hi, last.key);
+        hi -= 1;
+        if (i % 3_000 == 0) try tree.checkInvariants();
+    }
+    try testing.expect((try tree.popFront(gpa)) == null);
+    try testing.expectEqual(deep_n, snapshot.len);
+    try snapshot.checkInvariants();
+}
+
+test "deleteAt at random indices matches a model" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+    try fillDeep(TreeType, &tree, gpa, deep_n);
+    var snapshot = tree.copy();
+    defer snapshot.deinit(gpa);
+
+    var remaining = try std.ArrayList(isize).initCapacity(gpa, deep_n);
+    defer remaining.deinit(gpa);
+    for (0..deep_n) |i| remaining.appendAssumeCapacity(@intCast(i));
+
+    var prng = std.Random.DefaultPrng.init(11);
+    for (0..deep_n / 2) |step| {
+        const index = prng.random().uintLessThan(usize, remaining.items.len);
+        const expected = remaining.orderedRemove(index);
+        const removed = (try tree.deleteAt(gpa, index)).?;
+        try testing.expectEqual(expected, removed.key);
+        if (step % 5_000 == 0) try tree.checkInvariants();
+    }
+    try tree.checkInvariants();
+    for (remaining.items, 0..) |k, i| try testing.expectEqual(k, tree.getAt(i).?.key);
+    try snapshot.checkInvariants();
+    try testing.expectEqual(deep_n, snapshot.len);
+}
+
+test "map delete and ordered deleteKey match a model" {
+    const MapType = IntMap;
+    const TreeType = KeyTree;
+    const gpa = testing.allocator;
+    var m = MapType.init();
+    defer m.deinit(gpa);
+    try fillDeep(MapType, &m, gpa, deep_n);
+    var kt = TreeType.init();
+    defer kt.deinit(gpa);
+    try fillDeep(TreeType, &kt, gpa, deep_n);
+    var snapshot = m.copy();
+    defer snapshot.deinit(gpa);
+
+    const model = try newModel(gpa, deep_n, deep_n);
+    defer gpa.free(model);
+    var prng = std.Random.DefaultPrng.init(5);
+    for (0..deep_n) |_| {
+        const k = prng.random().uintLessThan(usize, deep_n);
+        const key: isize = @intCast(k);
+        const a = try m.delete(gpa, key);
+        const b = try kt.deleteKey(gpa, key);
+        try testing.expectEqual(model[k], a != null);
+        try testing.expectEqual(model[k], b != null);
+        model[k] = false;
+    }
+    try expectMatchesModel(&m, model);
+    try expectMatchesModel(&kt, model);
+    const full = try newModel(gpa, deep_n, deep_n);
+    defer gpa.free(full);
+    try expectMatchesModel(&snapshot, full);
+}

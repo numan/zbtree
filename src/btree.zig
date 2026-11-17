@@ -1593,39 +1593,67 @@ pub fn Tree(
             }
         }
 
-        // Recursive deletion implementation. It removes directly from leaves,
-        // replaces internal matches with their left-subtree predecessor, and
-        // rebalances any child that drops below the minimum size.
-        fn deleteFromNode(self: *Self, gpa: mem.Allocator, node: *Node, key: K, val: V) anyerror!?V {
+        // It removes directly from leaves, replaces internal matches
+        // with their left-subtree predecessor, and rebalances any
+        // child that drops below the minimum size.
+        fn deleteFromNode(self: *Self, gpa: mem.Allocator, node: *Node, key: K, val: V) !?V {
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             return self.deleteFromNodeWithPrefix(gpa, node, key, val, prefix);
         }
 
-        fn deleteFromNodeWithPrefix(self: *Self, gpa: mem.Allocator, node: *Node, key: K, val: V, prefix: u64) anyerror!?V {
-            const found = searchNodeWithPrefix(node, key, val, prefix);
-            if (node.isLeaf()) return if (found.found) removeItemAt(node, found.index).value else null;
-
-            const branch = node.branch.?;
-            if (found.found) {
+        fn deleteFromNodeWithPrefix(self: *Self, gpa: mem.Allocator, root: *Node, key: K, val: V, prefix: u64) !?V {
+            var path: Path = .init();
+            var node = root;
+            const old = while (node.branch) |branch| {
+                const found = searchNodeWithPrefix(node, key, val, prefix);
                 try self.makeUniqueChild(gpa, node, found.index);
-                const old = node.values[found.index];
-                const replacement = try self.deleteMaxFromNode(gpa, branch.children[found.index].?);
-                node.keys[found.index] = replacement.key;
-                node.values[found.index] = replacement.value;
-                setPrefix(node, found.index);
-                branch.counts[found.index] -= 1;
-                try self.rebalanceChild(gpa, node, found.index);
-                return old;
-            }
+                path.push(node, found.index);
+                const child = branch.children[found.index].?;
+                if (found.found) {
+                    // Internal match: replace it with its predecessor, the
+                    // largest item of the left subtree.
+                    const previous = node.values[found.index];
+                    const predecessor = try self.removeMaxAlongPath(gpa, &path, child);
+                    node.keys[found.index] = predecessor.key;
+                    node.values[found.index] = predecessor.value;
+                    setPrefix(node, found.index);
+                    break previous;
+                }
+                node = child;
+            } else leaf: {
+                const found = searchNodeWithPrefix(node, key, val, prefix);
+                if (!found.found) return null; // nothing removed: no fix-up needed
+                break :leaf removeItemAt(node, found.index).value;
+            };
 
-            try self.makeUniqueChild(gpa, node, found.index);
-            const old = try self.deleteFromNodeWithPrefix(gpa, branch.children[found.index].?, key, val, prefix);
-            if (old != null) {
-                branch.counts[found.index] -= 1;
-                try self.rebalanceChild(gpa, node, found.index);
-            }
-
+            try self.unwindDelete(gpa, &path, 1);
             return old;
+        }
+
+        /// Walks the right spine from `start`recording each step in `path`
+        /// and removes the largest item from the final leaf. NOTE: you must
+        /// call `unwindDelete` along the same path after.
+        fn removeMaxAlongPath(self: *Self, gpa: mem.Allocator, path: *Path, start: *Node) !Entry {
+            var node = start;
+            while (node.branch) |branch| {
+                const child_index = node.len;
+                try self.makeUniqueChild(gpa, node, child_index);
+                path.push(node, child_index);
+                node = branch.children[child_index].?;
+            }
+            return removeItemAt(node, node.len - 1);
+        }
+
+        /// Bottom up fix after `removeMaxAlongPath`. Need to fix the count, and
+        /// let each parent repair undeffull children.
+        fn unwindDelete(self: *Self, gpa: mem.Allocator, path: *const Path, removed: usize) !void {
+            var i = path.len;
+            while (i > 0) {
+                i -= 1;
+                const entry = path.entries[i];
+                entry.node.branch.?.counts[entry.child] -= removed;
+                try self.rebalanceChild(gpa, entry.node, entry.child);
+            }
         }
 
         // Restores the minimum size rule for `parent`'s child at `child_index`
@@ -1955,65 +1983,54 @@ pub fn Tree(
             }
         }
 
-        fn deleteMinFromNode(self: *Self, gpa: mem.Allocator, node: *Node) !Entry {
-            if (node.isLeaf()) return removeItemAt(node, 0);
-
-            const branch = node.branch.?;
-            try self.makeUniqueChild(gpa, node, 0);
-            const removed = try self.deleteMinFromNode(gpa, branch.children[0].?);
-            branch.counts[0] -= 1;
-            try self.rebalanceChild(gpa, node, 0);
-            return removed;
-        }
-
-        pub fn deleteMaxFromNode(self: *Self, gpa: mem.Allocator, node: *Node) !Entry {
-            if (node.isLeaf()) return removeItemAt(node, node.len - 1);
-
-            const branch = node.branch.?;
-            const child_index = node.len;
-            try self.makeUniqueChild(gpa, node, child_index);
-            const removed = try self.deleteMaxFromNode(gpa, branch.children[child_index].?);
-            branch.counts[child_index] -= 1;
-            try self.rebalanceChild(gpa, node, child_index);
-            return removed;
-        }
-
-        fn deleteAtFromNode(self: *Self, gpa: mem.Allocator, node: *Node, index: usize) !Entry {
-            if (node.isLeaf()) return removeItemAt(node, index);
-
-            const branch = node.branch.?;
-            var remaining = index;
-            for (0..node.len) |i| {
-                const child_count = branch.counts[i];
-                if (remaining < child_count) {
-                    try self.makeUniqueChild(gpa, node, i);
-                    const removed = try self.deleteAtFromNode(gpa, branch.children[i].?, remaining);
-                    branch.counts[i] -= 1;
-                    try self.rebalanceChild(gpa, node, i);
-                    return removed;
-                }
-
-                remaining -= child_count;
-
-                if (remaining == 0) {
-                    try self.makeUniqueChild(gpa, node, i);
-                    const old = Entry.init(node.keys[i], node.values[i]);
-                    const replacement = try self.deleteMaxFromNode(gpa, branch.children[i].?);
-                    branch.counts[i] -= 1;
-                    node.keys[i] = replacement.key;
-                    node.values[i] = replacement.value;
-                    setPrefix(node, i);
-                    try self.rebalanceChild(gpa, node, i);
-                    return old;
-                }
-                remaining -= 1;
+        fn deleteMinFromNode(self: *Self, gpa: mem.Allocator, root: *Node) !Entry {
+            var path: Path = .{};
+            var node = root;
+            while (node.branch) |branch| {
+                try self.makeUniqueChild(gpa, node, 0);
+                path.push(node, 0);
+                node = branch.children[0].?;
             }
+            const removed = removeItemAt(node, 0);
+            try self.unwindDelete(gpa, &path, 1);
+            return removed;
+        }
 
-            const child_index = node.len;
-            try self.makeUniqueChild(gpa, node, child_index);
-            const removed = try self.deleteAtFromNode(gpa, branch.children[child_index].?, remaining);
-            branch.counts[child_index] -= 1;
-            try self.rebalanceChild(gpa, node, child_index);
+        pub fn deleteMaxFromNode(self: *Self, gpa: mem.Allocator, root: *Node) !Entry {
+            var path: Path = .{};
+            const removed = try self.removeMaxAlongPath(gpa, &path, root);
+            try self.unwindDelete(gpa, &path, 1);
+            return removed;
+        }
+
+        fn deleteAtFromNode(self: *Self, gpa: mem.Allocator, root: *Node, index: usize) !Entry {
+            var path: Path = .{};
+            var node = root;
+            var remaining = index;
+            const removed = descend: while (node.branch) |branch| {
+                const child_index = for (0..node.len) |i| {
+                    const child_count = branch.counts[i];
+                    if (remaining < child_count) break i;
+                    remaining -= child_count;
+                    if (remaining == 0) {
+                        // The target is separator i: replace it with its predecessor.
+                        try self.makeUniqueChild(gpa, node, i);
+                        path.push(node, i);
+                        const old = Entry.init(node.keys[i], node.values[i]);
+                        const replacement = try self.removeMaxAlongPath(gpa, &path, branch.children[i].?);
+                        node.keys[i] = replacement.key;
+                        node.values[i] = replacement.value;
+                        setPrefix(node, i);
+                        break :descend old;
+                    }
+                    remaining -= 1;
+                } else node.len;
+
+                try self.makeUniqueChild(gpa, node, child_index);
+                path.push(node, child_index);
+                node = branch.children[child_index].?;
+            } else removeItemAt(node, remaining);
+            try self.unwindDelete(gpa, &path, 1);
             return removed;
         }
 
