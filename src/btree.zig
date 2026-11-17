@@ -330,20 +330,52 @@ pub fn Tree(
             return &internal.node;
         }
 
-        // Recursively frees a node, all of its descendants, and branch data.
-        fn destroyNode(self: *Self, gpa: mem.Allocator, node: *Node) void {
-            for (0..node.len) |i| releaseValue(gpa, node.values[i]);
+        // Frees a node and every descendant that no other tree still shares,
+        // including their values and branch data.
+        fn destroyNode(self: *Self, gpa: mem.Allocator, root: *Node) void {
+            _ = self;
+            const Frame = struct { node: *Node, next_child: usize };
+            var stack: [max_height]Frame = undefined;
+            releaseValues(gpa, root);
+            stack[0] = .{ .node = root, .next_child = 0 };
+            var depth: usize = 1;
 
-            if (node.branch) |branch| {
-                for (0..node.len + 1) |i| {
-                    self.releaseNode(gpa, branch.children[i]);
+            while (depth > 0) {
+                const top = &stack[depth - 1];
+                const node = top.node;
+                if (node.branch) |branch| {
+                    if (top.next_child <= node.len) {
+                        const child = branch.children[top.next_child];
+                        top.next_child += 1;
+                        // Children may be null (collapseRootIfNeeded detaches
+                        // children[0] first) or still shared with a copy.
+                        const c = child orelse continue;
+                        if (dropSharedRef(c)) continue;
+                        std.debug.assert(depth < max_height);
+                        releaseValues(gpa, c);
+                        stack[depth] = .{ .node = c, .next_child = 0 };
+                        depth += 1;
+                        continue;
+                    }
+                    const internal: *InternalNode = @fieldParentPtr("branch", branch);
+                    gpa.destroy(internal);
+                } else {
+                    gpa.destroy(node);
                 }
-                const internal: *InternalNode = @fieldParentPtr("branch", branch);
-                gpa.destroy(internal);
-                return;
+                depth -= 1;
             }
+        }
 
-            gpa.destroy(node);
+        fn releaseValues(gpa: mem.Allocator, node: *Node) void {
+            for (0..node.len) |i| releaseValue(gpa, node.values[i]);
+        }
+
+        // Drops one shared-owner reference. Returns true when another tree
+        // still owns the node, meaning the caller must not free it.
+        fn dropSharedRef(node: *Node) bool {
+            if (node.rc.load(.monotonic) == 0) return false;
+            _ = node.rc.fetchSub(1, .acq_rel);
+            return true;
         }
 
         // Splits a full node into left and right halves. The original node keeps
@@ -2179,69 +2211,113 @@ pub fn Tree(
             return removed;
         }
 
-        fn deleteRangeChunkFromNode(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, offset: usize, index: usize, count: usize, depth: usize) anyerror!DeleteRangeChunk {
-            if (node.isLeaf()) return deleteRangeFromLeafReturning(gpa, builder, node, offset, index, count, depth);
+        fn deleteRangeChunkFromNode(
+            self: *Self,
+            gpa: mem.Allocator,
+            builder: *RangeBuilder,
+            root: *Node,
+            root_offset: usize,
+            root_index: usize,
+            count: usize,
+        ) !DeleteRangeChunk {
+            var path: Path = .init();
+            var node = root;
+            var offset = root_offset;
+            var index = root_index;
 
-            const branch = node.branch.?;
-            var i: usize = 0;
-            var child_offset = offset;
-            var child_index = index;
-            var found_separator = false;
+            const deleted: DeleteRangeChunk = level: while (node.branch) |branch| {
+                var i: usize = 0;
+                var child_offset = offset;
+                var child_index = index;
+                var found_separator = false;
 
-            while (i < node.len) : (i += 1) {
-                const child_count = branch.counts[i];
-                if (child_index <= child_count) {
-                    if (child_index == child_count) {
-                        child_offset += child_count;
-                        found_separator = true;
+                while (i < node.len) : (i += 1) {
+                    const child_count = branch.counts[i];
+                    if (child_index <= child_count) {
+                        if (child_index == child_count) {
+                            child_offset += child_count;
+                            found_separator = true;
+                        }
+                        break;
                     }
-                    break;
+                    child_index -= child_count + 1;
+                    child_offset += child_count + 1;
                 }
-                child_index -= child_count + 1;
-                child_offset += child_count + 1;
-            }
 
-            if (found_separator and node.len > min_items and count > branch.counts[i + 1]) {
-                return .{ .start = child_offset, .count = try self.detachItemAndRightChildAt(gpa, builder, node, i) };
-            }
+                if (found_separator and node.len > min_items and count > branch.counts[i + 1]) {
+                    break :level .{
+                        .start = child_offset,
+                        .count = try self.detachItemAndRightChildAt(
+                            gpa,
+                            builder,
+                            node,
+                            i,
+                        ),
+                    };
+                }
 
-            if (found_separator) {
-                const removed = try self.deleteAtFromNode(gpa, node, index);
-                try builder.appendEntry(gpa, removed);
-                return .{ .start = child_offset, .count = 1 };
-            }
+                if (found_separator) {
+                    const removed = try self.deleteAtFromNode(gpa, node, index);
+                    try builder.appendEntry(gpa, removed);
+                    break :level .{
+                        .start = child_offset,
+                        .count = 1,
+                    };
+                }
 
-            var taken: usize = 0;
-            var remaining_count = count;
-            var chunk: DeleteRangeChunk = .{};
-            while (child_index == 0 and i < node.len and node.len > min_items and remaining_count > branch.counts[i]) {
-                if (taken == 0) chunk.start = child_offset;
-                const removed = try self.detachChildAndItemAt(gpa, builder, node, i);
-                chunk.count += removed;
-                remaining_count -= removed;
-                taken += 1;
-            }
-            if (taken > 0) return chunk;
+                var taken: usize = 0;
+                var remaining_count = count;
+                var chunk: DeleteRangeChunk = .{};
+                while (child_index == 0 and i < node.len and node.len > min_items and remaining_count > branch.counts[i]) {
+                    if (taken == 0) chunk.start = child_offset;
+                    const removed = try self.detachChildAndItemAt(gpa, builder, node, i);
+                    chunk.count += removed;
+                    remaining_count -= removed;
+                    taken += 1;
+                }
 
-            while (child_index > 0 and i < node.len and node.len > min_items and remaining_count > (branch.counts[i] - child_index) + branch.counts[i + 1] + 1) {
-                if (taken == 0) chunk.start = child_offset + branch.counts[i];
-                const removed = try self.detachItemAndRightChildAt(gpa, builder, node, i);
-                chunk.count += removed;
-                remaining_count -= removed;
-                taken += 1;
-            }
-            if (taken > 0) return chunk;
+                if (taken > 0) break :level chunk;
 
-            try self.makeUniqueChild(gpa, node, i);
-            const deleted = try self.deleteRangeChunkFromNode(gpa, builder, branch.children[i].?, child_offset, child_index, count, depth + 1);
-            branch.counts[i] -= deleted.count;
-            if (branch.children[i].?.len < min_items) try self.rebalanceChild(gpa, node, i);
+                while (child_index > 0 and i < node.len and node.len > min_items and remaining_count > (branch.counts[i] - child_index) + branch.counts[i + 1] + 1) {
+                    if (taken == 0) chunk.start = child_offset + branch.counts[i];
+                    const removed = try self.detachItemAndRightChildAt(gpa, builder, node, i);
+                    chunk.count += removed;
+                    remaining_count -= removed;
+                    taken += 1;
+                }
+
+                if (taken > 0) break :level chunk;
+
+                // we couldn't remove anything at this level. move into child i
+                try self.makeUniqueChild(gpa, node, i);
+                path.push(node, i);
+                node = branch.children[i].?;
+                offset = child_offset;
+                index = child_index;
+            } else try deleteRangeFromLeafReturning(
+                gpa,
+                builder,
+                node,
+                offset,
+                index,
+                count,
+                path.len,
+            );
+
+            try self.unwindDelete(gpa, &path, deleted.count);
             return deleted;
         }
 
         fn deleteRangeChunkFromRoot(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, index: usize, count: usize) anyerror!DeleteRangeChunk {
             try self.makeUniqueRoot(gpa);
-            const deleted = try self.deleteRangeChunkFromNode(gpa, builder, self.root.?, 0, index, count, 0);
+            const deleted = try self.deleteRangeChunkFromNode(
+                gpa,
+                builder,
+                self.root.?,
+                0,
+                index,
+                count,
+            );
             self.len -= deleted.count;
             self.collapseRootIfNeeded(gpa);
             return deleted;
@@ -2444,13 +2520,10 @@ pub fn Tree(
         }
 
         // Releases one owner reference. If no shared owner remains, destroys
-        // the node and recursively releases its children.
+        // the node and releases its children.
         fn releaseNode(self: *Self, gpa: mem.Allocator, node: ?*Node) void {
             const n = node orelse return;
-            if (n.rc.load(.monotonic) > 0) {
-                _ = n.rc.fetchSub(1, .acq_rel);
-                return;
-            }
+            if (dropSharedRef(n)) return;
             self.destroyNode(gpa, n);
         }
 

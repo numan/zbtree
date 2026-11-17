@@ -418,3 +418,127 @@ test "map delete and ordered deleteKey match a model" {
     defer gpa.free(full);
     try expectMatchesModel(&snapshot, full);
 }
+
+const RangeWalk = struct {
+    expected: []const isize,
+    next: usize = 0,
+};
+
+fn expectRangeItem(ctx: *RangeWalk, key: isize, value: isize) !void {
+    try testing.expect(ctx.next < ctx.expected.len);
+    try testing.expectEqual(ctx.expected[ctx.next], key);
+    try testing.expectEqual(key * 10, value);
+    ctx.next += 1;
+}
+
+test "random deleteRangeAt calls on a deep tree match a model" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+    try fillDeep(TreeType, &tree, gpa, deep_n);
+    var snapshot = tree.copy();
+    defer snapshot.deinit(gpa);
+
+    var remaining = try std.ArrayList(isize).initCapacity(gpa, deep_n);
+    defer remaining.deinit(gpa);
+    for (0..deep_n) |i| remaining.appendAssumeCapacity(@intCast(i));
+
+    var prng = std.Random.DefaultPrng.init(17);
+    const random = prng.random();
+    while (remaining.items.len > 0) {
+        const index = random.uintLessThan(usize, remaining.items.len);
+        // Mix tiny, medium, and huge ranges so both the leaf path and the
+        // detach-whole-subtree paths run at every depth.
+        const count = switch (random.uintLessThan(u8, 3)) {
+            0 => random.uintLessThan(usize, 4) + 1,
+            1 => random.uintLessThan(usize, 200) + 1,
+            else => random.uintLessThan(usize, 8_000) + 1,
+        };
+        const end = @min(index + count, remaining.items.len);
+
+        const result = try tree.deleteRangeAt(gpa, index, count, .{});
+        defer result.deinit(gpa);
+        try testing.expectEqual(end - index, result.removed_count);
+
+        var walk = RangeWalk{ .expected = remaining.items[index..end] };
+        try result.ascent(*RangeWalk, &walk, expectRangeItem);
+        try testing.expectEqual(end - index, walk.next);
+
+        remaining.replaceRangeAssumeCapacity(index, end - index, &.{});
+        try tree.checkInvariants();
+        try testing.expectEqual(remaining.items.len, tree.len);
+    }
+    try testing.expect(tree.root == null);
+    try testing.expectEqual(deep_n, snapshot.len);
+    try snapshot.checkInvariants();
+}
+
+var live_values: usize = 0;
+
+fn copyCounted(_: Allocator, value: isize) anyerror!isize {
+    live_values += 1;
+    return value;
+}
+
+fn releaseCounted(_: Allocator, _: isize) void {
+    live_values -= 1;
+}
+
+const OwnedTree = btree.Tree(isize, isize, .{
+    .compare = cmpKey,
+    .use_string_prefix = false,
+    .copy_value = copyCounted,
+    .release_value = releaseCounted,
+});
+
+fn fillOwned(tree: *OwnedTree, gpa: Allocator, n: usize) !void {
+    for (0..n) |i| {
+        const k: isize = @intCast(i);
+        live_values += 1; // the tree takes ownership of this value
+        try testing.expect(try tree.insert(gpa, k, k * 10));
+    }
+}
+
+test "every owned value and node is released exactly once" {
+    const TreeType = OwnedTree;
+    const gpa = testing.allocator;
+    // Try both destruction orders: shared nodes must be freed by whichever
+    // tree lets go last.
+    for ([_]bool{ true, false }) |original_first| {
+        live_values = 0;
+        var original = TreeType.init();
+        try fillOwned(&original, gpa, deep_n);
+        var copy = original.copy();
+        // Clone a few paths so the trees share some nodes and own others.
+        // delete hands the removed value back to the caller, who must release it.
+        for (0..200) |i| {
+            if (try copy.delete(gpa, @intCast(i * 300), 0)) |value| releaseCounted(gpa, value);
+        }
+        const range = try copy.deleteRangeAt(gpa, 10_000, 20_000, .{});
+
+        if (original_first) {
+            original.deinit(gpa);
+            range.deinit(gpa);
+            copy.deinit(gpa);
+        } else {
+            copy.deinit(gpa);
+            range.deinit(gpa);
+            original.deinit(gpa);
+        }
+        // testing.allocator reports leaked nodes; this catches leaked values.
+        try testing.expectEqual(0, live_values);
+    }
+}
+
+test "clear on a deep tree, then reuse" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+    try fillDeep(TreeType, &tree, gpa, deep_n);
+    tree.clear(gpa);
+    try testing.expectEqual(0, tree.len);
+    try fillDeep(TreeType, &tree, gpa, 1_000);
+    try tree.checkInvariants();
+}
