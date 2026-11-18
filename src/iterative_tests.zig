@@ -542,3 +542,124 @@ test "clear on a deep tree, then reuse" {
     try fillDeep(TreeType, &tree, gpa, 1_000);
     try tree.checkInvariants();
 }
+
+const DescWalk = struct { next: isize, seen: usize = 0 };
+
+fn expectDescending(ctx: *DescWalk, key: isize, value: isize) !void {
+    try testing.expectEqual(ctx.next, key);
+    try testing.expectEqual(key * 10, value);
+    ctx.next -= 1;
+    ctx.seen += 1;
+}
+
+const StartWalk = struct { next: isize, step: isize, left: usize };
+
+fn expectFromIndex(ctx: *StartWalk, key: isize, value: isize) !bool {
+    try testing.expectEqual(ctx.next, key);
+    try testing.expectEqual(key * 10, value);
+    ctx.next += ctx.step;
+    ctx.left -= 1;
+    return ctx.left > 0;
+}
+
+test "ascent and descent visit a deep tree in order" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+    try fillDeep(TreeType, &tree, gpa, deep_n);
+
+    const model = try newModel(gpa, deep_n, deep_n);
+    defer gpa.free(model);
+    try expectMatchesModel(&tree, model); // uses ascent
+
+    var desc = DescWalk{ .next = @intCast(deep_n - 1) };
+    try tree.descent(*DescWalk, &desc, expectDescending);
+    try testing.expectEqual(deep_n, desc.seen);
+}
+
+test "ascendAt and descendAt start at every index of a deep tree" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+    try fillDeep(TreeType, &tree, gpa, deep_n);
+
+    for (0..deep_n) |i| {
+        const k: isize = @intCast(i);
+        // Three items crosses leaf->separator->leaf boundaries near node edges.
+        var up = StartWalk{ .next = k, .step = 1, .left = @min(3, deep_n - i) };
+        try tree.ascendAt(*StartWalk, i, &up, expectFromIndex);
+        try testing.expectEqual(0, up.left);
+
+        var down = StartWalk{ .next = k, .step = -1, .left = @min(3, i + 1) };
+        try tree.descendAt(*StartWalk, i, &down, expectFromIndex);
+        try testing.expectEqual(0, down.left);
+    }
+
+    // Full runs from a deep interior start.
+    var up = StartWalk{ .next = 31_337, .step = 1, .left = deep_n - 31_337 };
+    try tree.ascendAt(*StartWalk, 31_337, &up, expectFromIndex);
+    try testing.expectEqual(0, up.left);
+    var down = StartWalk{ .next = 31_337, .step = -1, .left = 31_338 };
+    try tree.descendAt(*StartWalk, 31_337, &down, expectFromIndex);
+    try testing.expectEqual(0, down.left);
+}
+
+fn addOne(_: void, _: isize, value: *isize) !void {
+    value.* += 1;
+}
+
+fn subOne(_: void, _: isize, value: *isize) !void {
+    value.* -= 1;
+}
+
+test "ascentMut and descentMut update a copy without touching the original" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var original = TreeType.init();
+    defer original.deinit(gpa);
+    try fillDeep(TreeType, &original, gpa, deep_n);
+
+    var copy = original.copy();
+    defer copy.deinit(gpa);
+    try copy.ascentMut(gpa, void, {}, addOne);
+    for (0..deep_n) |i| {
+        const k: isize = @intCast(i);
+        try testing.expectEqual(k * 10 + 1, copy.getAt(i).?.value);
+    }
+
+    var copy2 = copy.copy();
+    defer copy2.deinit(gpa);
+    try copy2.descentMut(gpa, void, {}, subOne);
+    try copy2.descentMut(gpa, void, {}, subOne);
+
+    const model = try newModel(gpa, deep_n, deep_n);
+    defer gpa.free(model);
+    try expectMatchesModel(&original, model);
+    for (0..deep_n) |i| {
+        const k: isize = @intCast(i);
+        try testing.expectEqual(k * 10 + 1, copy.getAt(i).?.value);
+        try testing.expectEqual(k * 10 - 1, copy2.getAt(i).?.value);
+    }
+}
+
+fn failAt(ctx: *usize, _: isize, _: isize) !void {
+    if (ctx.* == 0) return error.Stop;
+    ctx.* -= 1;
+}
+
+test "traversal errors stop deep in the tree" {
+    const TreeType = IntTree;
+    const gpa = testing.allocator;
+    var tree = TreeType.init();
+    defer tree.deinit(gpa);
+    try fillDeep(TreeType, &tree, gpa, deep_n);
+
+    var left: usize = 40_000;
+    try testing.expectError(error.Stop, tree.ascent(*usize, &left, failAt));
+    try testing.expectEqual(0, left);
+    left = 40_000;
+    try testing.expectError(error.Stop, tree.descent(*usize, &left, failAt));
+    try testing.expectEqual(0, left);
+}

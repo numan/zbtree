@@ -82,11 +82,11 @@ pub fn Tree(
         };
 
         pub const Path = struct {
-            entries: [max_height]PathEntry = undefined,
-            len: usize = 0,
+            entries: [max_height]PathEntry,
+            len: usize,
 
             pub fn init() Path {
-                return .{};
+                return .{ .entries = undefined, .len = 0 };
             }
 
             pub fn push(path: *Path, node: *Node, child: usize) void {
@@ -190,7 +190,7 @@ pub fn Tree(
                 comptime yield: fn (CtxType, K, V) anyerror!void,
             ) !void {
                 for (result.chunks[0..result.chunk_count]) |chunk| {
-                    if (chunk.node) |node| try visitAsc(CtxType, node, context, yield);
+                    if (chunk.node) |node| try walkAsc(null, node, 0, context, Emitter(CtxType, yield).emit);
                     for (chunk.items) |item| try yield(context, item.key, item.value);
                 }
             }
@@ -940,28 +940,186 @@ pub fn Tree(
             context: CtxType,
             comptime yield: fn (CtxType, K, V) anyerror!void,
         ) !void {
-            if (self.root) |root| try visitAsc(CtxType, root, context, yield);
+            if (self.root) |root| try walkAsc(
+                null,
+                root,
+                0,
+                context,
+                Emitter(CtxType, yield).emit,
+            );
         }
 
-        // Recursive implementation for ascending traversal.
-        fn visitAsc(
-            comptime CtxType: type,
-            node: *const Node,
-            ctx: CtxType,
-            comptime yield: fn (CtxType, K, V) anyerror!void,
+        const TraversalFrame = struct { node: *Node, next: usize };
+
+        const TraversalStack = struct {
+            frames: [max_height]TraversalFrame,
+            len: usize,
+
+            fn init() TraversalStack {
+                return .{ .frames = undefined, .len = 0 };
+            }
+
+            fn push(stack: *TraversalStack, node: *Node, next: usize) void {
+                std.debug.assert(stack.len < max_height);
+                stack.frames[stack.len] = .{ .node = node, .next = next };
+                stack.len += 1;
+            }
+
+            fn top(stack: *TraversalStack) ?*TraversalFrame {
+                return if (stack.len == 0) null else &stack.frames[stack.len - 1];
+            }
+
+            fn pop(stack: *TraversalStack) void {
+                stack.len -= 1;
+            }
+        };
+
+        // Passed by `*Mut` traversals, which must clone shared children
+        // before handing out pointers into them. Read-only traversals pass
+        // `null` instead.
+        const Cow = struct {
+            tree: *Self,
+            gpa: mem.Allocator,
+        };
+
+        // Returns child `child_index` of `parent`. `cow` is a `Cow` or `null`,
+        // and its type is known at compile time: a `Cow` clones a child that
+        // is still shared first, and `null` compiles to a plain pointer load.
+        fn enterChild(cow: anytype, parent: *Node, child_index: usize) !*Node {
+            comptime std.debug.assert(@TypeOf(cow) == Cow or @TypeOf(cow) == @TypeOf(null));
+            if (comptime @TypeOf(cow) == Cow) try cow.tree.makeUniqueChild(cow.gpa, parent, child_index);
+            return parent.branch.?.children[child_index].?;
+        }
+
+        // Adapts the public callback shapes, `(ctx, K, V)` or `(ctx, K, *V)`
+        // returning `void` or `bool`, to `emit(ctx, node, index) !bool`.
+        fn Emitter(comptime CtxType: type, comptime yield: anytype) type {
+            return struct {
+                fn emit(ctx: CtxType, node: *Node, i: usize) anyerror!bool {
+                    const wants_ptr = comptime @typeInfo(@TypeOf(yield)).@"fn".param_types[2].? == *V;
+                    const result = if (wants_ptr)
+                        try yield(ctx, node.keys[i], &node.values[i])
+                    else
+                        try yield(ctx, node.keys[i], node.values[i]);
+                    return if (@TypeOf(result) == bool) result else true;
+                }
+            };
+        }
+
+        // Yields the items of `root`'s subtree in ascending order, starting at
+        // sorted position `index`. Stops early when `emit` returns false.
+        fn walkAsc(
+            cow: anytype,
+            root: *Node,
+            index: usize,
+            ctx: anytype,
+            comptime emit: fn (@TypeOf(ctx), *Node, usize) anyerror!bool,
         ) !void {
-            if (node.isLeaf()) {
-                for (0..node.len) |i| try yield(ctx, node.keys[i], node.values[i]);
-                return;
-            }
+            var stack: TraversalStack = .init();
 
-            const branch = node.branch.?;
-            for (0..node.len) |i| {
-                try visitAsc(CtxType, branch.children[i].?, ctx, yield);
-                try yield(ctx, node.keys[i], node.values[i]);
-            }
+            // Seek: follow subtree counts so the top frame's next item is `index`.
+            var node = root;
+            var remaining = index;
+            seek: while (node.branch) |branch| {
+                const child_index = for (0..node.len) |i| {
+                    if (remaining < branch.counts[i]) break i; // inside child i
+                    remaining -= branch.counts[i];
+                    if (remaining == 0) {
+                        stack.push(node, i); // separator i comes next
+                        break :seek;
+                    }
+                    remaining -= 1;
+                } else node.len;
+                stack.push(node, child_index); // after this child: separator child_index
+                node = try enterChild(cow, node, child_index);
+            } else stack.push(node, remaining);
 
-            try visitAsc(CtxType, branch.children[node.len].?, ctx, yield);
+            // Run: yield the top frame's next item, then push the left spine
+            // of the child that follows it.
+            while (stack.top()) |frame| {
+                if (frame.node.isLeaf()) {
+                    for (frame.next..frame.node.len) |i| {
+                        if (!try emit(ctx, frame.node, i)) return;
+                    }
+                    stack.pop();
+                    continue;
+                }
+                if (frame.next == frame.node.len) {
+                    stack.pop();
+                    continue;
+                }
+
+                const i = frame.next;
+                frame.next += 1;
+                if (!try emit(ctx, frame.node, i)) return;
+
+                var child = try enterChild(cow, frame.node, i + 1);
+                while (true) {
+                    stack.push(child, 0);
+                    if (child.isLeaf()) break;
+                    child = try enterChild(cow, child, 0);
+                }
+            }
+        }
+
+        // Mirror image of walkAsc: yields in descending order starting at
+        // sorted position `index`.
+        fn walkDesc(
+            cow: anytype,
+            root: *Node,
+            index: usize,
+            ctx: anytype,
+            comptime emit: fn (@TypeOf(ctx), *Node, usize) anyerror!bool,
+        ) !void {
+            var stack: TraversalStack = .init();
+
+            var node = root;
+            var remaining = index;
+            seek: while (node.branch) |branch| {
+                const child_index = for (0..node.len) |i| {
+                    if (remaining < branch.counts[i]) break i; // inside child i
+                    remaining -= branch.counts[i];
+                    if (remaining == 0) {
+                        stack.push(node, i + 1); // separator i comes next
+                        break :seek;
+                    }
+                    remaining -= 1;
+                } else node.len;
+                stack.push(node, child_index); // after this child: separator child_index - 1
+                node = try enterChild(cow, node, child_index);
+            } else stack.push(node, remaining + 1);
+
+            while (stack.top()) |frame| {
+                if (frame.node.isLeaf()) {
+                    // Written as a do-while on purpose. With `while (i > 0)`
+                    // the optimizer reloads the callback's context from
+                    // memory on every item, which about doubles the cost of
+                    // long `descendAt` scans.
+                    var i = frame.next;
+                    if (i > 0) while (true) {
+                        i -= 1;
+                        if (!try emit(ctx, frame.node, i)) return;
+                        if (i == 0) break;
+                    };
+                    stack.pop();
+                    continue;
+                }
+                if (frame.next == 0) {
+                    stack.pop();
+                    continue;
+                }
+
+                frame.next -= 1;
+                const i = frame.next;
+                if (!try emit(ctx, frame.node, i)) return;
+
+                var child = try enterChild(cow, frame.node, i);
+                while (true) {
+                    stack.push(child, child.len);
+                    if (child.isLeaf()) break;
+                    child = try enterChild(cow, child, child.len);
+                }
+            }
         }
 
         /// Visits every item in ascending sort order and yields mutable values.
@@ -976,31 +1134,8 @@ pub fn Tree(
             comptime yield: fn (CtxType, K, *V) anyerror!void,
         ) !void {
             try self.makeUniqueRoot(gpa);
-            if (self.root) |root| try self.visitAscMut(gpa, CtxType, root, context, yield);
-        }
-
-        fn visitAscMut(
-            self: *Self,
-            gpa: mem.Allocator,
-            comptime CtxType: type,
-            node: *Node,
-            ctx: CtxType,
-            comptime yield: fn (CtxType, K, *V) anyerror!void,
-        ) !void {
-            if (node.isLeaf()) {
-                for (0..node.len) |i| try yield(ctx, node.keys[i], &node.values[i]);
-                return;
-            }
-
-            const branch = node.branch.?;
-            for (0..node.len) |i| {
-                try self.makeUniqueChild(gpa, node, i);
-                try self.visitAscMut(gpa, CtxType, branch.children[i].?, ctx, yield);
-                try yield(ctx, node.keys[i], &node.values[i]);
-            }
-
-            try self.makeUniqueChild(gpa, node, node.len);
-            try self.visitAscMut(gpa, CtxType, branch.children[node.len].?, ctx, yield);
+            const cow: Cow = .{ .tree = self, .gpa = gpa };
+            if (self.root) |root| try walkAsc(cow, root, 0, context, Emitter(CtxType, yield).emit);
         }
 
         /// Visits every item in descending sort order.
@@ -1013,34 +1148,7 @@ pub fn Tree(
             context: CtxType,
             comptime yield: fn (CtxType, K, V) anyerror!void,
         ) !void {
-            if (self.root) |root| try visitDesc(CtxType, root, context, yield);
-        }
-
-        // Recursive implementation for descending traversal.
-        fn visitDesc(
-            comptime CtxType: type,
-            node: *const Node,
-            ctx: CtxType,
-            comptime yield: fn (CtxType, K, V) anyerror!void,
-        ) !void {
-            if (node.isLeaf()) {
-                var i = node.len;
-                while (i > 0) {
-                    i -= 1;
-                    try yield(ctx, node.keys[i], node.values[i]);
-                }
-                return;
-            }
-
-            const branch = node.branch.?;
-            try visitDesc(CtxType, branch.children[node.len].?, ctx, yield);
-
-            var i = node.len;
-            while (i > 0) {
-                i -= 1;
-                try yield(ctx, node.keys[i], node.values[i]);
-                try visitDesc(CtxType, branch.children[i].?, ctx, yield);
-            }
+            if (self.root) |root| try walkDesc(null, root, self.len - 1, context, Emitter(CtxType, yield).emit);
         }
 
         /// Visits every item in descending sort order and yields mutable values.
@@ -1055,37 +1163,8 @@ pub fn Tree(
             comptime yield: fn (CtxType, K, *V) anyerror!void,
         ) !void {
             try self.makeUniqueRoot(gpa);
-            if (self.root) |root| try self.visitDescMut(gpa, CtxType, root, context, yield);
-        }
-
-        fn visitDescMut(
-            self: *Self,
-            gpa: mem.Allocator,
-            comptime CtxType: type,
-            node: *Node,
-            ctx: CtxType,
-            comptime yield: fn (CtxType, K, *V) anyerror!void,
-        ) !void {
-            if (node.isLeaf()) {
-                var i = node.len;
-                while (i > 0) {
-                    i -= 1;
-                    try yield(ctx, node.keys[i], &node.values[i]);
-                }
-                return;
-            }
-
-            const branch = node.branch.?;
-            try self.makeUniqueChild(gpa, node, node.len);
-            try self.visitDescMut(gpa, CtxType, branch.children[node.len].?, ctx, yield);
-
-            var i = node.len;
-            while (i > 0) {
-                i -= 1;
-                try yield(ctx, node.keys[i], &node.values[i]);
-                try self.makeUniqueChild(gpa, node, i);
-                try self.visitDescMut(gpa, CtxType, branch.children[i].?, ctx, yield);
-            }
+            const cow: Cow = .{ .tree = self, .gpa = gpa };
+            if (self.root) |root| try walkDesc(cow, root, self.len - 1, context, Emitter(CtxType, yield).emit);
         }
 
         /// Returns the first item greater than or equal to `key`/`val`.
@@ -1300,55 +1379,6 @@ pub fn Tree(
             }
         }
 
-        fn visitAscFrom(
-            comptime CtxType: type,
-            node: *const Node,
-            index: usize,
-            ctx: CtxType,
-            comptime yield: fn (CtxType, K, V) anyerror!bool,
-        ) !bool {
-            if (node.isLeaf()) {
-                for (index..node.len) |i| {
-                    if (!try yield(ctx, node.keys[i], node.values[i])) return false;
-                }
-                return true;
-            }
-
-            const branch = node.branch.?;
-            var remaining = index;
-            var started = false;
-
-            for (0..node.len) |i| {
-                const child_count = branch.counts[i];
-                if (!started) {
-                    if (remaining < child_count) {
-                        if (!try visitAscFrom(CtxType, branch.children[i].?, remaining, ctx, yield)) return false;
-                        started = true;
-                    } else {
-                        remaining -= child_count;
-                    }
-                } else {
-                    if (!try visitAscFrom(CtxType, branch.children[i].?, 0, ctx, yield)) return false;
-                }
-
-                if (!started) {
-                    if (remaining == 0) {
-                        started = true;
-                    } else {
-                        remaining -= 1;
-                    }
-                }
-
-                if (started and !try yield(ctx, node.keys[i], node.values[i])) return false;
-            }
-
-            if (!started) {
-                return visitAscFrom(CtxType, branch.children[node.len].?, remaining, ctx, yield);
-            }
-
-            return visitAscFrom(CtxType, branch.children[node.len].?, 0, ctx, yield);
-        }
-
         /// Visits items in ascending order starting at sorted position `index`.
         ///
         /// The callback returns `true` to continue or `false` to stop early.
@@ -1361,88 +1391,7 @@ pub fn Tree(
             comptime yield: fn (CtxType, K, V) anyerror!bool,
         ) !void {
             if (index >= self.len) return;
-            _ = try visitAscFrom(CtxType, self.root.?, index, context, yield);
-        }
-
-        fn visitDescAllBool(
-            comptime CtxType: type,
-            node: *const Node,
-            ctx: CtxType,
-            comptime yield: fn (CtxType, K, V) anyerror!bool,
-        ) !bool {
-            if (node.isLeaf()) {
-                var i = node.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (!try yield(ctx, node.keys[i], node.values[i])) return false;
-                }
-                return true;
-            }
-
-            const branch = node.branch.?;
-            if (!try visitDescAllBool(CtxType, branch.children[node.len].?, ctx, yield)) return false;
-            var i = node.len;
-            while (i > 0) {
-                i -= 1;
-                if (!try yield(ctx, node.keys[i], node.values[i])) return false;
-                if (!try visitDescAllBool(CtxType, branch.children[i].?, ctx, yield)) return false;
-            }
-            return true;
-        }
-
-        fn visitDescLowerChildren(
-            comptime CtxType: type,
-            node: *const Node,
-            start_child: usize,
-            ctx: CtxType,
-            comptime yield: fn (CtxType, K, V) anyerror!bool,
-        ) !bool {
-            const branch = node.branch.?;
-            var i = start_child;
-            while (i > 0) {
-                i -= 1;
-                if (!try yield(ctx, node.keys[i], node.values[i])) return false;
-                if (!try visitDescAllBool(CtxType, branch.children[i].?, ctx, yield)) return false;
-            }
-            return true;
-        }
-
-        fn visitDescFrom(
-            comptime CtxType: type,
-            node: *const Node,
-            index: usize,
-            ctx: CtxType,
-            comptime yield: fn (CtxType, K, V) anyerror!bool,
-        ) !bool {
-            if (node.isLeaf()) {
-                var i = index + 1;
-                while (i > 0) {
-                    i -= 1;
-                    if (!try yield(ctx, node.keys[i], node.values[i])) return false;
-                }
-                return true;
-            }
-
-            const branch = node.branch.?;
-            var remaining = index;
-            for (0..node.len) |i| {
-                const child_count = branch.counts[i];
-                if (remaining < child_count) {
-                    if (!try visitDescFrom(CtxType, branch.children[i].?, remaining, ctx, yield)) return false;
-                    return visitDescLowerChildren(CtxType, node, i, ctx, yield);
-                }
-                remaining -= child_count;
-
-                if (remaining == 0) {
-                    if (!try yield(ctx, node.keys[i], node.values[i])) return false;
-                    if (!try visitDescAllBool(CtxType, branch.children[i].?, ctx, yield)) return false;
-                    return visitDescLowerChildren(CtxType, node, i, ctx, yield);
-                }
-                remaining -= 1;
-            }
-
-            if (!try visitDescFrom(CtxType, branch.children[node.len].?, remaining, ctx, yield)) return false;
-            return visitDescLowerChildren(CtxType, node, node.len, ctx, yield);
+            try walkAsc(null, self.root.?, index, context, Emitter(CtxType, yield).emit);
         }
 
         /// Visits items in descending order starting at sorted position `index`.
@@ -1459,7 +1408,7 @@ pub fn Tree(
         ) !void {
             if (self.len == 0) return;
             const start = if (index >= self.len) self.len - 1 else index;
-            _ = try visitDescFrom(CtxType, self.root.?, start, context, yield);
+            try walkDesc(null, self.root.?, start, context, Emitter(CtxType, yield).emit);
         }
 
         // Finds a slot that may be mutated by cloning each shared node on the
@@ -2016,7 +1965,7 @@ pub fn Tree(
         }
 
         fn deleteMinFromNode(self: *Self, gpa: mem.Allocator, root: *Node) !Entry {
-            var path: Path = .{};
+            var path: Path = .init();
             var node = root;
             while (node.branch) |branch| {
                 try self.makeUniqueChild(gpa, node, 0);
@@ -2029,14 +1978,14 @@ pub fn Tree(
         }
 
         pub fn deleteMaxFromNode(self: *Self, gpa: mem.Allocator, root: *Node) !Entry {
-            var path: Path = .{};
+            var path: Path = .init();
             const removed = try self.removeMaxAlongPath(gpa, &path, root);
             try self.unwindDelete(gpa, &path, 1);
             return removed;
         }
 
         fn deleteAtFromNode(self: *Self, gpa: mem.Allocator, root: *Node, index: usize) !Entry {
-            var path: Path = .{};
+            var path: Path = .init();
             var node = root;
             var remaining = index;
             const removed = descend: while (node.branch) |branch| {
