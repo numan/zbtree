@@ -214,6 +214,7 @@ pub fn Tree(
             index: usize,
 
             fn init(node: *Node, index: usize) Slot {
+                assertUnique(node);
                 return .{ .node = node, .index = index };
             }
         };
@@ -366,22 +367,35 @@ pub fn Tree(
             }
         }
 
+        // Nodes shared with a copy must be cloned before they are written to.
+        fn assertUnique(node: *const Node) void {
+            std.debug.assert(node.rc.load(.monotonic) == 0);
+        }
+
+        // A pointer through which the caller may write a value.
+        fn writableValue(node: *Node, index: usize) *V {
+            assertUnique(node);
+            return &node.values[index];
+        }
+
         fn releaseValues(gpa: mem.Allocator, node: *Node) void {
             for (0..node.len) |i| releaseValue(gpa, node.values[i]);
         }
 
-        // Drops one shared-owner reference. Returns true when another tree
-        // still owns the node, meaning the caller must not free it.
+        // Drops one owner's reference. Returns true when another owner still
+        // holds the node, meaning the caller must not free it. When it returns
+        // false the count has wrapped around, and the caller must free the
+        // node.
         fn dropSharedRef(node: *Node) bool {
-            if (node.rc.load(.monotonic) == 0) return false;
-            _ = node.rc.fetchSub(1, .acq_rel);
-            return true;
+            return node.rc.fetchSub(1, .acq_rel) != 0;
         }
 
         // Splits a full node into left and right halves. The original node keeps
         // the left half; the returned Split contains the promoted middle item
         // and the new right half.
         fn splitNode(self: *Self, gpa: mem.Allocator, node: *Node) !Split {
+            assertUnique(node);
+            std.debug.assert(node.len == max_items);
             const median: usize = max_items - min_items - 1;
             const right = try self.newNode(gpa, node.isLeaf());
 
@@ -413,8 +427,9 @@ pub fn Tree(
         // tree height by one.
         pub fn splitRoot(self: *Self, gpa: mem.Allocator) !void {
             const old_root = self.root.?;
-            const split = try self.splitNode(gpa, old_root);
             const new_root = try self.newNode(gpa, false);
+            errdefer self.destroyNode(gpa, new_root);
+            const split = try self.splitNode(gpa, old_root);
 
             new_root.keys[0] = split.key;
             new_root.values[0] = split.value;
@@ -629,6 +644,7 @@ pub fn Tree(
         }
         // Inserts one item into a non-full node by shifting later items right.
         pub fn insertItemAt(node: *Node, index: usize, key: K, value: V) void {
+            assertUnique(node);
             std.debug.assert(node.len < max_items);
 
             if (index < node.len) {
@@ -648,6 +664,7 @@ pub fn Tree(
         // Inserts a child pointer into an internal node and records that child's
         // current subtree size.
         fn insertChildAt(node: *Node, index: usize, child: *Node) void {
+            assertUnique(node);
             const branch = node.branch.?;
             std.debug.assert(index <= node.len + 1);
 
@@ -842,6 +859,7 @@ pub fn Tree(
 
         // Replaces the value at `index` and keeps the stored key.
         fn replaceValueAt(node: *Node, index: usize, value: V) SetResult {
+            assertUnique(node);
             const old = node.values[index];
             node.values[index] = value;
             return .{ .old = old, .inserted = false };
@@ -908,7 +926,7 @@ pub fn Tree(
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             while (true) {
                 const found = searchNodeWithPrefix(node, key, value, prefix);
-                if (found.found) return &node.values[found.index];
+                if (found.found) return writableValue(node, found.index);
                 if (node.branch) |branch| {
                     try self.makeUniqueChild(gpa, node, found.index);
                     node = branch.children[found.index].?;
@@ -922,7 +940,7 @@ pub fn Tree(
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             while (true) {
                 const found = searchKeyOnlyWithPrefix(node, key, prefix);
-                if (found.found) return &node.values[found.index];
+                if (found.found) return writableValue(node, found.index);
                 if (node.branch) |branch| {
                     try self.makeUniqueChild(gpa, node, found.index);
                     node = branch.children[found.index].?;
@@ -998,7 +1016,7 @@ pub fn Tree(
                 fn emit(ctx: CtxType, node: *Node, i: usize) anyerror!bool {
                     const wants_ptr = comptime @typeInfo(@TypeOf(yield)).@"fn".param_types[2].? == *V;
                     const result = if (wants_ptr)
-                        try yield(ctx, node.keys[i], &node.values[i])
+                        try yield(ctx, node.keys[i], writableValue(node, i))
                     else
                         try yield(ctx, node.keys[i], node.values[i]);
                     return if (@TypeOf(result) == bool) result else true;
@@ -1323,7 +1341,7 @@ pub fn Tree(
             var remaining = index;
 
             while (true) {
-                if (node.isLeaf()) return EntryMut.init(node.keys[remaining], &node.values[remaining]);
+                if (node.isLeaf()) return EntryMut.init(node.keys[remaining], writableValue(node, remaining));
 
                 const branch = node.branch.?;
                 for (0..node.len) |i| {
@@ -1333,7 +1351,7 @@ pub fn Tree(
                         break;
                     }
                     remaining -= branch.counts[i];
-                    if (remaining == 0) return EntryMut.init(node.keys[i], &node.values[i]);
+                    if (remaining == 0) return EntryMut.init(node.keys[i], writableValue(node, i));
                     remaining -= 1;
                 } else {
                     try self.makeUniqueChild(gpa, node, node.len);
@@ -1505,6 +1523,7 @@ pub fn Tree(
 
         // Removes and returns the item at `index`, shifting later items left.
         pub fn removeItemAt(node: *Node, index: usize) Entry {
+            assertUnique(node);
             const removed = Entry.init(node.keys[index], node.values[index]);
 
             if (index + 1 < node.len) {
@@ -1587,7 +1606,7 @@ pub fn Tree(
             var node = root;
             const old = while (node.branch) |branch| {
                 const found = searchNodeWithPrefix(node, key, val, prefix);
-                try self.makeUniqueChild(gpa, node, found.index);
+                try self.makeUniqueForDelete(gpa, node, found.index);
                 path.push(node, found.index);
                 const child = branch.children[found.index].?;
                 if (found.found) {
@@ -1607,7 +1626,7 @@ pub fn Tree(
                 break :leaf removeItemAt(node, found.index).value;
             };
 
-            try self.unwindDelete(gpa, &path, 1);
+            self.unwindDelete(gpa, &path, 1);
             return old;
         }
 
@@ -1618,7 +1637,7 @@ pub fn Tree(
             var node = start;
             while (node.branch) |branch| {
                 const child_index = node.len;
-                try self.makeUniqueChild(gpa, node, child_index);
+                try self.makeUniqueForDelete(gpa, node, child_index);
                 path.push(node, child_index);
                 node = branch.children[child_index].?;
             }
@@ -1626,24 +1645,27 @@ pub fn Tree(
         }
 
         /// Bottom up fix after `removeMaxAlongPath`. Need to fix the count, and
-        /// let each parent repair undeffull children.
-        fn unwindDelete(self: *Self, gpa: mem.Allocator, path: *const Path, removed: usize) !void {
+        /// let each parent repair undeffull children. Every node it touches
+        /// was made unique on the way down, so it can't fail: an item is
+        /// already gone by the time it runs.
+        fn unwindDelete(self: *Self, gpa: mem.Allocator, path: *const Path, removed: usize) void {
             var i = path.len;
             while (i > 0) {
                 i -= 1;
                 const entry = path.entries[i];
                 entry.node.branch.?.counts[entry.child] -= removed;
-                try self.rebalanceChild(gpa, entry.node, entry.child);
+                self.rebalanceChild(gpa, entry.node, entry.child);
             }
         }
 
         // Restores the minimum size rule for `parent`'s child at `child_index`
-        // by borrowing from a sibling when possible or merging siblings.
-        pub inline fn rebalanceChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
-            if (parent.branch.?.children[child_index].?.len < min_items) try self.rebalanceChildSlow(gpa, parent, child_index);
+        // by borrowing from a sibling when possible or merging siblings. The
+        // child and the sibling it pairs with must already be unique.
+        pub inline fn rebalanceChild(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) void {
+            if (parent.branch.?.children[child_index].?.len < min_items) self.rebalanceChildSlow(gpa, parent, child_index);
         }
 
-        fn rebalanceChildSlow(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
+        fn rebalanceChildSlow(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) void {
             if (parent.len == 0) return;
 
             const branch = parent.branch.?;
@@ -1651,11 +1673,11 @@ pub fn Tree(
             var i = child_index;
             if (i == parent.len) i -= 1;
 
-            try self.makeUniqueChild(gpa, parent, i);
-            try self.makeUniqueChild(gpa, parent, i + 1);
-
             const left = branch.children[i].?;
             const right = branch.children[i + 1].?;
+            assertUnique(parent);
+            assertUnique(left);
+            assertUnique(right);
 
             if (left.len + right.len < max_items) {
                 self.mergeChildren(gpa, parent, i);
@@ -1672,6 +1694,7 @@ pub fn Tree(
             const branch = parent.branch.?;
             const left = branch.children[child_index - 1].?;
             const child = branch.children[child_index].?;
+            std.debug.assert(left.len > min_items);
             const left_index = left.len - 1;
             const promoted_key = left.keys[left_index];
             const promoted_value = left.values[left_index];
@@ -1699,6 +1722,7 @@ pub fn Tree(
             const branch = parent.branch.?;
             const child = branch.children[child_index].?;
             const right = branch.children[child_index + 1].?;
+            std.debug.assert(right.len > min_items);
 
             if (child.branch) |child_branch| {
                 const right_branch = right.branch.?;
@@ -1725,6 +1749,7 @@ pub fn Tree(
             const branch = parent.branch.?;
             const left = branch.children[left_index].?;
             const right = branch.children[left_index + 1].?;
+            std.debug.assert(left.len + right.len < max_items);
 
             insertItemAt(left, left.len, parent.keys[left_index], parent.values[left_index]);
             for (0..right.len) |i| insertItemAt(left, left.len, right.keys[i], right.values[i]);
@@ -1905,6 +1930,7 @@ pub fn Tree(
             var node = root;
             decend: while (true) {
                 if (node.isLeaf()) {
+                    assertUnique(node);
                     const old: Entry = .init(node.keys[remaining], node.values[remaining]);
                     node.keys[remaining] = key;
                     node.values[remaining] = value;
@@ -1924,6 +1950,7 @@ pub fn Tree(
                     remaining -= child_count;
 
                     if (remaining == 0) {
+                        assertUnique(node);
                         const old: Entry = .init(node.keys[i], node.values[i]);
                         node.keys[i] = key;
                         node.values[i] = value;
@@ -1968,19 +1995,22 @@ pub fn Tree(
             var path: Path = .init();
             var node = root;
             while (node.branch) |branch| {
+                // Child 0 and the sibling it rebalances with, as in
+                // makeUniqueForDelete.
                 try self.makeUniqueChild(gpa, node, 0);
+                try self.makeUniqueChild(gpa, node, 1);
                 path.push(node, 0);
                 node = branch.children[0].?;
             }
             const removed = removeItemAt(node, 0);
-            try self.unwindDelete(gpa, &path, 1);
+            self.unwindDelete(gpa, &path, 1);
             return removed;
         }
 
         pub fn deleteMaxFromNode(self: *Self, gpa: mem.Allocator, root: *Node) !Entry {
             var path: Path = .init();
             const removed = try self.removeMaxAlongPath(gpa, &path, root);
-            try self.unwindDelete(gpa, &path, 1);
+            self.unwindDelete(gpa, &path, 1);
             return removed;
         }
 
@@ -1995,7 +2025,7 @@ pub fn Tree(
                     remaining -= child_count;
                     if (remaining == 0) {
                         // The target is separator i: replace it with its predecessor.
-                        try self.makeUniqueChild(gpa, node, i);
+                        try self.makeUniqueForDelete(gpa, node, i);
                         path.push(node, i);
                         const old = Entry.init(node.keys[i], node.values[i]);
                         const replacement = try self.removeMaxAlongPath(gpa, &path, branch.children[i].?);
@@ -2007,11 +2037,11 @@ pub fn Tree(
                     remaining -= 1;
                 } else node.len;
 
-                try self.makeUniqueChild(gpa, node, child_index);
+                try self.makeUniqueForDelete(gpa, node, child_index);
                 path.push(node, child_index);
                 node = branch.children[child_index].?;
             } else removeItemAt(node, remaining);
-            try self.unwindDelete(gpa, &path, 1);
+            self.unwindDelete(gpa, &path, 1);
             return removed;
         }
 
@@ -2053,10 +2083,42 @@ pub fn Tree(
             }
 
             fn flushItems(builder: *@This(), gpa: mem.Allocator) !void {
+                if (builder.pending_items.items.len == 0) return;
+                // Reserve the chunk slots, so a failure can leave the pending
+                // items where they are instead of freeing them.
+                try builder.chunks.ensureUnusedCapacity(gpa, 1);
                 const items = try builder.takePendingItems(gpa);
-                if (items.len == 0) return;
-                errdefer gpa.free(items);
-                try builder.chunks.append(gpa, .{ .items = items });
+                builder.chunks.appendAssumeCapacity(.{ .items = items });
+            }
+
+            // Appends `node` then `entry`, or neither. All or nothing for detaches
+            fn appendNodeThenEntry(
+                builder: *@This(),
+                gpa: mem.Allocator,
+                node: *Node,
+                entry: Entry,
+            ) !void {
+                try builder.flushItems(gpa);
+                try builder.chunks.ensureUnusedCapacity(gpa, 1);
+                try builder.pending_items.ensureUnusedCapacity(gpa, 1);
+                builder.chunks.appendAssumeCapacity(.{ .node = node });
+                builder.pending_items.appendAssumeCapacity(entry);
+            }
+
+            // Appends `entry` and then `node`, or neither.
+            fn appendEntryThenNode(
+                builder: *@This(),
+                gpa: mem.Allocator,
+                entry: Entry,
+                node: *Node,
+            ) !void {
+                try builder.chunks.ensureUnusedCapacity(gpa, 2);
+                try builder.pending_items.append(gpa, entry);
+                builder.flushItems(gpa) catch |err| {
+                    _ = builder.pending_items.pop();
+                    return err;
+                };
+                builder.chunks.appendAssumeCapacity(.{ .node = node });
             }
 
             fn result(builder: *@This(), gpa: mem.Allocator, removed_count: usize) !DeleteRangeResult {
@@ -2091,6 +2153,7 @@ pub fn Tree(
         }
 
         fn deleteRangeFromLeafReturning(gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, offset: usize, index: usize, count: usize, depth: usize) !DeleteRangeChunk {
+            assertUnique(node);
             const floor = if (depth == 0) 0 else min_items - 1;
             const removable = if (node.len > floor) node.len - floor else 0;
             const removed = @min(count, node.len - index, removable);
@@ -2111,12 +2174,12 @@ pub fn Tree(
 
         fn detachChildAndItemAt(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, child_index: usize) !usize {
             _ = self;
+            assertUnique(node);
             const branch = node.branch.?;
             const child = branch.children[child_index].?;
             const removed = branch.counts[child_index] + 1;
 
-            try builder.appendNode(gpa, child);
-            try builder.appendEntry(gpa, Entry.init(node.keys[child_index], node.values[child_index]));
+            try builder.appendNodeThenEntry(gpa, child, Entry.init(node.keys[child_index], node.values[child_index]));
 
             if (child_index + 1 < node.len) {
                 if (comptime @sizeOf(K) != 0) @memmove(node.keys[child_index .. node.len - 1], node.keys[child_index + 1 .. node.len]);
@@ -2136,13 +2199,13 @@ pub fn Tree(
 
         fn detachItemAndRightChildAt(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, node: *Node, index: usize) !usize {
             _ = self;
+            assertUnique(node);
             const branch = node.branch.?;
             const child_index = index + 1;
             const child = branch.children[child_index].?;
             const removed = branch.counts[child_index] + 1;
 
-            try builder.appendEntry(gpa, Entry.init(node.keys[index], node.values[index]));
-            try builder.appendNode(gpa, child);
+            try builder.appendEntryThenNode(gpa, Entry.init(node.keys[index], node.values[index]), child);
 
             if (index + 1 < node.len) {
                 if (comptime @sizeOf(K) != 0) @memmove(node.keys[index .. node.len - 1], node.keys[index + 1 .. node.len]);
@@ -2206,8 +2269,11 @@ pub fn Tree(
                 }
 
                 if (found_separator) {
+                    // Reserve first: once the item is out of the tree,
+                    // handing it to `builder` must not fail.
+                    try builder.pending_items.ensureUnusedCapacity(gpa, 1);
                     const removed = try self.deleteAtFromNode(gpa, node, index);
-                    try builder.appendEntry(gpa, removed);
+                    builder.pending_items.appendAssumeCapacity(removed);
                     break :level .{
                         .start = child_offset,
                         .count = 1,
@@ -2217,6 +2283,12 @@ pub fn Tree(
                 var taken: usize = 0;
                 var remaining_count = count;
                 var chunk: DeleteRangeChunk = .{};
+                // Items detached before a failed detach are already owned by
+                // `builder` so we must stop counting them.
+                errdefer if (chunk.count > 0) {
+                    for (path.slice()) |entry| entry.node.branch.?.counts[entry.child] -= chunk.count;
+                    self.len -= chunk.count;
+                };
                 while (child_index == 0 and i < node.len and node.len > min_items and remaining_count > branch.counts[i]) {
                     if (taken == 0) chunk.start = child_offset;
                     const removed = try self.detachChildAndItemAt(gpa, builder, node, i);
@@ -2238,7 +2310,7 @@ pub fn Tree(
                 if (taken > 0) break :level chunk;
 
                 // we couldn't remove anything at this level. move into child i
-                try self.makeUniqueChild(gpa, node, i);
+                try self.makeUniqueForDelete(gpa, node, i);
                 path.push(node, i);
                 node = branch.children[i].?;
                 offset = child_offset;
@@ -2253,7 +2325,7 @@ pub fn Tree(
                 path.len,
             );
 
-            try self.unwindDelete(gpa, &path, deleted.count);
+            self.unwindDelete(gpa, &path, deleted.count);
             return deleted;
         }
 
@@ -2317,10 +2389,10 @@ pub fn Tree(
                         chunk.releaseOwned(self, gpa);
                         return err;
                     };
-                    if (deleted.count == 0) {
-                        chunk.deinit(gpa);
-                        continue;
-                    }
+                    // Every pending range lies inside the tree, so each
+                    // chunk removes something. Dropping an empty one would
+                    // silently shorten the result.
+                    std.debug.assert(deleted.count > 0);
                     removed += deleted.count;
 
                     const end = index + range_count;
@@ -2376,7 +2448,8 @@ pub fn Tree(
             if (index >= self.len or count == 0) return .{ .removed_count = 0, .chunks = &.{}, .chunk_count = 0 };
 
             var start = index;
-            var end = @min(index + count, self.len);
+            // Clamp before adding: `index + count` can overflow.
+            var end = index + @min(count, self.len - index);
             if (comptime opts.min_exclusive) start += 1;
             if (comptime opts.max_inclusive) end = @min(end + 1, self.len);
             if (end <= start) return .{ .removed_count = 0, .chunks = &.{}, .chunk_count = 0 };
@@ -2462,6 +2535,10 @@ pub fn Tree(
         ) !usize {
             try expectInvariant(node.len <= max_items);
             try expectInvariant(is_root or node.len >= min_items);
+            // The traversal stacks hold `max_height` frames.
+            try expectInvariant(depth < max_height);
+            // Only `copy` shares nodes, and it marks both trees as copied.
+            if (!self.copied) try expectInvariant(node.rc.load(.monotonic) == 0);
 
             for (0..node.len) |i| {
                 const item = Bound{ .key = node.keys[i], .value = node.values[i] };
@@ -2480,6 +2557,16 @@ pub fn Tree(
                 }
                 return node.len;
             };
+
+            // The branch is the one allocated with this node, not another
+            // node's, which a whole-struct copy of a Node would leave behind.
+            const internal: *const InternalNode = @fieldParentPtr("node", node);
+            try expectInvariant(branch == &internal.branch);
+            // Slots past the last child stay empty, because cloning and
+            // shifting children copy them.
+            for (branch.children[node.len + 1 ..], branch.counts[node.len + 1 ..]) |child, count| {
+                try expectInvariant(child == null and count == 0);
+            }
 
             var total: usize = node.len;
             for (0..node.len + 1) |i| {
@@ -2550,11 +2637,12 @@ pub fn Tree(
             if (self.copied) try self.makeUniqueRootSlow(gpa);
         }
 
-        fn makeUniqueRootSlow(self: *Self, gpa: mem.Allocator) !void {
+        inline fn makeUniqueRootSlow(self: *Self, gpa: mem.Allocator) !void {
             const root = self.root orelse return;
             if (root.rc.load(.monotonic) == 0) return;
-            _ = root.rc.fetchSub(1, .acq_rel);
-            self.root = try self.cloneNode(gpa, root);
+            const clone = try self.cloneNode(gpa, root);
+            self.releaseNode(gpa, root);
+            self.root = clone;
         }
 
         // Clones an internal child when it is shared with another
@@ -2563,12 +2651,24 @@ pub fn Tree(
             if (self.copied) try self.makeUniqueChildSlow(gpa, parent, child_index);
         }
 
-        fn makeUniqueChildSlow(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
+        // Clones the child a delete descends into, and the sibling that
+        // rebalanceChild borrows from or merges with on the way back up.
+        // Cloning both before anything is removed means unwindDelete never
+        // allocates, so it can't fail halfway through.
+        inline fn makeUniqueForDelete(self: *Self, gpa: mem.Allocator, node: *Node, child_index: usize) !void {
+            if (!self.copied) return;
+            try self.makeUniqueChildSlow(gpa, node, child_index);
+            const sibling = if (child_index == node.len) child_index - 1 else child_index + 1;
+            try self.makeUniqueChildSlow(gpa, node, sibling);
+        }
+
+        inline fn makeUniqueChildSlow(self: *Self, gpa: mem.Allocator, parent: *Node, child_index: usize) !void {
             const branch = parent.branch.?;
             const child = branch.children[child_index].?;
             if (child.rc.load(.monotonic) == 0) return;
-            _ = child.rc.fetchSub(1, .acq_rel);
-            branch.children[child_index] = try self.cloneNode(gpa, child);
+            const clone = try self.cloneNode(gpa, child);
+            self.releaseNode(gpa, child);
+            branch.children[child_index] = clone;
         }
 
         /// Verifies the tree's internal structure.
@@ -2581,6 +2681,9 @@ pub fn Tree(
                 return;
             };
 
+            // An empty tree has no root, and an internal root that loses its
+            // last item collapses into its only child.
+            try expectInvariant(root.len > 0);
             var leaf_depth: ?usize = null;
             const count = try self.checkNode(root, true, 0, &leaf_depth, null, null);
             try expectInvariant(count == self.len);
@@ -3188,7 +3291,7 @@ test "rebalanceChild merges siblings when their items fit" {
     parent.branch.?.counts[1] = IntTree.subtreeCount(child);
     tree.len = 63;
 
-    try tree.rebalanceChild(testing.allocator, parent, 1);
+    tree.rebalanceChild(testing.allocator, parent, 1);
 
     try testing.expectEqual(0, parent.len);
     try testing.expectEqual(63, left.len);

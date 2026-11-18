@@ -1748,3 +1748,294 @@ test "descendAt propagates errors after starting inside a multi-level tree" {
     try testing.expectEqual(17, ctx.seen);
     try testing.expectEqual(2031, ctx.next);
 }
+
+test "insert keeps every item when splitting the root runs out of memory" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var tree = IntTree.init();
+    defer tree.deinit(gpa);
+
+    // Fill the root leaf exactly, so the next insert has to split it.
+    for (0..IntTree.max_items) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(gpa, key, key * 10));
+    }
+    try testing.expect(tree.root.?.isLeaf());
+
+    // The split allocates two nodes: the right half and the new root. Fail the second.
+    failing.fail_index = failing.alloc_index + 1;
+    try testing.expectError(error.OutOfMemory, tree.insert(gpa, IntTree.max_items, 0));
+    failing.fail_index = std.math.maxInt(usize);
+
+    try tree.checkInvariants();
+    for (0..IntTree.max_items) |i| {
+        const key: isize = @intCast(i);
+        try testing.expectEqual(key * 10, tree.get(key, key * 10));
+    }
+}
+
+fn fillEvenKeys(comptime IntTree: type, tree: *IntTree, gpa: std.mem.Allocator, count: usize) !void {
+    for (0..count) |i| {
+        const key: isize = @intCast(i * 2);
+        try testing.expect(try tree.insert(gpa, key, key * 10));
+    }
+}
+
+test "copy stays independent when cloning its shared root runs out of memory" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var original = IntTree.init();
+    defer original.deinit(gpa);
+    try fillEvenKeys(IntTree, &original, gpa, 3000);
+
+    var copy = original.copy();
+    defer copy.deinit(gpa);
+
+    // The first allocation of a mutation on the copy clones the shared root.
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, copy.insert(gpa, 1, 10));
+    failing.fail_index = std.math.maxInt(usize);
+
+    // The root is still shared, so mutating the original must clone it.
+    try testing.expect(try original.insert(gpa, 3, 30));
+    const still_shared = copy.root == original.root;
+    // Both trees now own the root, but its reference count says only one does.
+    // Restore the missing reference so teardown doesn't double free and crash
+    // the test run.
+    if (still_shared) _ = copy.root.?.rc.fetchAdd(1, .monotonic);
+
+    try testing.expect(!still_shared);
+    try testing.expectEqual(null, copy.get(3, 30));
+    try testing.expectEqual(3000, copy.len);
+    try copy.checkInvariants();
+    try original.checkInvariants();
+}
+
+test "copy stays independent when cloning a shared child runs out of memory" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var original = IntTree.init();
+    defer original.deinit(gpa);
+    try fillEvenKeys(IntTree, &original, gpa, 3000);
+
+    var copy = original.copy();
+    defer copy.deinit(gpa);
+
+    // Let the root clone succeed, then fail cloning its leftmost child.
+    failing.fail_index = failing.alloc_index + 1;
+    try testing.expectError(error.OutOfMemory, copy.insert(gpa, 1, 10));
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(copy.root != original.root);
+
+    // The leftmost child is still shared, so mutating it through the original
+    // must clone it.
+    try testing.expect(try original.insert(gpa, 3, 30));
+    const copy_child = copy.root.?.branch.?.children[0].?;
+    const still_shared = copy_child == original.root.?.branch.?.children[0].?;
+    // Both trees now own the child, but its reference count says only one
+    // does. Restore the missing reference so teardown doesn't free it twice
+    // and crash the test run.
+    if (still_shared) _ = copy_child.rc.fetchAdd(1, .monotonic);
+
+    try testing.expect(!still_shared);
+    try testing.expectEqual(null, copy.get(3, 30));
+    try testing.expectEqual(3000, copy.len);
+    try copy.checkInvariants();
+    try original.checkInvariants();
+}
+
+test "deleteRangeAt leaves a valid tree when an allocation fails" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    // Fail the k-th allocation inside deleteRangeAt, for every k until the
+    // delete succeeds, and check the tree after each failure.
+    var k: usize = 0;
+    while (true) : (k += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var tree = IntTree.init();
+        defer tree.deinit(gpa);
+        for (0..5000) |i| {
+            const key: isize = @intCast(i);
+            try testing.expect(try tree.insert(gpa, key, key * 10));
+        }
+
+        failing.fail_index = failing.alloc_index + k;
+        const result = tree.deleteRangeAt(gpa, 200, 4_300, .{}) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try tree.checkInvariants();
+            continue;
+        };
+        result.deinit(gpa);
+        try testing.expect(k > 0);
+        break;
+    }
+}
+
+fn expectCopyRangeDeleteSurvivesFailures(start: usize, count: usize) !void {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    const n = 2000;
+    // Fail the k-th allocation inside deleteRangeAt on a copy, for every k
+    // until the delete succeeds. Rebalancing on the way back up clones shared
+    // siblings, so some of these failures happen after items were removed.
+    var k: usize = 0;
+    while (true) : (k += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var original = IntTree.init();
+        defer original.deinit(gpa);
+        for (0..n) |i| {
+            const key: isize = @intCast(i);
+            try testing.expect(try original.insert(gpa, key, key * 10));
+        }
+        var copy = original.copy();
+        defer copy.deinit(gpa);
+
+        failing.fail_index = failing.alloc_index + k;
+        const result = copy.deleteRangeAt(gpa, start, count, .{}) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try copy.checkInvariants();
+            try original.checkInvariants();
+            try testing.expectEqual(n, original.len);
+            continue;
+        };
+        result.deinit(gpa);
+        try testing.expectEqual(n - count, copy.len);
+        try original.checkInvariants();
+        try testing.expectEqual(n, original.len);
+        try testing.expect(k > 0);
+        return;
+    }
+}
+
+test "deleteRangeAt on a copy leaves both trees valid when an allocation fails" {
+    // Starting at 200, every chunk is detached or removed from a leaf.
+    try expectCopyRangeDeleteSurvivesFailures(200, 1700);
+    // Starting at 31, a chunk starts at a separator, which is removed through
+    // deleteAtFromNode and its own walk down and back up.
+    try expectCopyRangeDeleteSurvivesFailures(31, 1500);
+}
+
+test "deleteRangeAt clamps a count that would overflow" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+    for (0..10) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+
+    const result = try tree.deleteRangeAt(testing.allocator, 5, std.math.maxInt(usize), .{});
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(5, result.removed_count);
+    try testing.expectEqual(5, tree.len);
+    try tree.checkInvariants();
+}
+
+// Counts live allocations made from any thread. It doesn't use
+// `testing.allocator`, which would report every leaked node separately.
+const CountingAllocator = struct {
+    var live = std.atomic.Value(isize).init(0);
+    const backing = std.heap.smp_allocator;
+    const allocator: std.mem.Allocator = .{
+        .ptr = undefined,
+        .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free },
+    };
+
+    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const ptr = backing.rawAlloc(len, alignment, return_address) orelse return null;
+        _ = live.fetchAdd(1, .monotonic);
+        return ptr;
+    }
+
+    fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        return backing.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        return backing.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        backing.rawFree(memory, alignment, return_address);
+        _ = live.fetchSub(1, .monotonic);
+    }
+};
+
+const SharedTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+
+var threads_may_start = std.atomic.Value(bool).init(false);
+
+fn waitForStart() void {
+    while (!threads_may_start.load(.acquire)) std.atomic.spinLoopHint();
+}
+
+// Runs `work` on two threads that start at the same moment.
+fn runOnTwoThreads(comptime work: anytype, first: anytype, second: anytype) !void {
+    threads_may_start.store(false, .release);
+    const a = try std.Thread.spawn(.{}, work, first);
+    const b = std.Thread.spawn(.{}, work, second) catch |err| {
+        threads_may_start.store(true, .release);
+        a.join();
+        return err;
+    };
+    threads_may_start.store(true, .release);
+    a.join();
+    b.join();
+}
+
+fn releaseWhenStarted(tree: *SharedTree) void {
+    waitForStart();
+    tree.deinit(CountingAllocator.allocator);
+}
+
+fn insertWhenStarted(tree: *SharedTree, key: isize) void {
+    waitForStart();
+    _ = tree.insert(CountingAllocator.allocator, key, key * 10) catch return;
+}
+
+test "copies released on two threads at once free every node" {
+    const gpa = CountingAllocator.allocator;
+    CountingAllocator.live.store(0, .monotonic);
+    // The two threads collide in fewer than one round in a thousand on some
+    // runs, so repeat often.
+    for (0..15_000) |_| {
+        var original = SharedTree.init();
+        try fillEvenKeys(SharedTree, &original, gpa, 200);
+        var copy = original.copy();
+
+        try runOnTwoThreads(releaseWhenStarted, .{&original}, .{&copy});
+
+        try testing.expectEqual(0, CountingAllocator.live.load(.monotonic));
+    }
+}
+
+test "copies mutated on two threads at once stay independent and free every node" {
+    const gpa = CountingAllocator.allocator;
+    CountingAllocator.live.store(0, .monotonic);
+    for (0..500) |_| {
+        var original = SharedTree.init();
+        try fillEvenKeys(SharedTree, &original, gpa, 200);
+        var copy = original.copy();
+
+        // Both keys go into the same leaf, so both threads clone the root
+        // and that leaf.
+        try runOnTwoThreads(insertWhenStarted, .{ &original, 1 }, .{ &copy, 3 });
+
+        try testing.expectEqual(201, original.len);
+        try testing.expectEqual(201, copy.len);
+        try testing.expectEqual(10, original.get(1, 0));
+        try testing.expectEqual(null, original.get(3, 0));
+        try testing.expectEqual(30, copy.get(3, 0));
+        try testing.expectEqual(null, copy.get(1, 0));
+        try original.checkInvariants();
+        try copy.checkInvariants();
+
+        original.deinit(gpa);
+        copy.deinit(gpa);
+        try testing.expectEqual(0, CountingAllocator.live.load(.monotonic));
+    }
+}

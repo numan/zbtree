@@ -691,3 +691,33 @@ test "deleteRangeAt releases every chunk when an allocation fails" {
         break;
     }
 }
+
+// Runs `op` on a copy of a 3,000-item tree. `op` is a function pointer
+// because checkAllAllocationFailures can't pass a comptime function as an
+// extra argument. Setup and teardown use `gpa` too, or the harness would
+// report their memory as leaked.
+fn cowScenario(gpa: Allocator, op: *const fn (*IntTree, Allocator) anyerror!void) !void {
+    var original = IntTree.init();
+    defer original.deinit(gpa);
+    for (0..3000) |i| {
+        const k: isize = @intCast(i * 2);
+        _ = try original.insert(gpa, k, k * 10);
+    }
+    var copy = original.copy();
+    defer copy.deinit(gpa);
+    op(&copy, gpa) catch |err| {
+        try copy.checkInvariants();
+        try original.checkInvariants();
+        return err;
+    };
+    try copy.checkInvariants();
+    try original.checkInvariants();
+}
+
+fn opInsertMany(t: *IntTree, gpa: Allocator) anyerror!void {
+    for (0..200) |i| _ = try t.insert(gpa, @intCast(i * 2 + 1), 0);
+}
+
+test "copy-on-write insert survives every allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, cowScenario, .{&opInsertMany});
+}

@@ -7,4 +7,5 @@ test {
     _ = @import("iterative_tests.zig");
     _ = @import("map_tests.zig");
     _ = @import("order.zig");
+    _ = @import("property_tests.zig");
 }
