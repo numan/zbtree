@@ -663,3 +663,31 @@ test "traversal errors stop deep in the tree" {
     try testing.expectError(error.Stop, tree.descent(*usize, &left, failAt));
     try testing.expectEqual(0, left);
 }
+
+test "deleteRangeAt releases every chunk when an allocation fails" {
+    const TreeType = IntTree;
+    // Fail the k-th allocation made *inside* deleteRangeAt, for every k, so
+    // each error path in the range-deletion loop runs once. testing.allocator
+    // (the backing allocator) reports anything leaked or double-freed.
+    var k: usize = 0;
+    while (true) : (k += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var tree = TreeType.init();
+        defer tree.deinit(gpa);
+        try fillDeep(TreeType, &tree, gpa, 5_000);
+
+        failing.fail_index = failing.alloc_index + k;
+        const result = tree.deleteRangeAt(gpa, 200, 4_300, .{}) catch |err| {
+            // Only ownership is checked here. A failed range delete can
+            // currently leave stale subtree counts (a separate, pre-existing
+            // bug), so checkInvariants is deliberately not called.
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        result.deinit(gpa);
+        try testing.expectEqual(700, tree.len);
+        try testing.expect(k > 0); // the loop really did inject failures
+        break;
+    }
+}

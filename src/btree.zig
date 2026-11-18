@@ -2272,31 +2272,64 @@ pub fn Tree(
             return deleted;
         }
 
-        fn deleteRangeRecursive(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, index: usize, count: usize) anyerror!usize {
-            const end = index + count;
-            var chunk_builder = RangeBuilder.init();
-            var chunk_appended = false;
-            errdefer if (!chunk_appended) chunk_builder.releaseOwned(self, gpa);
+        // Pending work for deleteRangePieces. Popped from a LIFO stack, so it
+        // is pushed in reverse of the order it must run.
+        const RangeWork = union(enum) {
+            /// Delete `count` more items starting at the fixed start index.
+            range: usize,
+            /// A chunk that was already deleted, waiting to be appended to the
+            /// output once everything to its left has been appended.
+            emit: RangeBuilder,
+        };
 
-            const deleted = try self.deleteRangeChunkFromRoot(gpa, &chunk_builder, index, count);
-            if (deleted.count == 0) {
-                chunk_builder.deinit(gpa);
-                return 0;
-            }
+        // Removes `count` items starting at sorted position `index`, one chunk
+        // at a time. A chunk may start after `index`, which leaves a left
+        // remainder that must be emitted before it and a right remainder that
+        // must be emitted after it. An explicit work stack keeps that order.
+        fn deleteRangePieces(self: *Self, gpa: mem.Allocator, builder: *RangeBuilder, index: usize, count: usize) !usize {
+            var work: std.ArrayList(RangeWork) = .empty;
+            defer work.deinit(gpa);
+            // On error, chunks still on the stack were never handed to `builder`.
+            errdefer for (work.items) |*item| switch (item.*) {
+                .emit => |*pending| pending.releaseOwned(self, gpa),
+                .range => {},
+            };
 
-            var removed: usize = deleted.count;
-            if (deleted.start > index) {
-                removed += try self.deleteRangeRecursive(gpa, builder, index, deleted.start - index);
-            }
+            try work.append(gpa, .{ .range = count });
+            var removed: usize = 0;
+            while (work.pop()) |item| switch (item) {
+                .emit => |pending| {
+                    var chunk = pending;
+                    builder.appendBuilder(gpa, &chunk) catch |err| {
+                        chunk.releaseOwned(self, gpa);
+                        return err;
+                    };
+                    chunk.deinit(gpa);
+                },
+                .range => |range_count| {
+                    // Reserve room for the three pushes below first, so that
+                    // after the chunk exists nothing can fail and leave it
+                    // owned by two places at once.
+                    try work.ensureUnusedCapacity(gpa, 3);
 
-            try builder.appendBuilder(gpa, &chunk_builder);
-            chunk_appended = true;
-            chunk_builder.deinit(gpa);
+                    var chunk = RangeBuilder.init();
+                    const deleted = self.deleteRangeChunkFromRoot(gpa, &chunk, index, range_count) catch |err| {
+                        chunk.releaseOwned(self, gpa);
+                        return err;
+                    };
+                    if (deleted.count == 0) {
+                        chunk.deinit(gpa);
+                        continue;
+                    }
+                    removed += deleted.count;
 
-            const deleted_end = deleted.start + deleted.count;
-            if (deleted_end < end) {
-                removed += try self.deleteRangeRecursive(gpa, builder, index, end - deleted_end);
-            }
+                    const end = index + range_count;
+                    const deleted_end = deleted.start + deleted.count;
+                    if (deleted_end < end) work.appendAssumeCapacity(.{ .range = end - deleted_end });
+                    work.appendAssumeCapacity(.{ .emit = chunk });
+                    if (deleted.start > index) work.appendAssumeCapacity(.{ .range = deleted.start - index });
+                },
+            };
             return removed;
         }
 
@@ -2359,7 +2392,7 @@ pub fn Tree(
                 return builder.result(gpa, limit);
             }
 
-            const removed = try self.deleteRangeRecursive(gpa, &builder, start, limit);
+            const removed = try self.deleteRangePieces(gpa, &builder, start, limit);
             return builder.result(gpa, removed);
         }
 
