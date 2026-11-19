@@ -27,6 +27,8 @@ func main() {
 	runs := flag.Int("runs", envInt("R", 50), "number of benchmark runs; median is reported")
 	flag.IntVar(items, "n", *items, "items per benchmark run")
 	flag.IntVar(runs, "r", *runs, "number of benchmark runs; median is reported")
+	keyType := flag.String("type", "", "only run this key type, such as uint64")
+	bench := flag.String("bench", "", "only run this benchmark row, such as get(rand)")
 	flag.Parse()
 	if *items <= 0 || *runs <= 0 {
 		panic("items and runs must be greater than zero")
@@ -34,18 +36,30 @@ func main() {
 
 	fmt.Println("tidwall/btree/v2 (Go, btree.Map)")
 	fmt.Printf("config: go=%s GOMAXPROCS=%d warmups=%d\n", runtime.Version(), runtime.GOMAXPROCS(0), warmupRuns)
-	benchMap[int32](*items, *runs)
-	benchMap[uint64](*items, *runs)
-	benchMap[string](*items, *runs)
+	rows := benchMap[int32](*items, *runs, *keyType, *bench)
+	rows += benchMap[uint64](*items, *runs, *keyType, *bench)
+	rows += benchMap[string](*items, *runs, *keyType, *bench)
+	if rows == 0 {
+		panic("no benchmark matches -type and -bench")
+	}
 }
 
-func benchMap[T keyType](items, runs int) {
+// benchMap runs the selected rows for one key type and returns how many there were.
+func benchMap[T keyType](items, runs int, onlyType, onlyBench string) int {
 	keyName := reflect.TypeFor[T]().Name()
 	if keyName == "" {
 		keyName = reflect.TypeFor[T]().String()
 	}
+	if onlyType != "" && onlyType != keyName {
+		return 0
+	}
+	rows := 0
 	ctx := benchContext[T]{items: items, copyBatchOps: copyBatchCount(items)}
 	run := func(label string, ops int, pre, op func()) {
+		if onlyBench != "" && onlyBench != label {
+			return
+		}
+		rows++
 		runBench(label, ops, runs, func() {
 			seed := benchmarkSeed(keyName, label)
 			ctx.rng = rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
@@ -80,6 +94,7 @@ func benchMap[T keyType](items, runs int) {
 	run("release", ctx.copyBatchOps, ctx.preReleaseCopies, ctx.releaseMany)
 	run("copy", ctx.copyBatchOps, ctx.preFullSeq, ctx.copyMany)
 	fmt.Println()
+	return rows
 }
 
 type benchContext[T keyType] struct {

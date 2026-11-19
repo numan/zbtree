@@ -11,10 +11,26 @@ const warmup_runs = 2;
 
 const AllocatorChoice = enum { smp, arena };
 
+/// Which side of the per-row process isolation this process is.
+const Role = enum {
+    /// The default. Prints the headers and starts one new process per row, so
+    /// that no row inherits allocator state from another.
+    parent,
+    /// Started by a parent with `--child`. Runs its row directly instead of
+    /// spawning again, and prints only that row's result line.
+    child,
+};
+
 const Options = struct {
     items: usize,
     runs: usize,
     allocator: AllocatorChoice = .smp,
+    /// Limits the run to one key type, such as `uint64`.
+    key_type: ?[]const u8 = null,
+    /// Limits the run to one benchmark row, such as `get(rand)`.
+    bench: ?[]const u8 = null,
+    /// Internal; users should not pass `--child`.
+    role: Role = .parent,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -26,16 +42,24 @@ pub fn main(init: std.process.Init) !void {
     const stdout = &stdout_file_writer.interface;
     defer stdout.flush() catch {};
 
-    try stdout.print("\nzbtree_ds (Zig)\n", .{});
-    try stdout.print("config: optimize={s} safety={s} allocator={s} warmups={d}\n", .{
-        optimizeName(builtin.mode),
-        if (std.debug.runtime_safety) "on" else "off",
-        @tagName(options.allocator),
-        warmup_runs,
-    });
-    try benchType(order.OrderedKey(i32, void), "int32", options, allocator, init.io, stdout);
-    try benchType(order.OrderedKey(u64, void), "uint64", options, allocator, init.io, stdout);
-    try benchType(order.OrderedKey([]const u8, void), "string", options, allocator, init.io, stdout);
+    if (options.role == .parent) {
+        try stdout.print("\nzbtree_ds (Zig)\n", .{});
+        try stdout.print("config: optimize={s} safety={s} allocator={s} warmups={d}\n", .{
+            optimizeName(builtin.mode),
+            if (std.debug.runtime_safety) "on" else "off",
+            @tagName(options.allocator),
+            warmup_runs,
+        });
+    }
+    const exe_path = switch (options.role) {
+        .parent => try std.process.executablePathAlloc(init.io, allocator),
+        .child => "",
+    };
+    var rows: usize = 0;
+    rows += try benchType(order.OrderedKey(i32, void), "int32", options, exe_path, allocator, init.io, stdout);
+    rows += try benchType(order.OrderedKey(u64, void), "uint64", options, exe_path, allocator, init.io, stdout);
+    rows += try benchType(order.OrderedKey([]const u8, void), "string", options, exe_path, allocator, init.io, stdout);
+    if (rows == 0) return error.NoMatchingBenchmark;
 }
 
 fn parseOptions(init: std.process.Init, arena: Allocator) !Options {
@@ -66,6 +90,20 @@ fn parseOptions(init: std.process.Init, arena: Allocator) !Options {
             options.allocator = parseAllocatorChoice(args[i]) orelse return error.InvalidAllocatorChoice;
         } else if (std.mem.startsWith(u8, arg, "--allocator=")) {
             options.allocator = parseAllocatorChoice(arg["--allocator=".len..]) orelse return error.InvalidAllocatorChoice;
+        } else if (std.mem.eql(u8, arg, "--type")) {
+            i += 1;
+            if (i == args.len) return error.MissingBenchmarkArgument;
+            options.key_type = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--type=")) {
+            options.key_type = arg["--type=".len..];
+        } else if (std.mem.eql(u8, arg, "--bench")) {
+            i += 1;
+            if (i == args.len) return error.MissingBenchmarkArgument;
+            options.bench = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--bench=")) {
+            options.bench = arg["--bench=".len..];
+        } else if (std.mem.eql(u8, arg, "--child")) {
+            options.role = .child;
         } else {
             return error.UnknownBenchmarkArgument;
         }
@@ -93,14 +131,20 @@ fn envUsize(init: std.process.Init, name: []const u8, default: usize) !usize {
     return std.fmt.parseInt(usize, value, 10);
 }
 
+/// Runs the selected rows for one key type and returns how many there were.
+///
+/// Each row is measured in a process of its own. std.heap.smp_allocator hands
+/// freed nodes back in last-in-first-out order, so in a shared process the
+/// node layout a row sees would depend on which rows ran before it.
 fn benchType(
     comptime Order: type,
     comptime key_name: []const u8,
     options: Options,
+    exe_path: []const u8,
     allocator: Allocator,
     io: Io,
     stdout: *Io.Writer,
-) !void {
+) !usize {
     const K = Order.Key;
     const Map = map.Map(K, usize, .{ .use_string_prefix = Order.use_string_prefix });
     const Ctx = BenchContext(K, Map);
@@ -141,17 +185,62 @@ fn benchType(
         .{ .label = "copy", .ops = .copy_batch, .pre = Ctx.preFullSeq, .op = Ctx.copyMany },
     };
 
-    try stdout.print("Benchmarking {d} items, {s} keys, {d} times, using median\n", .{ options.items, key_name, options.runs });
-
-    inline for (benchmarks) |bench| {
-        const ops = switch (bench.ops) {
-            .items => options.items,
-            .partial_range => partialRangeCount(options.items),
-            .copy_batch => copyBatchCount(options.items),
-        };
-        try runBenchmark(Ctx, options, bench.label, ops, bench.pre, bench.op, allocator, io, stdout);
+    if (options.key_type) |wanted| {
+        if (!std.mem.eql(u8, wanted, key_name)) return 0;
     }
-    try stdout.print("\n", .{});
+    if (options.role == .parent) {
+        try stdout.print("Benchmarking {d} items, {s} keys, {d} times, using median\n", .{ options.items, key_name, options.runs });
+    }
+
+    var rows: usize = 0;
+    inline for (benchmarks) |bench| {
+        if (options.bench == null or std.mem.eql(u8, options.bench.?, bench.label)) {
+            rows += 1;
+            switch (options.role) {
+                .parent => {
+                    // The child writes its row straight to the shared stdout.
+                    try stdout.flush();
+                    try runRowInChild(exe_path, options, key_name, bench.label, allocator, io);
+                },
+                .child => {
+                    const ops = switch (bench.ops) {
+                        .items => options.items,
+                        .partial_range => partialRangeCount(options.items),
+                        .copy_batch => copyBatchCount(options.items),
+                    };
+                    try runBenchmark(Ctx, options, bench.label, ops, bench.pre, bench.op, allocator, io, stdout);
+                },
+            }
+        }
+    }
+    if (options.role == .parent) try stdout.print("\n", .{});
+    return rows;
+}
+
+fn runRowInChild(
+    exe_path: []const u8,
+    options: Options,
+    key_name: []const u8,
+    label: []const u8,
+    arena: Allocator,
+    io: Io,
+) !void {
+    var child = try std.process.spawn(io, .{ .argv = &.{
+        exe_path,
+        "--child",
+        "--items",
+        try std.fmt.allocPrint(arena, "{d}", .{options.items}),
+        "--runs",
+        try std.fmt.allocPrint(arena, "{d}", .{options.runs}),
+        "--allocator",
+        @tagName(options.allocator),
+        "--type",
+        key_name,
+        "--bench",
+        label,
+    } });
+    const term = try child.wait(io);
+    if (!term.success()) return error.BenchmarkChildFailed;
 }
 
 fn BenchContext(comptime K: type, comptime Map: type) type {
