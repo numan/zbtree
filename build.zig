@@ -77,7 +77,7 @@ fn addBenchStep(
 ) void {
     const bench_step = b.step(
         "bench",
-        "Benchmark zbtree_ds against tidwall/btype (needs -Doptimize=safe|fast)",
+        "Benchmark zbtree_ds against tidwall/btree (needs -Doptimize=safe|fast)",
     );
 
     if (!optimize_explicit or optimize == .debug) {
@@ -109,7 +109,7 @@ fn addBenchStep(
     const zig_arena_output = zig_arena_cmd.captureStdOut(.{ .basename = "zig-arena-bench.txt" });
 
     const go_bench_cmd = b.addSystemCommand(&.{ "go", "run", "." });
-    go_bench_cmd.setCwd(b.path("benchmark/reference_btype"));
+    go_bench_cmd.setCwd(b.path("benchmark/reference_btree"));
     go_bench_cmd.has_side_effects = true;
     const go_output = go_bench_cmd.captureStdOut(.{ .basename = "go-bench.txt" });
 

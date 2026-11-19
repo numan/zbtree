@@ -13,7 +13,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/tidwall/btype"
+	"github.com/tidwall/btree/v2"
 )
 
 const warmupRuns = 2
@@ -32,7 +32,7 @@ func main() {
 		panic("items and runs must be greater than zero")
 	}
 
-	fmt.Println("tidwall/btype (Go, btype.Map)")
+	fmt.Println("tidwall/btree/v2 (Go, btree.Map)")
 	fmt.Printf("config: go=%s GOMAXPROCS=%d warmups=%d\n", runtime.Version(), runtime.GOMAXPROCS(0), warmupRuns)
 	benchMap[int32](*items, *runs)
 	benchMap[uint64](*items, *runs)
@@ -85,22 +85,22 @@ func benchMap[T keyType](items, runs int) {
 type benchContext[T keyType] struct {
 	rng          *rand.Rand
 	items        int
-	tree         *btype.Map[T, int]
+	tree         *btree.Map[T, int]
 	keys         []T
 	indices      []int
-	copiedTrees  []*btype.Map[T, int]
+	copiedTrees  []*btree.Map[T, int]
 	copyBatchOps int
 	checksum     int
 }
 
 func (c *benchContext[T]) preInsertSeq() {
-	c.tree = btype.NewMap[T, int]()
+	c.tree = btree.NewMap[T, int]()
 	c.keys = randKeys[T](c.rng, c.items)
 	slices.SortFunc(c.keys, cmp.Compare[T])
 }
 
 func (c *benchContext[T]) preInsertRand() {
-	c.tree = btype.NewMap[T, int]()
+	c.tree = btree.NewMap[T, int]()
 	c.keys = randKeys[T](c.rng, c.items)
 	shuffle(c.rng, c.keys)
 }
@@ -124,9 +124,9 @@ func (c *benchContext[T]) preFullRand() {
 
 func (c *benchContext[T]) preReleaseCopies() {
 	c.fillTree(false)
-	c.copiedTrees = make([]*btype.Map[T, int], c.copyBatchOps)
+	c.copiedTrees = make([]*btree.Map[T, int], c.copyBatchOps)
 	for i := range c.copiedTrees {
-		c.copiedTrees[i] = c.tree.Copy()
+		c.copiedTrees[i] = c.tree.Clone()
 	}
 }
 
@@ -175,7 +175,7 @@ func (c *benchContext[T]) pushFrontAll() {
 func (c *benchContext[T]) getAll() {
 	digest := 0
 	for _, key := range c.keys {
-		value, ok := c.tree.Get(key)
+		value, ok := c.tree.Lookup(key)
 		assert(ok)
 		digest += keyDigest(key) ^ value
 	}
@@ -185,7 +185,7 @@ func (c *benchContext[T]) getAll() {
 func (c *benchContext[T]) getMutAll() {
 	digest := 0
 	for _, key := range c.keys {
-		value, ok := c.tree.GetMut(key)
+		value, ok := c.tree.LookupMut(key)
 		assert(ok)
 		digest += keyDigest(key) ^ value
 	}
@@ -259,7 +259,7 @@ func (c *benchContext[T]) indexOfAll() {
 func (c *benchContext[T]) getAtAll() {
 	digest := 0
 	for _, index := range c.indices {
-		key, value, ok := c.tree.GetAt(index)
+		key, value, ok := c.tree.LookupAt(index)
 		assert(ok)
 		digest += keyDigest(key) ^ value ^ index
 	}
@@ -269,7 +269,7 @@ func (c *benchContext[T]) getAtAll() {
 func (c *benchContext[T]) getAtMutAll() {
 	digest := 0
 	for _, index := range c.indices {
-		key, value, ok := c.tree.GetAtMut(index)
+		key, value, ok := c.tree.LookupAtMut(index)
 		assert(ok)
 		digest += keyDigest(key) ^ value ^ index
 	}
@@ -350,7 +350,7 @@ func (c *benchContext[T]) popBackAll() {
 func (c *benchContext[T]) deleteRangeAtReturning() {
 	count := partialRangeCount(c.items)
 	start := partialRangeStart(c.items, count)
-	removed := c.tree.DeleteRangeAt(start, count)
+	removed := c.tree.DrainAt(start, count)
 	assert(removed.Len() == count)
 	assert(c.tree.Len() == c.items-count)
 	digest := 0
@@ -364,7 +364,7 @@ func (c *benchContext[T]) deleteRangeReturning() {
 	first, last, ok := c.partialRangeBounds()
 	assert(ok)
 	count := partialRangeCount(c.items)
-	removed := c.tree.DeleteRangeOptions(first, last, btype.DeleteRangeOptions{MaxInclusive: true})
+	removed := c.tree.DrainOptions(first, last, btree.DrainOptions{MaxInclusive: true})
 	assert(removed.Len() == count)
 	assert(c.tree.Len() == c.items-count)
 	digest := 0
@@ -377,12 +377,12 @@ func (c *benchContext[T]) deleteRangeReturning() {
 func (c *benchContext[T]) partialRangeBounds() (T, T, bool) {
 	count := partialRangeCount(c.items)
 	start := partialRangeStart(c.items, count)
-	first, _, ok := c.tree.GetAt(start)
+	first, _, ok := c.tree.LookupAt(start)
 	if !ok {
 		var zero T
 		return zero, zero, false
 	}
-	last, _, ok := c.tree.GetAt(start + count - 1)
+	last, _, ok := c.tree.LookupAt(start + count - 1)
 	return first, last, ok
 }
 
@@ -399,7 +399,7 @@ func (c *benchContext[T]) releaseMany() {
 func (c *benchContext[T]) copyMany() {
 	digest := 0
 	for range c.copyBatchOps {
-		copy := c.tree.Copy()
+		copy := c.tree.Clone()
 		digest += copy.Len()
 		copy.Release()
 	}

@@ -371,7 +371,7 @@ const operation_header = "operation";
 fn writeSummary(allocator: Allocator, stdout: *std.Io.Writer, header: Header, zig: Input, zig_arena: Input, go: Input) !void {
     const safety_label = if (std.mem.eql(u8, header.safety, "on")) "ON" else "OFF";
 
-    try stdout.writeAll("zbtree_ds (Zig) vs tidwall/btype (Go)\n");
+    try stdout.writeAll("zbtree_ds (Zig) vs tidwall/btree (Go)\n");
     try writeThousands(stdout, zig.items);
     try stdout.print(" items · median of {d} runs · {s} warmups\n", .{ zig.runs, header.warmups });
     try stdout.print("  Zig        {s} · runtime safety {s} · std.heap.smp_allocator\n", .{ header.optimize, safety_label });

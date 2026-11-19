@@ -15,7 +15,7 @@ pub fn MapConfig(comptime K: type, comptime V: type) type {
     };
 }
 
-/// btype.Map-like key/value collection.
+/// tidwall/btree Map-like key/value collection.
 ///
 /// Items are ordered and identified by key only. Values never participate in
 /// ordering, so inserting the same key with a different value still addresses
