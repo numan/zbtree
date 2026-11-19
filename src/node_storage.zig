@@ -27,7 +27,7 @@ pub fn NodeStorage(
             values: [max_items]V = undefined,
             len: u8 = 0,
             branch: ?*Branch = null,
-            rc: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+            rc: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
             pub fn init() NodeSelf {
                 return .{};
@@ -60,4 +60,12 @@ pub fn NodeStorage(
             branch: Branch,
         };
     };
+}
+
+test "word-sized nodes fit power-of-two allocation sizes" {
+    // std.heap.smp_allocator rounds each allocation up to a power of two, so a
+    // node one byte over the boundary occupies twice the memory.
+    const Storage = NodeStorage(u64, u64, false);
+    try std.testing.expect(@sizeOf(Storage.Node) <= 1024);
+    try std.testing.expect(@sizeOf(Storage.InternalNode) <= 2048);
 }

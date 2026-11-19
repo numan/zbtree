@@ -2585,7 +2585,9 @@ pub fn Tree(
 
         // Adds one shared owner reference to a node for copy-on-write sharing.
         fn retainNode(node: ?*Node) void {
-            if (node) |n| _ = n.rc.fetchAdd(1, .monotonic);
+            const n = node orelse return;
+            const shared = n.rc.fetchAdd(1, .monotonic);
+            std.debug.assert(shared != std.math.maxInt(u32));
         }
 
         // Releases one owner reference. If no shared owner remains, destroys
