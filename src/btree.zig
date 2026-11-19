@@ -283,6 +283,10 @@ pub fn Tree(
             };
         }
 
+        fn useBranchlessReadSearch() bool {
+            return config.search_mode != .linear and usePrimitiveOrderedKeyFastSearch();
+        }
+
         fn usePrimitiveOrderedKeyFastSearch() bool {
             if (K == []const u8) return false;
             return switch (@typeInfo(K)) {
@@ -569,6 +573,34 @@ pub fn Tree(
             while (true) : (i += 1) {
                 if (!orderedKeyLess(node.keys[i], key)) return SearchResult.init(i, orderedKeyEqual(node.keys[i], key));
             }
+        }
+
+        // Node search for lookups that leave the node's items in place. Insert,
+        // delete and indexOf keep searchKeyOnlyWithPrefix: they branch on the
+        // found index straight after the search, and measured slower when the
+        // search itself was branchless.
+        inline fn searchKeyOnlyForRead(node: *const Node, key: K, prefix: u64) SearchResult {
+            if (comptime useBranchlessReadSearch()) return searchPrimitiveOrderedKeyBranchless(node, key);
+            return searchKeyOnlyWithPrefix(node, key, prefix);
+        }
+
+        // Lower-bound binary search whose only branch is the loop count, which
+        // depends on the node length and not on the key.
+        inline fn searchPrimitiveOrderedKeyBranchless(node: *const Node, key: K) SearchResult {
+            const len: usize = node.len;
+            if (len == 0) return SearchResult.init(0, false);
+
+            // Every key before `base` is less than `key`; the answer lies in
+            // the `remaining` keys that start at `base`.
+            var base: usize = 0;
+            var remaining: usize = len;
+            while (remaining > 1) {
+                const half = remaining / 2;
+                base = if (node.keys[base + half - 1] < key) base + half else base;
+                remaining -= half;
+            }
+            base += @intFromBool(node.keys[base] < key);
+            return SearchResult.init(base, base < len and node.keys[base] == key);
         }
 
         inline fn searchPrimitiveOrderedKeyLinear(node: *const Node, key: K) SearchResult {
@@ -910,7 +942,7 @@ pub fn Tree(
             var node = self.root orelse return null;
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             while (true) {
-                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                const found = searchKeyOnlyForRead(node, key, prefix);
                 if (found.found) return node.values[found.index];
                 if (node.branch) |branch| node = branch.children[found.index].? else return null;
             }
@@ -939,7 +971,7 @@ pub fn Tree(
             var node = self.root orelse return null;
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             while (true) {
-                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                const found = searchKeyOnlyForRead(node, key, prefix);
                 if (found.found) return writableValue(node, found.index);
                 if (node.branch) |branch| {
                     try self.makeUniqueChild(gpa, node, found.index);
@@ -1254,7 +1286,7 @@ pub fn Tree(
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             var candidate: ?Entry = null;
             while (true) {
-                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                const found = searchKeyOnlyForRead(node, key, prefix);
                 if (found.index < node.len) candidate = Entry.init(node.keys[found.index], node.values[found.index]);
                 if (found.found) return candidate;
                 if (node.branch) |branch| node = branch.children[found.index].? else return candidate;
@@ -1268,7 +1300,7 @@ pub fn Tree(
             var candidate: ?Entry = null;
 
             while (true) {
-                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                const found = searchKeyOnlyForRead(node, key, prefix);
                 if (!found.found and found.index < node.len) candidate = Entry.init(node.keys[found.index], node.values[found.index]);
 
                 if (found.found) {
@@ -1287,7 +1319,7 @@ pub fn Tree(
             var candidate: ?Entry = null;
 
             while (true) {
-                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                const found = searchKeyOnlyForRead(node, key, prefix);
                 if (found.found) {
                     if (node.branch) |branch| return maxEntry(branch.children[found.index].?);
                     return if (found.index == 0) candidate else Entry.init(node.keys[found.index - 1], node.values[found.index - 1]);
@@ -1451,7 +1483,7 @@ pub fn Tree(
             var node = self.root orelse return null;
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             while (true) {
-                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                const found = searchKeyOnlyForRead(node, key, prefix);
                 if (found.found) return Slot.init(node, found.index);
                 if (node.branch) |branch| {
                     try self.makeUniqueChild(gpa, node, found.index);
@@ -2855,6 +2887,31 @@ test "linear and binary node searches return matching lower bounds" {
     }
 }
 
+test "branchless node search matches linear search at every node length" {
+    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+
+    const node = try tree.newNode(std.testing.allocator, true);
+    defer tree.destroyNode(std.testing.allocator, node);
+
+    for (0..IntTree.max_items + 1) |len| {
+        for (0..len) |i| node.keys[i] = @intCast(10 * (i + 1));
+        node.len = @intCast(len);
+
+        // Covers keys below, equal to, between and above the stored keys.
+        const past_last: isize = @intCast(10 * len + 5);
+        var key: isize = 5;
+        while (key <= past_last) : (key += 5) {
+            const linear = IntTree.searchPrimitiveOrderedKeyLinear(node, key);
+            const branchless = IntTree.searchPrimitiveOrderedKeyBranchless(node, key);
+
+            try testing.expectEqual(linear.index, branchless.index);
+            try testing.expectEqual(linear.found, branchless.found);
+        }
+    }
+}
+
 test "node searches handle empty nodes" {
     const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
     var tree = IntTree.init();
@@ -2870,6 +2927,18 @@ test "node searches handle empty nodes" {
     try testing.expect(!linear.found);
     try testing.expectEqual(0, binary.index);
     try testing.expect(!binary.found);
+}
+
+test "explicit linear search mode opts out of the branchless read search" {
+    const AutoTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const BinaryTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false, .search_mode = .binary });
+    const LinearTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false, .search_mode = .linear });
+    const StringTree = Tree([]const u8, usize, .{ .compare = compareTestStringKey, .search_mode = .binary });
+
+    try testing.expect(AutoTree.useBranchlessReadSearch());
+    try testing.expect(BinaryTree.useBranchlessReadSearch());
+    try testing.expect(!LinearTree.useBranchlessReadSearch());
+    try testing.expect(!StringTree.useBranchlessReadSearch());
 }
 
 test "search mode selects linear or binary node search" {

@@ -21,6 +21,7 @@ const Config = struct {
     optimize: ?[]const u8 = null,
     safety: ?[]const u8 = null,
     allocator: ?[]const u8 = null,
+    search: ?[]const u8 = null,
     go: ?[]const u8 = null,
     gomaxprocs: ?[]const u8 = null,
     warmups: ?[]const u8 = null,
@@ -40,6 +41,7 @@ const Verdict = union(enum) {
 const Header = struct {
     optimize: []const u8,
     safety: []const u8,
+    search: []const u8,
     warmups: []const u8,
     go: []const u8,
     gomaxprocs: []const u8,
@@ -172,6 +174,7 @@ fn validateInputs(zig: Input, zig_arena: Input, go: Input) Error!Header {
     const arena_optimize = try requireField("zig-arena", "optimize", zig_arena.config.optimize);
     const zig_safety = try requireField("zig", "safety", zig.config.safety);
     const arena_safety = try requireField("zig-arena", "safety", zig_arena.config.safety);
+    const zig_search = try requireField("zig", "search", zig.config.search);
     const zig_warmups = try requireField("zig", "warmups", zig.config.warmups);
     const go_warmups = try requireField("go", "warmups", go.config.warmups);
     const go_version = try requireField("go", "go", go.config.go);
@@ -204,6 +207,7 @@ fn validateInputs(zig: Input, zig_arena: Input, go: Input) Error!Header {
     return .{
         .optimize = zig_optimize,
         .safety = zig_safety,
+        .search = zig_search,
         .warmups = zig_warmups,
         .go = go_version,
         .gomaxprocs = go_gomaxprocs,
@@ -247,6 +251,7 @@ fn parseConfigLine(line: []const u8) ?Config {
         if (std.mem.eql(u8, key, "optimize")) config.optimize = value;
         if (std.mem.eql(u8, key, "safety")) config.safety = value;
         if (std.mem.eql(u8, key, "allocator")) config.allocator = value;
+        if (std.mem.eql(u8, key, "search")) config.search = value;
         if (std.mem.eql(u8, key, "go")) config.go = value;
         if (std.mem.eql(u8, key, "GOMAXPROCS")) config.gomaxprocs = value;
         if (std.mem.eql(u8, key, "warmups")) config.warmups = value;
@@ -374,7 +379,7 @@ fn writeSummary(allocator: Allocator, stdout: *std.Io.Writer, header: Header, zi
     try stdout.writeAll("zbtree_ds (Zig) vs tidwall/btree (Go)\n");
     try writeThousands(stdout, zig.items);
     try stdout.print(" items · median of {d} runs · {s} warmups\n", .{ zig.runs, header.warmups });
-    try stdout.print("  Zig        {s} · runtime safety {s} · std.heap.smp_allocator\n", .{ header.optimize, safety_label });
+    try stdout.print("  Zig        {s} · runtime safety {s} · std.heap.smp_allocator · search mode {s}\n", .{ header.optimize, safety_label, header.search });
     try stdout.writeAll("  Zig arena  same build · per-sample ArenaAllocator (reference only, not scored)\n");
     try stdout.print("  Go         {s} · GOMAXPROCS={s} · bounds checks ON\n", .{ header.go, header.gomaxprocs });
     try stdout.writeAll("ns/op = median time per operation, lower is better.\n");
@@ -490,10 +495,11 @@ test "parseBenchmarkLine reads label and comma-separated ops/sec from both harne
 }
 
 test "parseConfigLine reads zig and go config lines" {
-    const zig = parseConfigLine("config: optimize=ReleaseFast safety=off allocator=smp warmups=2").?;
+    const zig = parseConfigLine("config: optimize=ReleaseFast safety=off allocator=smp search=binary warmups=2").?;
     try std.testing.expectEqualStrings("ReleaseFast", zig.optimize.?);
     try std.testing.expectEqualStrings("off", zig.safety.?);
     try std.testing.expectEqualStrings("smp", zig.allocator.?);
+    try std.testing.expectEqualStrings("binary", zig.search.?);
     try std.testing.expectEqualStrings("2", zig.warmups.?);
     try std.testing.expect(zig.go == null);
 

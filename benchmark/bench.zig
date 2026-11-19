@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const zbtree_ds = @import("zbtree_ds");
 const map = zbtree_ds.map;
 const order = zbtree_ds.order;
@@ -8,6 +9,13 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const warmup_runs = 2;
+
+/// Node search the benchmarked maps use, set with `-Dsearch-mode`.
+const search_mode: map.SearchMode = switch (build_options.search_mode) {
+    .auto => .auto,
+    .binary => .binary,
+    .linear => .linear,
+};
 
 const AllocatorChoice = enum { smp, arena };
 
@@ -44,10 +52,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (options.role == .parent) {
         try stdout.print("\nzbtree_ds (Zig)\n", .{});
-        try stdout.print("config: optimize={s} safety={s} allocator={s} warmups={d}\n", .{
+        try stdout.print("config: optimize={s} safety={s} allocator={s} search={s} warmups={d}\n", .{
             optimizeName(builtin.mode),
             if (std.debug.runtime_safety) "on" else "off",
             @tagName(options.allocator),
+            @tagName(search_mode),
             warmup_runs,
         });
     }
@@ -146,7 +155,7 @@ fn benchType(
     stdout: *Io.Writer,
 ) !usize {
     const K = Order.Key;
-    const Map = map.Map(K, usize, .{ .use_string_prefix = Order.use_string_prefix });
+    const Map = map.Map(K, usize, .{ .use_string_prefix = Order.use_string_prefix, .search_mode = search_mode });
     const Ctx = BenchContext(K, Map);
 
     // How many operations one timed sample performs, used to compute ns/op.

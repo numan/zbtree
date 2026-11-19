@@ -1,9 +1,16 @@
 const std = @import("std");
 
+const SearchMode = enum { auto, binary, linear };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize_explicit = b.user_input_options.contains("optimize");
     const optimize = b.standardOptimizeOption(.{});
+    const search_mode = b.option(
+        SearchMode,
+        "search-mode",
+        "Node search of the benchmarked maps: auto (default), binary or linear",
+    ) orelse .auto;
 
     const zbtree_module = b.addModule("zbtree_ds", .{
         .root_source_file = b.path("src/root.zig"),
@@ -26,7 +33,7 @@ pub fn build(b: *std.Build) void {
     });
 
     addRunStep(b, exe);
-    addBenchStep(b, target, optimize, optimize_explicit, zbtree_module, compare_module);
+    addBenchStep(b, target, optimize, optimize_explicit, search_mode, zbtree_module, compare_module);
     addTestStep(b, zbtree_module, exe, compare_module);
 }
 
@@ -72,6 +79,7 @@ fn addBenchStep(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     optimize_explicit: bool,
+    search_mode: SearchMode,
     zbtree_module: *std.Build.Module,
     compare_module: *std.Build.Module,
 ) void {
@@ -92,6 +100,10 @@ fn addBenchStep(
         .optimize = optimize,
         .zbtree_module = zbtree_module,
     });
+    const bench_options = b.addOptions();
+    bench_options.addOption(SearchMode, "search_mode", search_mode);
+    bench_exe.root_module.addOptions("build_options", bench_options);
+
     const compare_exe = b.addExecutable(.{
         .name = "zbtree_ds-bench-compare",
         .root_module = compare_module,
