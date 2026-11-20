@@ -2674,6 +2674,11 @@ pub fn Tree(
         inline fn makeUniqueRootSlow(self: *Self, gpa: mem.Allocator) !void {
             const root = self.root orelse return;
             if (root.rc.load(.monotonic) == 0) return;
+            try self.cloneSharedRoot(gpa, root);
+        }
+
+        // `noinline` to improve performance of `getMut`
+        noinline fn cloneSharedRoot(self: *Self, gpa: mem.Allocator, root: *Node) !void {
             const clone = try self.cloneNode(gpa, root);
             self.releaseNode(gpa, root);
             self.root = clone;
@@ -2700,6 +2705,11 @@ pub fn Tree(
             const branch = parent.branch.?;
             const child = branch.children[child_index].?;
             if (child.rc.load(.monotonic) == 0) return;
+            try self.cloneSharedChild(gpa, branch, child_index, child);
+        }
+
+        // `noinline` to improve performance of `getMut`
+        noinline fn cloneSharedChild(self: *Self, gpa: mem.Allocator, branch: *Branch, child_index: usize, child: *Node) !void {
             const clone = try self.cloneNode(gpa, child);
             self.releaseNode(gpa, child);
             branch.children[child_index] = clone;
