@@ -1393,38 +1393,46 @@ pub fn Tree(
         }
 
         /// Returns the zero-based sorted position of `key`/`val`.
-        /// Returns `null` when no equal item exists.
-        pub fn indexOf(self: *const Self, key: K, val: V) ?usize {
-            var node = self.root orelse return null;
+        ///
+        /// When no equal item exists, `found` is false and `index` is the
+        /// position at which the item would be inserted.
+        pub fn indexOf(self: *const Self, key: K, val: V) RankResult {
+            var node = self.root orelse return RankResult.init(0, false);
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             var skipped: usize = 0;
 
             while (true) {
                 const found = searchNodeWithPrefix(node, key, val, prefix);
-                if (node.isLeaf()) return if (found.found) skipped + found.index else null;
+                if (node.isLeaf()) {
+                    if (found.found) return RankResult.init(skipped + found.index, true);
+                    return RankResult.init(skipped + found.index, false);
+                }
 
                 const branch = node.branch.?;
                 skipped += found.index;
                 for (0..found.index) |i| skipped += branch.counts[i];
-                if (found.found) return skipped + branch.counts[found.index];
+                if (found.found) return RankResult.init(skipped + branch.counts[found.index], true);
                 node = branch.children[found.index].?;
             }
         }
 
-        pub fn indexOfKey(self: *const Self, key: K) ?usize {
+        pub fn indexOfKey(self: *const Self, key: K) RankResult {
             requireOrderedKeyMode();
-            var node = self.root orelse return null;
+            var node = self.root orelse return RankResult.init(0, false);
             const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
             var skipped: usize = 0;
 
             while (true) {
                 const found = searchKeyOnlyWithPrefix(node, key, prefix);
-                if (node.isLeaf()) return if (found.found) skipped + found.index else null;
+                if (node.isLeaf()) {
+                    if (found.found) return RankResult.init(skipped + found.index, true);
+                    return RankResult.init(skipped + found.index, false);
+                }
 
                 const branch = node.branch.?;
                 skipped += found.index;
                 for (0..found.index) |i| skipped += branch.counts[i];
-                if (found.found) return skipped + branch.counts[found.index];
+                if (found.found) return RankResult.init(skipped + branch.counts[found.index], true);
                 node = branch.children[found.index].?;
             }
         }
@@ -2452,24 +2460,6 @@ pub fn Tree(
             return removed;
         }
 
-        fn rankOf(self: *const Self, key: K, value: V) RankResult {
-            var node = self.root orelse return RankResult.init(0, false);
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
-            var skipped: usize = 0;
-
-            while (true) {
-                const found = searchNodeWithPrefix(node, key, value, prefix);
-                if (node.isLeaf()) return RankResult.init(found.index + skipped, found.found);
-
-                const branch = node.branch.?;
-                skipped += found.index;
-                for (0..found.index) |i| skipped += branch.counts[i];
-                if (found.found) return RankResult.init(skipped + branch.counts[found.index], true);
-
-                node = branch.children[found.index].?;
-            }
-        }
-
         /// Removes up to `count` items starting at sorted position `index`.
         ///
         /// Ranges past the end are clamped, and empty or out-of-range requests
@@ -2521,7 +2511,7 @@ pub fn Tree(
             max_value: V,
             comptime opts: DeleteRangeOptions,
         ) !DeleteRangeResult {
-            return self.deleteRangeByRank(gpa, self.rankOf(min_key, min_value), self.rankOf(max_key, max_value), opts);
+            return self.deleteRangeByRank(gpa, self.indexOf(min_key, min_value), self.indexOf(max_key, max_value), opts);
         }
 
         pub fn deleteRangeKey(
@@ -3418,7 +3408,7 @@ test "replaceAt updates leaf and internal positions without reordering" {
     const separator = (try tree.replaceAt(testing.allocator, 32, 315, -315)).?;
     try testing.expectEqual(320, separator.key);
     try testing.expectEqual(315, tree.getAt(32).?.key);
-    try testing.expect(tree.indexOf(320, 0) == null);
+    try testing.expect(!tree.indexOf(320, 0).found);
     try testing.expectEqual(-315, tree.get(315, 0).?);
 
     const last_index = tree.len - 1;
@@ -3464,7 +3454,7 @@ test "deleteAt removes leaf separator and edge entries" {
     try testing.expectEqual(31, separator.key);
     try testing.expectEqual(-31, separator.value);
     try testing.expectEqual(199, tree.len);
-    try testing.expect(tree.indexOf(31, 0) == null);
+    try testing.expect(!tree.indexOf(31, 0).found);
     try testing.expectEqual(32, tree.getAt(31).?.key);
 
     const first = (try tree.deleteAt(testing.allocator, 0)).?;

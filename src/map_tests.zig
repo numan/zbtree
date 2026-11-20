@@ -103,6 +103,11 @@ fn expectMapEntry(entry: anytype, key: i32, value: i32) !void {
     try testing.expectEqual(value, entry.?.value);
 }
 
+fn expectIndexOf(index: usize, found: bool, result: anytype) !void {
+    try testing.expectEqual(index, result.index);
+    try testing.expectEqual(found, result.found);
+}
+
 fn expectOptionalMapEntry(entry: anytype, expected: ?Pair) !void {
     if (expected) |pair| {
         try expectMapEntry(entry, pair.key, pair.value);
@@ -205,12 +210,12 @@ fn expectMapMatchesOracle(comptime MapType: type, m: *const MapType, present: *c
             last = .{ .key = key, .value = expected };
 
             try testing.expectEqual(expected, m.get(key));
-            try testing.expectEqual(expected_len, m.indexOf(key).?);
+            try expectIndexOf(expected_len, true, m.indexOf(key));
             try expectMapEntry(m.getAt(expected_len), key, expected);
             expected_len += 1;
         } else {
             try testing.expectEqual(null, m.get(key));
-            try testing.expectEqual(null, m.indexOf(key));
+            try expectIndexOf(expected_len, false, m.indexOf(key));
         }
 
         try expectOptionalMapEntry(m.seek(key), expectedAtOrAfter(present, values, i));
@@ -300,7 +305,9 @@ test "map facade forwards ordered traversal and index APIs" {
 
     try expectMapEntry(m.front(), 1, 10);
     try expectMapEntry(m.back(), 5, 50);
-    try testing.expectEqual(2, m.indexOf(3));
+    const rank: IntMap.RankResult = m.indexOf(3);
+    try expectIndexOf(2, true, rank);
+    try expectIndexOf(5, false, m.indexOf(6));
     try expectMapEntry(m.seek(4), 4, 40);
     try expectMapEntry(m.seekNext(3), 4, 40);
     try expectMapEntry(m.seekPrev(3), 2, 20);

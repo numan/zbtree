@@ -453,8 +453,9 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
         pub fn indexOfAll(self: *Self) !void {
             var digest: usize = 0;
             for (self.keys) |key| {
-                const index = self.tree.indexOf(key) orelse return error.BenchmarkMissingKey;
-                digest +%= digestKey(key) ^ index;
+                const rank = self.tree.indexOf(key);
+                if (!rank.found) return error.BenchmarkMissingKey;
+                digest +%= digestKey(key) ^ rank.index;
             }
             self.record(digest);
         }

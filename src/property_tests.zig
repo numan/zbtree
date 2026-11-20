@@ -591,16 +591,15 @@ fn Suite(comptime spec: Spec) type {
                     const want_seek: ?Item = if (at.index < items.len) items[at.index] else null;
                     const want_next: ?Item = if (next < items.len) items[next] else null;
                     const want_prev: ?Item = if (at.index > 0) items[at.index - 1] else null;
-                    const want_index: ?usize = if (at.found) at.index else null;
 
                     try expectValue("get", n, tree.get(key, value), found);
-                    try expectIndex("indexOf", n, tree.indexOf(key, value), want_index);
+                    try expectIndex("indexOf", n, tree.indexOf(key, value), at);
                     try expectEntry("seek", n, tree.seek(key, value), want_seek);
                     try expectEntry("seekNext", n, tree.seekNext(key, value), want_next);
                     try expectEntry("seekPrev", n, tree.seekPrev(key, value), want_prev);
                     if (comptime ordered) {
                         try expectValue("getKey", n, tree.getKey(key), found);
-                        try expectIndex("indexOfKey", n, tree.indexOfKey(key), want_index);
+                        try expectIndex("indexOfKey", n, tree.indexOfKey(key), at);
                         try expectEntry("seekKey", n, tree.seekKey(key), want_seek);
                         try expectEntry("seekNextKey", n, tree.seekNextKey(key), want_next);
                         try expectEntry("seekPrevKey", n, tree.seekPrevKey(key), want_prev);
@@ -644,8 +643,10 @@ fn Suite(comptime spec: Spec) type {
                 if (tagOf(value) != item.tag) return violation(name ++ "({d}) returned value #{d} instead of #{d}", .{ n, tagOf(value), item.tag });
             }
 
-            fn expectIndex(comptime name: []const u8, n: isize, got: ?usize, want: ?usize) !void {
-                if (!std.meta.eql(got, want)) return violation(name ++ "({d}) returned {any} instead of {any}", .{ n, got, want });
+            fn expectIndex(comptime name: []const u8, n: isize, got: Tree.RankResult, want: Position) !void {
+                if (got.index != want.index or got.found != want.found) {
+                    return violation(name ++ "({d}) returned index {d} (found: {}) instead of index {d} (found: {})", .{ n, got.index, got.found, want.index, want.found });
+                }
             }
 
             /// Cheap enough to run after every operation.

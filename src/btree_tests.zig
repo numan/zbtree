@@ -56,6 +56,11 @@ fn expectRemovedCount(expected: usize, result: anytype) !void {
     try testing.expectEqual(expected, result.removed_count);
 }
 
+fn expectIndexOf(index: usize, found: bool, result: anytype) !void {
+    try testing.expectEqual(index, result.index);
+    try testing.expectEqual(found, result.found);
+}
+
 const CollectLimitContext = struct {
     items: [300]Pair = undefined,
     len: usize = 0,
@@ -226,7 +231,7 @@ test "ordered-key btree supports ordered access and key-bounded range deletion" 
 
     try testing.expectEqual(@as(isize, 0), tree.front().?.key);
     try testing.expectEqual(@as(isize, 6), tree.back().?.key);
-    try testing.expectEqual(@as(?usize, 3), tree.indexOfKey(3));
+    try expectIndexOf(3, true, tree.indexOfKey(3));
     try testing.expectEqual(@as(isize, 4), tree.seekKey(4).?.key);
     try testing.expectEqual(@as(isize, 4), tree.seekNextKey(3).?.key);
     try testing.expectEqual(@as(isize, 2), tree.seekPrevKey(3).?.key);
@@ -369,7 +374,7 @@ test "string prefixes route searches across split root" {
     try testing.expectEqual(31, tree.get("key-031", 0).?);
     try testing.expectEqual(32, tree.get("key-032", 0).?);
     try testing.expectEqual(79, tree.get("key-079", 0).?);
-    try testing.expectEqual(15, tree.indexOf("key-015", 0).?);
+    try expectIndexOf(15, true, tree.indexOf("key-015", 0));
     try testing.expectEqualStrings("key-016", tree.seekNext("key-015", 0).?.key);
     try tree.checkInvariants();
 }
@@ -405,7 +410,7 @@ test "binary string search works with prefix routing and collisions" {
     try testing.expectEqualStrings("abcdefgh-064", tree.seek("abcdefgh-064", 0).?.key);
     try testing.expectEqualStrings("abcdefgh-065", tree.seekNext("abcdefgh-064", 0).?.key);
     try testing.expectEqualStrings("abcdefgh-063", tree.seekPrev("abcdefgh-064", 0).?.key);
-    try testing.expectEqual(64, tree.indexOf("abcdefgh-064", 0).?);
+    try expectIndexOf(64, true, tree.indexOf("abcdefgh-064", 0));
     try testing.expect(tree.get("abcdefgh-999", 0) == null);
     try tree.checkInvariants();
 }
@@ -449,7 +454,7 @@ test "append-only inserts preserve indexes after repeated right-edge splits" {
         const entry = tree.getAt(i).?;
         try testing.expectEqual(key, entry.key);
         try testing.expectEqual(-key, entry.value);
-        try testing.expectEqual(i, tree.indexOf(key, 0).?);
+        try expectIndexOf(i, true, tree.indexOf(key, 0));
     }
     try tree.checkInvariants();
 }
@@ -469,7 +474,7 @@ test "append-only string inserts preserve prefix routing after splits" {
         var expected_buffer: [12]u8 = undefined;
         const expected = fillKey(expected_buffer[0..], "key", i);
         try testing.expectEqualStrings(expected, tree.getAt(i).?.key);
-        try testing.expectEqual(i, tree.indexOf(expected, 0).?);
+        try expectIndexOf(i, true, tree.indexOf(expected, 0));
         try testing.expectEqual(i, tree.get(expected, 0).?);
     }
     try tree.checkInvariants();
@@ -516,7 +521,7 @@ test "default comparator can order equal keys by value" {
     try testing.expectEqual(2, tree.len);
     try testing.expectEqual(100, tree.getAt(0).?.value);
     try testing.expectEqual(200, tree.getAt(1).?.value);
-    try testing.expectEqual(1, tree.indexOf(10, 200).?);
+    try expectIndexOf(1, true, tree.indexOf(10, 200));
     try tree.checkInvariants();
 }
 
@@ -537,7 +542,7 @@ test "binary search mode preserves lookup and index behavior after splits" {
     for (0..512) |i| {
         const key: isize = @intCast(i * 2);
         try testing.expectEqual(-key, tree.get(key, 0).?);
-        try testing.expectEqual(i, tree.indexOf(key, 0).?);
+        try expectIndexOf(i, true, tree.indexOf(key, 0));
         try testing.expectEqual(key, tree.getAt(i).?.key);
     }
 
@@ -650,7 +655,7 @@ test "set replaces values after node splits without changing counts" {
         const key: isize = @intCast(i);
         const expected = if (i % 3 == 0) -key else key * 10;
         try testing.expectEqual(expected, tree.get(key, 0).?);
-        try testing.expectEqual(i, tree.indexOf(key, 0).?);
+        try expectIndexOf(i, true, tree.indexOf(key, 0));
     }
     try tree.checkInvariants();
 }
@@ -721,7 +726,7 @@ test "delete removes internal keys and preserves indexed order" {
         const entry = tree.getAt(index).?;
         try testing.expectEqual(key, entry.key);
         try testing.expectEqual(key * 10, entry.value);
-        try testing.expectEqual(index, tree.indexOf(key, 0).?);
+        try expectIndexOf(index, true, tree.indexOf(key, 0));
         index += 1;
     }
     try testing.expectEqual(tree.len, index);
@@ -868,7 +873,7 @@ test "insertAt inserts only when the item fits at the index" {
     try testing.expectEqual(4, tree.len);
     for ([_]isize{ 5, 10, 15, 20 }, 0..) |key, index| {
         try testing.expectEqual(key, tree.getAt(index).?.key);
-        try testing.expectEqual(index, tree.indexOf(key, 0).?);
+        try expectIndexOf(index, true, tree.indexOf(key, 0));
     }
     try tree.checkInvariants();
 }
@@ -1193,15 +1198,15 @@ test "deleteRange honors value tie breakers" {
 
     try expectRemovedCount(5, try tree.deleteRange(testing.allocator, 10, 2, 10, 7, .{}));
     for ([_]isize{ 2, 3, 4, 5, 6 }) |value| {
-        try testing.expect(tree.indexOf(10, value) == null);
+        try testing.expect(!tree.indexOf(10, value).found);
     }
     for ([_]isize{ 0, 1, 7, 8, 9 }, [_]usize{ 1, 2, 3, 4, 5 }) |value, index| {
-        try testing.expectEqual(index, tree.indexOf(10, value).?);
+        try expectIndexOf(index, true, tree.indexOf(10, value));
     }
 
     try expectRemovedCount(2, try tree.deleteRange(testing.allocator, 10, 7, 10, 8, .{ .max_inclusive = true }));
-    try testing.expect(tree.indexOf(10, 7) == null);
-    try testing.expect(tree.indexOf(10, 8) == null);
+    try testing.expect(!tree.indexOf(10, 7).found);
+    try testing.expect(!tree.indexOf(10, 8).found);
     try testing.expectEqual(5, tree.len);
     try testing.expectEqual(9, tree.front().?.key);
     try testing.expectEqual(11, tree.back().?.key);
@@ -1596,13 +1601,13 @@ test "getAt and indexOf use subtree counts" {
         const entry = tree.getAt(i).?;
         try testing.expectEqual(key, entry.key);
         try testing.expectEqual(-key, entry.value);
-        try testing.expectEqual(i, tree.indexOf(entry.key, entry.value).?);
+        try expectIndexOf(i, true, tree.indexOf(entry.key, entry.value));
     }
 
     try testing.expect(tree.getAt(8000) == null);
-    try testing.expect(tree.indexOf(-2, 0) == null);
-    try testing.expect(tree.indexOf(1, 0) == null);
-    try testing.expect(tree.indexOf(16_000, 0) == null);
+    try expectIndexOf(0, false, tree.indexOf(-2, 0));
+    try expectIndexOf(1, false, tree.indexOf(1, 0));
+    try expectIndexOf(8000, false, tree.indexOf(16_000, 0));
     try tree.checkInvariants();
 }
 

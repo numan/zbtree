@@ -71,6 +71,7 @@ pub fn Map(
         pub const Entry = Base.Entry;
         pub const EntryMut = Base.EntryMut;
         pub const DeleteRangeResult = Base.DeleteRangeResult;
+        pub const RankResult = Base.RankResult;
 
         pub fn init() Self {
             return .{};
@@ -154,7 +155,11 @@ pub fn Map(
             return self.tree.getAtMut(gpa, index);
         }
 
-        pub fn indexOf(self: *const Self, key: K) ?usize {
+        /// Returns the zero-based sorted position of `key`.
+        ///
+        /// When the key is absent, `found` is false and `index` is the
+        /// position at which it would be inserted.
+        pub fn indexOf(self: *const Self, key: K) RankResult {
             return self.tree.indexOfKey(key);
         }
 
