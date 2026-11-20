@@ -362,7 +362,7 @@ pub fn Tree(
                         depth += 1;
                         continue;
                     }
-                    const internal: *InternalNode = @fieldParentPtr("branch", branch);
+                    const internal: *InternalNode = @fieldParentPtr("node", node);
                     gpa.destroy(internal);
                 } else {
                     gpa.destroy(node);
