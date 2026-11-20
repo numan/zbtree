@@ -2492,11 +2492,13 @@ pub fn Tree(
         }
 
         pub fn deleteRangeByRank(self: *Self, gpa: mem.Allocator, min_rank: RankResult, max_rank: RankResult, comptime opts: DeleteRangeOptions) !DeleteRangeResult {
+            // Saturating, because a caller may pass any rank, and positions
+            // past the end delete nothing.
             var start = min_rank.index;
-            if (opts.min_exclusive and min_rank.found) start += 1;
+            if (opts.min_exclusive and min_rank.found) start +|= 1;
 
             var end = max_rank.index;
-            if (opts.max_inclusive and max_rank.found) end += 1;
+            if (opts.max_inclusive and max_rank.found) end +|= 1;
 
             if (end <= start) return .{ .removed_count = 0, .chunks = &.{}, .chunk_count = 0 };
             return self.deleteRangeAt(gpa, start, end - start, .{});

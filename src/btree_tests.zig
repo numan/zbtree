@@ -1940,6 +1940,28 @@ test "deleteRangeAt clamps a count that would overflow" {
     try tree.checkInvariants();
 }
 
+test "deleteRangeByRank handles ranks at the largest index" {
+    const IntTree = btree.Tree(isize, isize, .{ .compare = compareIntKey, .use_string_prefix = false });
+    var tree = IntTree.init();
+    defer tree.deinit(testing.allocator);
+    for (0..10) |i| {
+        const key: isize = @intCast(i);
+        try testing.expect(try tree.insert(testing.allocator, key, key * 10));
+    }
+    const last: IntTree.RankResult = .{ .index = std.math.maxInt(usize), .found = true };
+
+    const to_end = try tree.deleteRangeByRank(testing.allocator, .{ .index = 2, .found = true }, last, .{ .max_inclusive = true });
+    defer to_end.deinit(testing.allocator);
+    try testing.expectEqual(8, to_end.removed_count);
+    try testing.expectEqual(2, tree.len);
+
+    const reversed = try tree.deleteRangeByRank(testing.allocator, last, .{ .index = 1, .found = false }, .{ .min_exclusive = true });
+    defer reversed.deinit(testing.allocator);
+    try testing.expectEqual(0, reversed.removed_count);
+    try testing.expectEqual(2, tree.len);
+    try tree.checkInvariants();
+}
+
 // Counts live allocations made from any thread. It doesn't use
 // `testing.allocator`, which would report every leaked node separately.
 const CountingAllocator = struct {

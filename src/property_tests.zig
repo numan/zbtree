@@ -2,10 +2,14 @@
 //!
 //! Each test runs many random cases. A case applies a random sequence of
 //! operations to one or more trees and to a sorted-array model of each tree,
-//! and makes allocations fail at random points inside the operations. The
-//! cases run against several tree configurations: integer and string keys,
-//! string prefixes, linear and binary search, ordered-key mode, values that
-//! break ties between equal keys, and `void` values.
+//! and makes allocations fail at random points inside the operations: either
+//! one allocation and every later one, or one allocation alone. The cases run
+//! against several tree configurations: integer, string, enum, and float
+//! keys, string prefixes, linear and binary search, ordered-key mode, values
+//! that break ties between equal keys, `void` values, and `Map`. String keys
+//! include keys shorter than 8 bytes, zero and 0xFF bytes, and long keys that
+//! share their first 8 bytes. Some range delete results are kept while later
+//! operations run, and released after the trees they came from.
 //!
 //! The properties:
 //!
@@ -21,18 +25,25 @@
 //! * Structure: `checkInvariants` passes, also right after a failure.
 //! * Ownership: every node and value a tree can reach is live, no value is
 //!   stored in two places, each node's reference count matches the number of
-//!   trees and parent nodes that point to it, nothing is live that no tree
-//!   can reach, and nothing is freed twice.
-//! * Copies: mutating one tree never changes another.
+//!   trees, parent nodes, and kept range delete results that point to it,
+//!   nothing is live that no tree or result can reach, and nothing is freed
+//!   twice.
+//! * Copies: mutating one tree never changes another, or a kept range delete
+//!   result.
 //!
 //! The seed is `std.testing.random_seed`, which is random on every test run.
 //! A failure prints it, and `zig build test --seed=0x<seed>` reruns the same
 //! cases. `zig build test` caches a passing run until the code changes. To
 //! run these tests again with a new seed, use
 //! `zig test src/root.zig --test-filter property_tests`.
+//!
+//! Each case draws its operations, its allocation failures, and its checks
+//! from separate random streams, so a change to the checks doesn't change
+//! the operations a seed produces.
 
 const std = @import("std");
 const btree = @import("btree.zig");
+const Map = @import("map.zig").Map;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
@@ -46,6 +57,9 @@ const TrackingAllocator = struct {
     /// Allocations that may still succeed before every allocation fails.
     /// Null means allocations never fail.
     budget: ?usize = null,
+    /// Whether only the allocation that finds the budget spent fails, and
+    /// the ones after it succeed again.
+    only_one: bool = false,
     /// Whether an allocation was refused because the budget ran out.
     refused: bool = false,
     /// Frees of memory that isn't live, such as a second free of the same
@@ -92,6 +106,7 @@ const TrackingAllocator = struct {
         if (tracker.budget) |*budget| {
             if (budget.* == 0) {
                 tracker.refused = true;
+                if (tracker.only_one) tracker.budget = null;
                 return null;
             }
             budget.* -= 1;
@@ -183,6 +198,15 @@ const Span = struct {
         const end = high.index + @intFromBool(options.max_inclusive and high.found);
         return if (end <= start) .{} else .{ .start = start, .end = end };
     }
+
+    /// `deleteRangeByRank(min, max, options)` on a tree of `len` items: from
+    /// rank `min` to rank `max`, with each end moved past the item when its
+    /// rank found one and the options say so.
+    fn byRank(len: usize, min: Position, max: Position, options: Op.Options) Span {
+        const start = min.index + @intFromBool(options.min_exclusive and min.found);
+        const end = max.index + @intFromBool(options.max_inclusive and max.found);
+        return if (end <= start) .{} else at(len, start, end - start, .{});
+    }
 };
 
 const Op = union(enum) {
@@ -201,11 +225,17 @@ const Op = union(enum) {
     replace_at: Slot,
     delete_at: usize,
     get_at_mut: usize,
-    ascent_mut,
-    descent_mut,
+    /// Seeds the choice of which values the walk replaces.
+    ascent_mut: u64,
+    descent_mut: u64,
     delete_range_at: Range,
     delete_range: KeyRange,
     delete_all_at: Tail,
+    // Not for maps, which don't have it.
+    delete_range_by_rank: RankRange,
+    /// Checks and releases a range delete result that was kept, by its
+    /// position among them.
+    release_result: usize,
     clear,
     copy,
     drop,
@@ -218,19 +248,74 @@ const Op = union(enum) {
     delete_range_key: KeyRange,
 
     const Slot = struct { index: usize, key: isize };
-    const Range = struct { index: usize, count: usize, options: Options };
-    const KeyRange = struct { min: isize, max: isize, options: Options };
-    const Tail = struct { index: usize, options: Options };
+    // `hold` keeps the result of a range delete for a later
+    // `release_result`, instead of releasing it at once.
+    const Range = struct { index: usize, count: usize, options: Options, hold: bool };
+    const KeyRange = struct { min: isize, max: isize, options: Options, hold: bool };
+    const Tail = struct { index: usize, options: Options, hold: bool };
+    const RankRange = struct { min: Position, max: Position, options: Options, hold: bool };
     const Options = btree.DeleteRangeOptions;
 };
 
 const Kind = std.meta.Tag(Op);
+
+/// The independent random streams of a case.
+const Seeds = struct {
+    generate: u64,
+    fault: u64,
+    check: u64,
+
+    fn of(seed: u64) Seeds {
+        var split: std.Random.SplitMix64 = .init(seed);
+        return .{ .generate = split.next(), .fault = split.next(), .check = split.next() };
+    }
+};
+
+/// The part of a string key after its first 2 bytes, indexed by the model
+/// key modulo their number. Short tails make keys shorter than the 8-byte
+/// string prefix, so that zero padding ties them. Longer tails share the
+/// whole prefix and differ after it.
+const string_tails = [_][]const u8{
+    "",
+    "\x00",
+    "\x00\x00",
+    "\x00\x00\x00\x00\x00\x00",
+    "\x00\x00\x00\x00\x00\x00\x00",
+    "\x00\x01",
+    "\x01",
+    "a",
+    "abcdef",
+    "abcdef\x00",
+    "abcdef\x00\x00",
+    "abcdef\x01",
+    "abcdefgh",
+    "abcdefghijklmnopqrstuvwxyz",
+    "b",
+    "\x7f",
+    "\xfe\xff",
+    "\xff",
+    "\xff\xff\xff\xff\xff\xff",
+    "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+};
+
+comptime {
+    for (string_tails[0 .. string_tails.len - 1], string_tails[1..]) |a, b| {
+        if (std.mem.order(u8, a, b) != .lt) @compileError("string_tails must be sorted without duplicates");
+    }
+}
 
 /// How often each kind of operation is picked, relative to the others.
 const Mix = std.enums.EnumArray(Kind, u16);
 
 fn pickKind(random: std.Random, mix: Mix) Kind {
     return Mix.Indexer.keyForIndex(random.weightedIndex(u16, &mix.values));
+}
+
+/// Maps don't delete by rank.
+fn forMaps(mix: Mix) Mix {
+    var result = mix;
+    result.set(.delete_range_by_rank, 0);
+    return result;
 }
 
 /// Ordered-key trees also get the key-only variants of the keyed
@@ -251,9 +336,17 @@ const aux = testing.allocator;
 
 const max_trees = 4;
 
+/// Range delete results kept at once.
+const max_results = 4;
+
+/// A key type for enum keys. Its tags are the model keys.
+const Ordinal = enum(i32) { _ };
+
 /// A tree configuration under test.
 const Spec = struct {
-    key: enum { int, string } = .int,
+    /// `Map` wraps an ordered-key tree and takes keys without values.
+    container: enum { tree, map } = .tree,
+    key: enum { int, string, enumeration, float } = .int,
     /// Whether string keys keep their first 8 bytes in internal nodes.
     prefix: bool = false,
     value: enum {
@@ -285,12 +378,17 @@ fn Suite(comptime spec: Spec) type {
         if (spec.value == .tie_break and (spec.key != .int or spec.ordering != .compare)) {
             @compileError("tie-break values need integer keys and a comparator");
         }
+        if (spec.container == .map and spec.ordering != .ordered_key) {
+            @compileError("maps order by key alone, so they need .ordering = .ordered_key");
+        }
     }
 
     return struct {
         const K = switch (spec.key) {
             .int => isize,
             .string => []const u8,
+            .enumeration => Ordinal,
+            .float => f64,
         };
         const owns_values = spec.value != .none;
         const V = if (owns_values) []const u8 else void;
@@ -299,9 +397,18 @@ fn Suite(comptime spec: Spec) type {
             .tie_break => 16,
             .none => 0,
         };
-        const ordered = spec.ordering == .ordered_key;
+        const is_map = spec.container == .map;
+        /// Whether the type under test has the key-only variants of the
+        /// keyed operations. A map's keyed operations are key-only.
+        const key_ops = spec.ordering == .ordered_key and !is_map;
 
-        const Tree = btree.Tree(K, V, .{
+        /// The type under test.
+        const Tree = if (is_map) Map(K, V, .{
+            .use_string_prefix = spec.prefix,
+            .search_mode = spec.search_mode,
+            .copy_value = if (owns_values) &copyValue else null,
+            .release_value = if (owns_values) &releaseValue else null,
+        }) else btree.Tree(K, V, .{
             .compare = compare,
             .ordering = spec.ordering,
             .use_string_prefix = spec.prefix,
@@ -309,6 +416,12 @@ fn Suite(comptime spec: Spec) type {
             .copy_value = if (owns_values) &copyValue else null,
             .release_value = if (owns_values) &releaseValue else null,
         });
+        /// The tree that holds the nodes.
+        const Base = if (is_map) @FieldType(Tree, "tree") else Tree;
+
+        fn baseOf(tree: *const Tree) *const Base {
+            return if (comptime is_map) &tree.tree else tree;
+        }
 
         // ---------------------------------------------------- keys and values
 
@@ -318,8 +431,9 @@ fn Suite(comptime spec: Spec) type {
 
         fn compare(a: K, a_value: V, b: K, b_value: V) std.math.Order {
             const order = switch (spec.key) {
-                .int => std.math.order(a, b),
+                .int, .float => std.math.order(a, b),
                 .string => std.mem.order(u8, a, b),
+                .enumeration => std.math.order(@backingInt(a), @backingInt(b)),
             };
             if (comptime spec.value != .tie_break) return order;
             if (order != .eq) return order;
@@ -344,31 +458,55 @@ fn Suite(comptime spec: Spec) type {
             return std.mem.readInt(i64, value[8..16], .little);
         }
 
-        /// Model key `n` as a string key: `n / 16` as 8 big-endian bytes,
-        /// with the sign bit flipped so that byte order matches numeric order,
-        /// then a ninth byte for `n % 16` unless it is zero. Sixteen keys in a
-        /// row share their first 8 bytes, so string prefixes both decide
-        /// comparisons and tie.
-        fn encode(buffer: *[9]u8, n: isize) []const u8 {
-            const major: i64 = @divFloor(n, 16);
-            std.mem.writeInt(u64, buffer[0..8], @as(u64, @bitCast(major)) ^ sign_bit, .big);
-            buffer[8] = @intCast(@mod(n, 16));
-            return if (buffer[8] == 0) buffer[0..8] else buffer;
+        /// Model key `n` as a string key: `n / string_tails.len` as 2
+        /// big-endian bytes, with the sign bit flipped so that byte order
+        /// matches numeric order, then the tail for `n % string_tails.len`.
+        /// The keys that share their first 2 bytes have tails that tie on
+        /// the string prefix as well as tails that it orders.
+        fn encode(gpa: Allocator, n: isize) Allocator.Error![]const u8 {
+            const major = std.math.cast(i16, @divFloor(n, string_tails.len)) orelse
+                @panic("model key is outside the range of string keys");
+            const tail = string_tails[@intCast(@mod(n, string_tails.len))];
+            const key = try gpa.alloc(u8, 2 + tail.len);
+            std.mem.writeInt(u16, key[0..2], @as(u16, @bitCast(major)) ^ sign_bit, .big);
+            @memcpy(key[2..], tail);
+            return key;
         }
 
+        /// The model key of a string key, or `invalid_key` for a key that
+        /// `encode` can't produce.
         fn decode(key: []const u8) isize {
-            const major: i64 = @bitCast(std.mem.readInt(u64, key[0..8], .big) ^ sign_bit);
-            const minor: i64 = if (key.len == 9) key[8] else 0;
-            return @intCast(major * 16 + minor);
+            if (key.len < 2) return invalid_key;
+            const major: i16 = @bitCast(std.mem.readInt(u16, key[0..2], .big) ^ sign_bit);
+            const minor = std.sort.binarySearch([]const u8, &string_tails, key[2..], orderTail) orelse return invalid_key;
+            return @as(isize, major) * string_tails.len + @as(isize, @intCast(minor));
         }
 
-        const sign_bit: u64 = 1 << 63;
+        fn orderTail(tail: []const u8, item: []const u8) std.math.Order {
+            return std.mem.order(u8, tail, item);
+        }
+
+        const sign_bit: u16 = 1 << 15;
+        /// Far from every model key, so that a check reports it as wrong.
+        const invalid_key = std.math.maxInt(isize);
+
+        /// Float keys are model keys in steps of a quarter, so that most
+        /// have a fraction.
+        const float_step = 0.25;
+
+        fn decodeFloat(key: f64) isize {
+            const steps = key / float_step;
+            if (!(@abs(steps) < 1 << 40) or @trunc(steps) != steps) return invalid_key;
+            return @intFromFloat(steps);
+        }
 
         /// The model key of a tree item whose value is known to be live.
         fn modelKey(key: K, value: V) isize {
             const major: isize = switch (spec.key) {
                 .int => key,
                 .string => decode(key),
+                .enumeration => @backingInt(key),
+                .float => decodeFloat(key),
             };
             if (comptime spec.value != .tie_break) return major;
             return major * tie_span + minorOf(value);
@@ -393,30 +531,54 @@ fn Suite(comptime spec: Spec) type {
             tag: u64,
         };
 
+        /// A range delete result kept for later, and the items it must hold.
+        const KeptResult = struct {
+            result: Tree.DeleteRangeResult,
+            items: []Item,
+        };
+
+        /// When an operation runs out of memory.
+        const Fault = struct {
+            /// Allocations that succeed first.
+            budget: usize,
+            /// Whether the allocations after the failing one succeed.
+            only_one: bool = false,
+        };
+
         const Harness = struct {
             tracker: TrackingAllocator,
-            prng: std.Random.DefaultPrng,
+            /// Picks the lookups the checks make and when to audit.
+            checker: std.Random.DefaultPrng,
             /// Holds string keys and lookup values, which the trees borrow.
             keys: std.heap.ArenaAllocator,
+            /// Generates the operations.
+            generator: std.Random.DefaultPrng,
+            /// Decides which allocations fail.
+            fault_source: std.Random.DefaultPrng,
             /// Whether operations run with allocation failures.
             faults: bool = false,
             key_space: isize = 16,
             subjects: std.ArrayList(Subject) = .empty,
+            /// Range delete results that outlive the operation that returned
+            /// them.
+            results: std.ArrayList(KeptResult) = .empty,
             /// Values the harness has allocated and not yet handed to a tree.
             held: usize = 0,
             next_tag: u64 = 1,
             epoch: u32 = 0,
-            visited: std.ArrayList(*Tree.Node) = .empty,
+            visited: std.ArrayList(*Base.Node) = .empty,
             // What was running, for the failure report.
             steps: usize = 0,
             current: ?Op = null,
             current_tree: usize = 0,
-            current_budget: ?usize = null,
+            current_fault: ?Fault = null,
 
-            fn init(backing: Allocator, seed: u64) Harness {
+            fn init(backing: Allocator, seeds: Seeds) Harness {
                 return .{
                     .tracker = .{ .backing = backing },
-                    .prng = .init(seed),
+                    .checker = .init(seeds.check),
+                    .generator = .init(seeds.generate),
+                    .fault_source = .init(seeds.fault),
                     .keys = .init(std.heap.page_allocator),
                 };
             }
@@ -424,6 +586,8 @@ fn Suite(comptime spec: Spec) type {
             fn deinit(h: *Harness) void {
                 for (h.subjects.items) |*subject| subject.model.deinit(aux);
                 h.subjects.deinit(aux);
+                for (h.results.items) |kept| aux.free(kept.items);
+                h.results.deinit(aux);
                 h.visited.deinit(aux);
                 h.tracker.deinit();
                 h.keys.deinit();
@@ -442,7 +606,10 @@ fn Suite(comptime spec: Spec) type {
                 } else {
                     std.debug.print("  last operation: step {d}, releasing the trees", .{h.steps});
                 }
-                if (h.current_budget) |budget| std.debug.print(", with its allocation {d} and every later one failing", .{budget + 1});
+                if (h.current_fault) |fault| {
+                    const later = if (fault.only_one) "succeeding" else "failing";
+                    std.debug.print(", with its allocation {d} failing and every later one {s}", .{ fault.budget + 1, later });
+                }
                 std.debug.print("\n", .{});
             }
 
@@ -450,10 +617,9 @@ fn Suite(comptime spec: Spec) type {
             fn treeKey(h: *Harness, n: isize) Allocator.Error!K {
                 switch (spec.key) {
                     .int => return if (spec.value == .tie_break) @divFloor(n, tie_span) else n,
-                    .string => {
-                        const buffer = try h.keys.allocator().create([9]u8);
-                        return encode(buffer, n);
-                    },
+                    .string => return encode(h.keys.allocator(), n),
+                    .enumeration => return @fromBackingInt(std.math.cast(i32, n) orelse @panic("model key is outside the range of enum keys")),
+                    .float => return @as(f64, @floatFromInt(n)) * float_step,
                 }
             }
 
@@ -480,7 +646,8 @@ fn Suite(comptime spec: Spec) type {
                 try h.checkContents();
             }
 
-            /// Walks every tree and counts who owns each node and value.
+            /// Walks every tree and kept range delete result, and counts who
+            /// owns each node and value.
             fn checkOwnership(h: *Harness) !void {
                 if (h.tracker.bad_frees != 0) {
                     return violation("{d} free(s) of memory that was not live, such as a double free", .{h.tracker.bad_frees});
@@ -490,7 +657,19 @@ fn Suite(comptime spec: Spec) type {
                 h.visited.clearRetainingCapacity();
                 var values: usize = 0;
                 for (h.subjects.items) |*subject| {
-                    if (subject.tree.root) |root| try h.claim(root, &values);
+                    if (baseOf(&subject.tree).root) |root| try h.claim(root, &values);
+                }
+                // A result owns its chunk list, its item lists, the values in
+                // them, and a reference to each subtree it detached.
+                var buffers: usize = 0;
+                for (h.results.items) |kept| {
+                    const chunks = kept.result.chunks;
+                    try h.claimBuffer(std.mem.sliceAsBytes(chunks), &buffers);
+                    for (chunks[0..kept.result.chunk_count]) |chunk| {
+                        if (chunk.node) |node| try h.claim(node, &values);
+                        try h.claimBuffer(std.mem.sliceAsBytes(chunk.items), &buffers);
+                        for (chunk.items) |entry| try h.claimValue(entry.value, &values);
+                    }
                 }
 
                 for (h.visited.items) |node| {
@@ -501,7 +680,7 @@ fn Suite(comptime spec: Spec) type {
                     }
                 }
 
-                const reachable = h.visited.items.len + values + h.held;
+                const reachable = h.visited.items.len + values + buffers + h.held;
                 const live = h.tracker.live.count();
                 if (live > reachable) return violation("{d} allocation(s) leaked: live but not reachable from any tree", .{live - reachable});
                 // Every node and value in a tree was just found live, so what
@@ -511,7 +690,7 @@ fn Suite(comptime spec: Spec) type {
 
             /// Records one owner of `node`. The first owner also claims the
             /// node's values and children.
-            fn claim(h: *Harness, node: *Tree.Node, values: *usize) (Violation || Allocator.Error)!void {
+            fn claim(h: *Harness, node: *Base.Node, values: *usize) (Violation || Allocator.Error)!void {
                 const allocation = h.nodeAllocation(node) orelse return violation("a tree points to a node that was freed", .{});
                 if (allocation.epoch == h.epoch) {
                     allocation.owners += 1;
@@ -521,18 +700,10 @@ fn Suite(comptime spec: Spec) type {
                 allocation.owners = 1;
                 try h.visited.append(aux, node);
 
-                if (node.isLeaf() != (allocation.len == @sizeOf(Tree.Node)) or node.len > Tree.max_items) {
+                if (node.isLeaf() != (allocation.len == @sizeOf(Base.Node)) or node.len > Base.max_items) {
                     return violation("a node is corrupt: {d} items, leaf: {}", .{ node.len, node.isLeaf() });
                 }
-                if (comptime owns_values) {
-                    for (node.values[0..node.len]) |value| {
-                        const owned = h.tracker.live.getPtr(@intFromPtr(value.ptr)) orelse return violation("a node holds a value that was freed", .{});
-                        if (owned.len != value_size or value.len != value_size) return violation("a node holds a corrupt value", .{});
-                        if (owned.epoch == h.epoch) return violation("a value is stored in two places", .{});
-                        owned.epoch = h.epoch;
-                    }
-                    values.* += node.len;
-                }
+                for (node.values[0..node.len]) |value| try h.claimValue(value, values);
 
                 const branch = node.branch orelse return;
                 for (branch.children[0 .. @as(usize, node.len) + 1]) |child| {
@@ -540,16 +711,37 @@ fn Suite(comptime spec: Spec) type {
                 }
             }
 
+            /// Records the one owner a value may have.
+            fn claimValue(h: *Harness, value: V, values: *usize) Violation!void {
+                if (comptime !owns_values) return;
+                const owned = h.tracker.live.getPtr(@intFromPtr(value.ptr)) orelse return violation("a node or result holds a value that was freed", .{});
+                if (owned.len != value_size or value.len != value_size) return violation("a node or result holds a corrupt value", .{});
+                if (owned.epoch == h.epoch) return violation("a value is stored in two places", .{});
+                owned.epoch = h.epoch;
+                values.* += 1;
+            }
+
+            /// Records the one owner of a buffer that a result allocated.
+            /// Empty buffers aren't allocated.
+            fn claimBuffer(h: *Harness, bytes: []const u8, buffers: *usize) Violation!void {
+                if (bytes.len == 0) return;
+                const allocation = h.tracker.live.getPtr(@intFromPtr(bytes.ptr)) orelse return violation("a range delete result holds a buffer that was freed", .{});
+                if (allocation.len != bytes.len) return violation("a range delete result holds a corrupt buffer", .{});
+                if (allocation.epoch == h.epoch) return violation("a buffer is held by two range delete results", .{});
+                allocation.epoch = h.epoch;
+                buffers.* += 1;
+            }
+
             /// The live allocation that holds `node`, or null if it was
             /// freed. Leaves are allocated on their own; internal nodes sit
             /// inside an InternalNode.
-            fn nodeAllocation(h: *Harness, node: *Tree.Node) ?*TrackingAllocator.Allocation {
+            fn nodeAllocation(h: *Harness, node: *Base.Node) ?*TrackingAllocator.Allocation {
                 const address = @intFromPtr(node);
                 if (h.tracker.live.getPtr(address)) |allocation| {
-                    if (allocation.len == @sizeOf(Tree.Node)) return allocation;
+                    if (allocation.len == @sizeOf(Base.Node)) return allocation;
                 }
-                const allocation = h.tracker.live.getPtr(address -% @offsetOf(Tree.InternalNode, "node")) orelse return null;
-                return if (allocation.len == @sizeOf(Tree.InternalNode)) allocation else null;
+                const allocation = h.tracker.live.getPtr(address -% @offsetOf(Base.InternalNode, "node")) orelse return null;
+                return if (allocation.len == @sizeOf(Base.InternalNode)) allocation else null;
             }
 
             fn checkContents(h: *Harness) !void {
@@ -558,8 +750,9 @@ fn Suite(comptime spec: Spec) type {
                     const tree = &subject.tree;
                     tree.checkInvariants() catch return violation("tree {d} fails checkInvariants", .{index + 1});
                     const items = subject.model.items;
-                    if (tree.len != items.len) {
-                        return violation("tree {d} has len {d} but should hold {d} items", .{ index + 1, tree.len, items.len });
+                    const len = baseOf(tree).len;
+                    if (len != items.len) {
+                        return violation("tree {d} has len {d} but should hold {d} items", .{ index + 1, len, items.len });
                     }
                     var forward: ModelWalk = .{ .expected = items };
                     try tree.ascent(*ModelWalk, &forward, ModelWalk.visit);
@@ -574,7 +767,9 @@ fn Suite(comptime spec: Spec) type {
             /// Compares the lookups and bounded walks with the model, at
             /// random positions and keys.
             fn checkReads(h: *Harness, tree: *const Tree, items: []const Item) !void {
-                const random = h.prng.random();
+                const random = h.checker.random();
+                const lowest = if (items.len == 0) 0 else items[0].key;
+                const highest = if (items.len == 0) 0 else items[items.len - 1].key;
                 try expectEntry("front", 0, tree.front(), if (items.len == 0) null else items[0]);
                 try expectEntry("back", 0, tree.back(), if (items.len == 0) null else items[items.len - 1]);
 
@@ -582,7 +777,7 @@ fn Suite(comptime spec: Spec) type {
                     const index = random.uintLessThan(usize, items.len + 2);
                     try expectEntry("getAt", index, tree.getAt(index), if (index < items.len) items[index] else null);
 
-                    const n = random.intRangeLessThan(isize, -2, h.key_space + 2);
+                    const n = random.intRangeAtMost(isize, lowest - 2, highest + 2);
                     const at = locate(items, n);
                     const key = try h.treeKey(n);
                     const value = try h.probe(n);
@@ -592,12 +787,20 @@ fn Suite(comptime spec: Spec) type {
                     const want_next: ?Item = if (next < items.len) items[next] else null;
                     const want_prev: ?Item = if (at.index > 0) items[at.index - 1] else null;
 
-                    try expectValue("get", n, tree.get(key, value), found);
-                    try expectIndex("indexOf", n, tree.indexOf(key, value), at);
-                    try expectEntry("seek", n, tree.seek(key, value), want_seek);
-                    try expectEntry("seekNext", n, tree.seekNext(key, value), want_next);
-                    try expectEntry("seekPrev", n, tree.seekPrev(key, value), want_prev);
-                    if (comptime ordered) {
+                    if (comptime is_map) {
+                        try expectValue("get", n, tree.get(key), found);
+                        try expectIndex("indexOf", n, tree.indexOf(key), at);
+                        try expectEntry("seek", n, tree.seek(key), want_seek);
+                        try expectEntry("seekNext", n, tree.seekNext(key), want_next);
+                        try expectEntry("seekPrev", n, tree.seekPrev(key), want_prev);
+                    } else {
+                        try expectValue("get", n, tree.get(key, value), found);
+                        try expectIndex("indexOf", n, tree.indexOf(key, value), at);
+                        try expectEntry("seek", n, tree.seek(key, value), want_seek);
+                        try expectEntry("seekNext", n, tree.seekNext(key, value), want_next);
+                        try expectEntry("seekPrev", n, tree.seekPrev(key, value), want_prev);
+                    }
+                    if (comptime key_ops) {
                         try expectValue("getKey", n, tree.getKey(key), found);
                         try expectIndex("indexOfKey", n, tree.indexOfKey(key), at);
                         try expectEntry("seekKey", n, tree.seekKey(key), want_seek);
@@ -655,8 +858,9 @@ fn Suite(comptime spec: Spec) type {
                     return violation("{d} free(s) of memory that was not live, such as a double free", .{h.tracker.bad_frees});
                 }
                 for (h.subjects.items, 0..) |*subject, index| {
-                    if (subject.tree.len != subject.model.items.len) {
-                        return violation("tree {d} has len {d} but should hold {d} items", .{ index + 1, subject.tree.len, subject.model.items.len });
+                    const len = baseOf(&subject.tree).len;
+                    if (len != subject.model.items.len) {
+                        return violation("tree {d} has len {d} but should hold {d} items", .{ index + 1, len, subject.model.items.len });
                     }
                 }
             }
@@ -682,29 +886,33 @@ fn Suite(comptime spec: Spec) type {
             /// many allocations. `usual` is how many allocations such a call
             /// makes at most when it doesn't clone nodes. Cloning one node
             /// allocates up to 64 times, so much larger budgets must stay
-            /// likely too.
-            fn planFault(h: *Harness, usual: usize) ?usize {
+            /// likely too. Half of the failures are of a single allocation,
+            /// so that the call goes on allocating after it.
+            fn planFault(h: *Harness, usual: usize) ?Fault {
                 if (!h.faults) return null;
-                const random = h.prng.random();
-                return switch (random.uintLessThan(u8, 4)) {
-                    0 => null,
+                const random = h.fault_source.random();
+                const budget = switch (random.uintLessThan(u8, 4)) {
+                    0 => return null,
                     1, 2 => random.uintLessThan(usize, usual),
                     else => random.uintLessThan(usize, @as(usize, 1) << random.uintLessThan(u6, 9)),
                 };
+                return .{ .budget = budget, .only_one = random.boolean() };
             }
 
-            /// Calls `func` with every allocation after the first `budget`
-            /// failing. Returns null when that made the call fail.
-            fn callWithFault(h: *Harness, comptime T: type, budget: usize, comptime func: anytype, args: anytype) !?T {
-                h.current_budget = budget;
-                h.tracker.budget = budget;
+            /// Calls `func` with the allocations that `fault` names failing.
+            /// Returns null when that made the call fail.
+            fn callWithFault(h: *Harness, comptime T: type, fault: Fault, comptime func: anytype, args: anytype) !?T {
+                h.current_fault = fault;
+                h.tracker.budget = fault.budget;
+                h.tracker.only_one = fault.only_one;
                 h.tracker.refused = false;
                 const result = @call(.auto, func, args);
                 h.tracker.budget = null;
+                h.tracker.only_one = false;
 
                 if (result) |value| {
                     if (h.tracker.refused) return violation("the call succeeded although an allocation failed", .{});
-                    h.current_budget = null;
+                    h.current_fault = null;
                     return value;
                 } else |err| {
                     if (err != error.OutOfMemory or !h.tracker.refused) return violation("the call failed with {t}", .{err});
@@ -721,10 +929,10 @@ fn Suite(comptime spec: Spec) type {
             /// failure.
             fn call(h: *Harness, comptime T: type, comptime func: anytype, args: anytype) !T {
                 // A point operation allocates once per node it splits.
-                if (h.planFault(4)) |budget| {
-                    if (try h.callWithFault(T, budget, func, args)) |value| return value;
+                if (h.planFault(4)) |fault| {
+                    if (try h.callWithFault(T, fault, func, args)) |value| return value;
                     try h.audit();
-                    h.current_budget = null;
+                    h.current_fault = null;
                 }
                 return callWithoutFault(T, func, args);
             }
@@ -740,7 +948,7 @@ fn Suite(comptime spec: Spec) type {
             /// that shares none they must succeed without any allocation.
             fn callInPlace(h: *Harness, comptime T: type, comptime func: anytype, args: anytype) !T {
                 if (h.shared()) return h.call(T, func, args);
-                return try h.callWithFault(T, 0, func, args) orelse
+                return try h.callWithFault(T, .{ .budget = 0 }, func, args) orelse
                     violation("the call allocated although the tree shares no nodes", .{});
             }
 
@@ -805,14 +1013,15 @@ fn Suite(comptime spec: Spec) type {
             fn apply(h: *Harness, index: usize, op: Op) !void {
                 h.current = op;
                 h.current_tree = index;
-                h.current_budget = null;
+                h.current_fault = null;
                 const subject = &h.subjects.items[index];
                 switch (op) {
                     .insert => |n| try h.insert(subject, n, Tree.insert),
                     .set => |n| try h.set(subject, n, Tree.set),
                     .replace => |n| try h.replace(subject, n, Tree.replace),
-                    .delete => |n| try h.delete(subject, n, Tree.delete),
-                    .get_mut => |n| try h.getMut(subject, n, Tree.getMut),
+                    // A map's `delete` and `getMut` take a key alone.
+                    .delete => |n| try h.delete(subject, n, if (is_map) deleteKey else Tree.delete),
+                    .get_mut => |n| try h.getMut(subject, n, if (is_map) getKeyMut else Tree.getMut),
                     .push_front => |n| try h.pushFront(subject, n),
                     .push_back => |n| try h.pushBack(subject, n),
                     .pop_front => try h.popFront(subject),
@@ -823,53 +1032,59 @@ fn Suite(comptime spec: Spec) type {
                     .replace_at => |slot| try h.replaceAt(subject, slot.index, slot.key),
                     .delete_at => |at| try h.deleteAt(subject, at),
                     .get_at_mut => |at| try h.getAtMut(subject, at),
-                    .ascent_mut => try h.walkMut(subject, false),
-                    .descent_mut => try h.walkMut(subject, true),
+                    .ascent_mut => |seed| try h.walkMut(subject, seed, false),
+                    .descent_mut => |seed| try h.walkMut(subject, seed, true),
                     .delete_range_at => |range| {
                         const span = Span.at(subject.model.items.len, range.index, range.count, range.options);
-                        try h.deleteSpan(subject, span, deleteRangeAt, .{ &subject.tree, h.gpa(), range.index, range.count, range.options });
+                        try h.deleteSpan(subject, span, range.hold, deleteRangeAt, .{ &subject.tree, h.gpa(), range.index, range.count, range.options });
                     },
                     .delete_range => |range| {
                         const span = Span.between(subject.model.items, range.min, range.max, range.options);
                         const args = .{ &subject.tree, h.gpa(), try h.treeKey(range.min), try h.probe(range.min), try h.treeKey(range.max), try h.probe(range.max), range.options };
-                        try h.deleteSpan(subject, span, deleteRange, args);
+                        try h.deleteSpan(subject, span, range.hold, deleteRange, args);
                     },
                     .delete_all_at => |tail| {
                         const len = subject.model.items.len;
                         const span = Span.at(len, tail.index, len - @min(tail.index, len), tail.options);
-                        try h.deleteSpan(subject, span, deleteAllAt, .{ &subject.tree, h.gpa(), tail.index, tail.options });
+                        try h.deleteSpan(subject, span, tail.hold, deleteAllAt, .{ &subject.tree, h.gpa(), tail.index, tail.options });
                     },
+                    .delete_range_by_rank => |range| if (comptime is_map) unreachable else {
+                        const span = Span.byRank(subject.model.items.len, range.min, range.max, range.options);
+                        try h.deleteSpan(subject, span, range.hold, deleteRangeByRank, .{ &subject.tree, h.gpa(), range.min, range.max, range.options });
+                    },
+                    .release_result => |at| try h.releaseResult(at),
                     .clear => {
                         subject.tree.clear(h.gpa());
                         subject.model.clearRetainingCapacity();
                     },
                     .copy => try h.copy(index),
                     .drop => try h.drop(index),
-                    .insert_key => |n| if (comptime ordered) try h.insert(subject, n, Tree.insertKey) else unreachable,
-                    .set_key => |n| if (comptime ordered) try h.set(subject, n, Tree.setKey) else unreachable,
-                    .replace_key => |n| if (comptime ordered) try h.replace(subject, n, Tree.replaceKey) else unreachable,
-                    .delete_key => |n| if (comptime ordered) try h.delete(subject, n, deleteKey) else unreachable,
-                    .get_key_mut => |n| if (comptime ordered) try h.getMut(subject, n, getKeyMut) else unreachable,
-                    .delete_range_key => |range| if (comptime ordered) {
+                    .insert_key => |n| if (comptime key_ops) try h.insert(subject, n, Tree.insertKey) else unreachable,
+                    .set_key => |n| if (comptime key_ops) try h.set(subject, n, Tree.setKey) else unreachable,
+                    .replace_key => |n| if (comptime key_ops) try h.replace(subject, n, Tree.replaceKey) else unreachable,
+                    .delete_key => |n| if (comptime key_ops) try h.delete(subject, n, deleteKey) else unreachable,
+                    .get_key_mut => |n| if (comptime key_ops) try h.getMut(subject, n, getKeyMut) else unreachable,
+                    .delete_range_key => |range| if (comptime key_ops) {
                         const span = Span.between(subject.model.items, range.min, range.max, range.options);
                         const args = .{ &subject.tree, h.gpa(), try h.treeKey(range.min), try h.treeKey(range.max), range.options };
-                        try h.deleteSpan(subject, span, deleteRangeKey, args);
+                        try h.deleteSpan(subject, span, range.hold, deleteRangeKey, args);
                     } else unreachable,
                 }
                 h.steps += 1;
                 try h.checkLengths();
 
                 // A full audit costs as much as visiting every item, so run it
-                // less often the more items there are. Range deletes are few
-                // and restructure the most, and a later one can free the
-                // nodes an earlier one broke, so check after each of them.
+                // less often the more items there are. Range deletes and the
+                // release of their results are few and restructure the most,
+                // and a later one can free the nodes an earlier one broke, so
+                // check after each of them.
                 const restructured = switch (op) {
-                    .delete_range_at, .delete_range, .delete_range_key, .delete_all_at => true,
+                    .delete_range_at, .delete_range, .delete_range_key, .delete_all_at, .delete_range_by_rank, .release_result => true,
                     else => false,
                 };
                 var total: usize = 0;
                 for (h.subjects.items) |*s| total += s.model.items.len;
-                if (restructured or h.prng.random().uintLessThan(usize, 1 + total / 4) == 0) try h.audit();
+                if (restructured or h.checker.random().uintLessThan(usize, 1 + total / 4) == 0) try h.audit();
             }
 
             /// `func` is `Tree.insert` or `Tree.insertKey`.
@@ -918,6 +1133,7 @@ fn Suite(comptime spec: Spec) type {
             }
 
             fn deleteKey(tree: *Tree, allocator: Allocator, key: K, _: V) !?V {
+                if (comptime is_map) return tree.delete(allocator, key);
                 return tree.deleteKey(allocator, key);
             }
 
@@ -935,6 +1151,7 @@ fn Suite(comptime spec: Spec) type {
             }
 
             fn getKeyMut(tree: *Tree, allocator: Allocator, key: K, _: V) !?*V {
+                if (comptime is_map) return tree.getMut(allocator, key);
                 return tree.getKeyMut(allocator, key);
             }
 
@@ -1003,7 +1220,7 @@ fn Suite(comptime spec: Spec) type {
                 }
                 // A rejected pop must not touch the tree, so it must not
                 // clone anything either.
-                const entry = try h.callWithFault(?Tree.Entry, 0, func, args) orelse
+                const entry = try h.callWithFault(?Tree.Entry, .{ .budget = 0 }, func, args) orelse
                     return violation("a pop that its predicate rejects allocated", .{});
                 if (entry != null) return violation("a pop returned an item that its predicate rejects", .{});
             }
@@ -1045,17 +1262,17 @@ fn Suite(comptime spec: Spec) type {
             /// item and replacing a few values on the way. A walk that fails
             /// partway keeps the values it already replaced, and leaves the
             /// tree otherwise as it was.
-            fn walkMut(h: *Harness, subject: *Subject, comptime descending: bool) !void {
+            fn walkMut(h: *Harness, subject: *Subject, seed: u64, comptime descending: bool) !void {
                 var pool: [4]NewValue = undefined;
                 const pool_len = if (owns_values) @min(pool.len, subject.model.items.len) else 0;
                 for (pool[0..pool_len]) |*value| value.* = try h.newValue(0);
-                var walk: MutWalk = .{ .h = h, .subject = subject, .descending = descending, .pool = pool[0..pool_len] };
+                var walk: MutWalk = .{ .h = h, .subject = subject, .descending = descending, .pool = pool[0..pool_len], .prng = .init(seed) };
                 const func = if (descending) descentMut else ascentMut;
                 const args = .{ &subject.tree, h.gpa(), &walk };
 
-                const budget: ?usize = if (h.shared()) h.planFault(8) else 0;
-                const finished = if (budget) |limit|
-                    try h.callWithFault(void, limit, func, args) != null
+                const fault: ?Fault = if (h.shared()) h.planFault(8) else .{ .budget = 0 };
+                const finished = if (fault) |planned|
+                    try h.callWithFault(void, planned, func, args) != null
                 else finished: {
                     try callWithoutFault(void, func, args);
                     break :finished true;
@@ -1067,7 +1284,7 @@ fn Suite(comptime spec: Spec) type {
                 } else {
                     if (!h.shared()) return violation("the call allocated although the tree shares no nodes", .{});
                     try h.audit();
-                    h.current_budget = null;
+                    h.current_fault = null;
                 }
                 for (walk.pool[walk.used..]) |value| h.discard(value);
             }
@@ -1080,70 +1297,100 @@ fn Suite(comptime spec: Spec) type {
                 return tree.descentMut(allocator, *MutWalk, walk, MutWalk.visit);
             }
 
-            /// Runs a range delete that removes `span` of the model.
-            fn deleteSpan(h: *Harness, subject: *Subject, span: Span, comptime func: anytype, args: anytype) !void {
+            /// Runs a range delete that removes `span` of the model, and keeps
+            /// its result if `hold` is set.
+            fn deleteSpan(h: *Harness, subject: *Subject, span: Span, hold: bool, comptime func: anytype, args: anytype) !void {
                 // A range delete allocates for every few nodes it detaches.
-                if (h.planFault(32)) |budget| {
-                    if (try h.callWithFault(Tree.DeleteRangeResult, budget, func, args)) |result| {
-                        return h.removedRange(subject, result, span.start, span.end);
+                if (h.planFault(32)) |fault| {
+                    if (try h.callWithFault(Tree.DeleteRangeResult, fault, func, args)) |result| {
+                        return h.removedRange(subject, result, span.start, span.end, hold);
                     }
                     // A failed range delete doesn't put back what it already
                     // removed, so delete the rest by position.
                     try h.checkOwnership();
                     const end = try resync(subject, span.start, span.end);
                     try h.checkContents();
-                    h.current_budget = null;
+                    h.current_fault = null;
                     const rest = try callWithoutFault(Tree.DeleteRangeResult, deleteRangeAt, .{ &subject.tree, h.gpa(), span.start, end - span.start, Op.Options{} });
-                    return h.removedRange(subject, rest, span.start, end);
+                    return h.removedRange(subject, rest, span.start, end, hold);
                 }
                 const result = try callWithoutFault(Tree.DeleteRangeResult, func, args);
-                try h.removedRange(subject, result, span.start, span.end);
+                try h.removedRange(subject, result, span.start, span.end, hold);
             }
 
-            // The tree takes range options at compile time.
-            fn optionBits(options: Op.Options) u2 {
-                return @as(u2, @intFromBool(options.min_exclusive)) << 1 | @intFromBool(options.max_inclusive);
-            }
-
-            fn optionsOf(comptime bits: u2) Op.Options {
-                return .{ .min_exclusive = bits & 2 != 0, .max_inclusive = bits & 1 != 0 };
+            /// Calls `method` with `options`, which the tree takes at compile
+            /// time, after `args`.
+            fn withOptions(comptime method: anytype, args: anytype, options: Op.Options) !Tree.DeleteRangeResult {
+                const bits = @as(u2, @intFromBool(options.min_exclusive)) << 1 | @intFromBool(options.max_inclusive);
+                switch (bits) {
+                    inline else => |b| {
+                        const comptime_options: Op.Options = comptime .{ .min_exclusive = b & 2 != 0, .max_inclusive = b & 1 != 0 };
+                        return @call(.auto, method, args ++ .{comptime_options});
+                    },
+                }
             }
 
             fn deleteRangeAt(tree: *Tree, allocator: Allocator, index: usize, count: usize, options: Op.Options) !Tree.DeleteRangeResult {
-                switch (optionBits(options)) {
-                    inline else => |bits| return tree.deleteRangeAt(allocator, index, count, comptime optionsOf(bits)),
-                }
+                return withOptions(Tree.deleteRangeAt, .{ tree, allocator, index, count }, options);
             }
 
             fn deleteRange(tree: *Tree, allocator: Allocator, min: K, min_value: V, max: K, max_value: V, options: Op.Options) !Tree.DeleteRangeResult {
-                switch (optionBits(options)) {
-                    inline else => |bits| return tree.deleteRange(allocator, min, min_value, max, max_value, comptime optionsOf(bits)),
-                }
+                // A map's `deleteRange` takes keys alone.
+                if (comptime is_map) return withOptions(Tree.deleteRange, .{ tree, allocator, min, max }, options);
+                return withOptions(Tree.deleteRange, .{ tree, allocator, min, min_value, max, max_value }, options);
+            }
+
+            fn deleteRangeByRank(tree: *Tree, allocator: Allocator, min: Position, max: Position, options: Op.Options) !Tree.DeleteRangeResult {
+                const min_rank: Tree.RankResult = .{ .index = min.index, .found = min.found };
+                const max_rank: Tree.RankResult = .{ .index = max.index, .found = max.found };
+                return withOptions(Tree.deleteRangeByRank, .{ tree, allocator, min_rank, max_rank }, options);
             }
 
             fn deleteRangeKey(tree: *Tree, allocator: Allocator, min: K, max: K, options: Op.Options) !Tree.DeleteRangeResult {
-                switch (optionBits(options)) {
-                    inline else => |bits| return tree.deleteRangeKey(allocator, min, max, comptime optionsOf(bits)),
-                }
+                return withOptions(Tree.deleteRangeKey, .{ tree, allocator, min, max }, options);
             }
 
             fn deleteAllAt(tree: *Tree, allocator: Allocator, index: usize, options: Op.Options) !Tree.DeleteRangeResult {
-                switch (optionBits(options)) {
-                    inline else => |bits| return tree.deleteAllAt(allocator, index, comptime optionsOf(bits)),
-                }
+                return withOptions(Tree.deleteAllAt, .{ tree, allocator, index }, options);
             }
 
             /// `result` must hold exactly the model's items from `start` to
-            /// `end`.
-            fn removedRange(h: *Harness, subject: *Subject, result: Tree.DeleteRangeResult, start: usize, end: usize) !void {
-                if (result.removed_count != end - start) {
-                    return violation("a range delete reports {d} removed items instead of {d}", .{ result.removed_count, end - start });
+            /// `end`. It is kept for a later `release_result` if `hold` is
+            /// set and there is room.
+            fn removedRange(h: *Harness, subject: *Subject, result: Tree.DeleteRangeResult, start: usize, end: usize, hold: bool) !void {
+                const removed = subject.model.items[start..end];
+                try h.expectResult(result, removed);
+                if (hold and h.results.items.len < max_results) {
+                    try h.results.ensureUnusedCapacity(aux, 1);
+                    h.results.appendAssumeCapacity(.{ .result = result, .items = try aux.dupe(Item, removed) });
+                } else {
+                    result.deinit(h.gpa());
                 }
-                var walk: ModelWalk = .{ .expected = subject.model.items[start..end], .unverified = h };
-                try result.ascent(*ModelWalk, &walk, ModelWalk.visit);
-                if (walk.next != end - start) return violation("a range delete returned {d} items instead of {d}", .{ walk.next, end - start });
-                result.deinit(h.gpa());
                 subject.model.replaceRangeAssumeCapacity(start, end - start, &.{});
+            }
+
+            /// Checks that `result` holds `items`, without trusting it to
+            /// point only to live values.
+            fn expectResult(h: *Harness, result: Tree.DeleteRangeResult, items: []const Item) !void {
+                if (result.len() != items.len) {
+                    return violation("a range delete reports {d} removed items instead of {d}", .{ result.len(), items.len });
+                }
+                var walk: ModelWalk = .{ .expected = items, .unverified = h };
+                try result.ascent(*ModelWalk, &walk, ModelWalk.visit);
+                if (walk.next != items.len) return violation("a range delete returned {d} items instead of {d}", .{ walk.next, items.len });
+            }
+
+            /// Checks that the kept result at `index` still holds what it
+            /// removed, after whatever happened to the trees since, and then
+            /// releases it.
+            fn releaseResult(h: *Harness, index: usize) !void {
+                if (index >= h.results.items.len) return;
+                // Proves that the result's nodes are safe to follow.
+                try h.checkOwnership();
+                const kept = h.results.swapRemove(index);
+                defer aux.free(kept.items);
+                try h.expectResult(kept.result, kept.items);
+                kept.result.deinit(h.gpa());
             }
 
             /// Brings the model in line with a tree whose range delete
@@ -1192,19 +1439,19 @@ fn Suite(comptime spec: Spec) type {
             // --------------------------------------------------------- generation
 
             fn anyKey(h: *Harness) isize {
-                return h.prng.random().intRangeLessThan(isize, 0, h.key_space);
+                return h.generator.random().intRangeLessThan(isize, 0, h.key_space);
             }
 
             /// A key that is in the tree about half of the time.
             fn someKey(h: *Harness, items: []const Item) isize {
-                const random = h.prng.random();
+                const random = h.generator.random();
                 if (items.len == 0 or random.boolean()) return h.anyKey();
                 return items[random.uintLessThan(usize, items.len)].key;
             }
 
             /// An index below `len`, or now and then one that is out of range.
             fn someIndex(h: *Harness, len: usize) usize {
-                const random = h.prng.random();
+                const random = h.generator.random();
                 if (len == 0 or random.uintLessThan(u8, 16) == 0) return len + random.uintLessThan(usize, 3);
                 return random.uintLessThan(usize, len);
             }
@@ -1212,7 +1459,7 @@ fn Suite(comptime spec: Spec) type {
             /// A key that usually sorts after item `after - 1` and before item
             /// `before`, where those exist.
             fn keyBetween(h: *Harness, items: []const Item, after: usize, before: usize) isize {
-                const random = h.prng.random();
+                const random = h.generator.random();
                 if (random.uintLessThan(u8, 8) == 0) return h.anyKey();
                 const low: ?isize = if (after > 0 and after <= items.len) items[after - 1].key else null;
                 const high: ?isize = if (before < items.len) items[before].key else null;
@@ -1226,7 +1473,7 @@ fn Suite(comptime spec: Spec) type {
             /// Half of the range deletes exclude their first item or include
             /// one past their end.
             fn someOptions(h: *Harness) Op.Options {
-                const random = h.prng.random();
+                const random = h.generator.random();
                 if (random.boolean()) return .{};
                 return .{ .min_exclusive = random.boolean(), .max_inclusive = random.boolean() };
             }
@@ -1234,7 +1481,7 @@ fn Suite(comptime spec: Spec) type {
             /// A key range whose width ranges from reversed or empty to the
             /// whole key space.
             fn keyRange(h: *Harness, items: []const Item) Op.KeyRange {
-                const random = h.prng.random();
+                const random = h.generator.random();
                 const min = h.someKey(items);
                 const width: isize = switch (random.uintLessThan(u8, 4)) {
                     0 => random.intRangeAtMost(isize, -2, 4),
@@ -1242,11 +1489,37 @@ fn Suite(comptime spec: Spec) type {
                     2 => random.intRangeAtMost(isize, 0, 800),
                     else => random.intRangeAtMost(isize, 0, h.key_space),
                 };
-                return .{ .min = min, .max = min + width, .options = h.someOptions() };
+                return .{ .min = min, .max = min + width, .options = h.someOptions(), .hold = h.someHold() };
+            }
+
+            /// A pair of ranks like the ones `indexOf` returns, and now and
+            /// then a pair that `indexOf` can't return: found past the end,
+            /// or reversed.
+            fn rankRange(h: *Harness, len: usize) Op.RankRange {
+                const random = h.generator.random();
+                const min = h.someIndex(len + 1);
+                const width = switch (random.uintLessThan(u8, 4)) {
+                    0 => random.uintAtMost(usize, 4),
+                    1 => random.uintAtMost(usize, 200),
+                    2 => random.uintAtMost(usize, len + 2),
+                    else => 0,
+                };
+                const max = if (random.uintLessThan(u8, 8) == 0) min -| random.uintAtMost(usize, 3) else min + width;
+                return .{
+                    .min = .{ .index = min, .found = min < len and random.boolean() or random.uintLessThan(u8, 16) == 0 },
+                    .max = .{ .index = max, .found = max < len and random.boolean() or random.uintLessThan(u8, 16) == 0 },
+                    .options = h.someOptions(),
+                    .hold = h.someHold(),
+                };
+            }
+
+            /// A quarter of the range deletes keep their result for later.
+            fn someHold(h: *Harness) bool {
+                return h.generator.random().uintLessThan(u8, 4) == 0;
             }
 
             fn generate(h: *Harness, items: []const Item, kind: Kind) Op {
-                const random = h.prng.random();
+                const random = h.generator.random();
                 switch (kind) {
                     .insert => return .{ .insert = h.anyKey() },
                     .set => return .{ .set = h.someKey(items) },
@@ -1280,8 +1553,8 @@ fn Suite(comptime spec: Spec) type {
                     },
                     .delete_at => return .{ .delete_at = h.someIndex(items.len) },
                     .get_at_mut => return .{ .get_at_mut = h.someIndex(items.len) },
-                    .ascent_mut => return .ascent_mut,
-                    .descent_mut => return .descent_mut,
+                    .ascent_mut => return .{ .ascent_mut = random.int(u64) },
+                    .descent_mut => return .{ .descent_mut = random.int(u64) },
                     .delete_range_at => {
                         // Tiny ranges stay inside a leaf. Medium ranges detach
                         // a few whole leaves and leave most of the tree for
@@ -1294,11 +1567,13 @@ fn Suite(comptime spec: Spec) type {
                             3 => std.math.maxInt(usize) - random.uintAtMost(usize, 2),
                             else => random.uintAtMost(usize, 200),
                         };
-                        return .{ .delete_range_at = .{ .index = h.someIndex(items.len), .count = count, .options = h.someOptions() } };
+                        return .{ .delete_range_at = .{ .index = h.someIndex(items.len), .count = count, .options = h.someOptions(), .hold = h.someHold() } };
                     },
                     .delete_range => return .{ .delete_range = h.keyRange(items) },
                     .delete_range_key => return .{ .delete_range_key = h.keyRange(items) },
-                    .delete_all_at => return .{ .delete_all_at = .{ .index = h.someIndex(items.len), .options = h.someOptions() } },
+                    .delete_all_at => return .{ .delete_all_at = .{ .index = h.someIndex(items.len), .options = h.someOptions(), .hold = h.someHold() } },
+                    .delete_range_by_rank => return .{ .delete_range_by_rank = h.rankRange(items.len) },
+                    .release_result => return .{ .release_result = h.someIndex(h.results.items.len) },
                     .clear => return .clear,
                     .copy => return .copy,
                     .drop => return .drop,
@@ -1310,7 +1585,7 @@ fn Suite(comptime spec: Spec) type {
             /// Mostly small trees, because they are cheap, and some with
             /// enough items for three levels.
             fn pickSize(h: *Harness, max_items: usize) usize {
-                const random = h.prng.random();
+                const random = h.generator.random();
                 const limit: usize = switch (random.uintLessThan(u8, 4)) {
                     0 => 8,
                     1 => 150,
@@ -1325,7 +1600,7 @@ fn Suite(comptime spec: Spec) type {
             /// deletes rebalance at once. Random keys leave nodes unevenly
             /// filled.
             fn fill(h: *Harness, count: usize) !void {
-                const random = h.prng.random();
+                const random = h.generator.random();
                 h.key_space = @intCast(4 * count + 16);
                 switch (random.uintLessThan(u8, 3)) {
                     0 => {
@@ -1346,19 +1621,20 @@ fn Suite(comptime spec: Spec) type {
                 }
             }
 
-            fn step(h: *Harness, mix: Mix) !void {
-                const random = h.prng.random();
+            fn generateStep(h: *Harness, mix: Mix) !void {
+                const random = h.generator.random();
                 const index = random.uintLessThan(usize, h.subjects.items.len);
                 const op = h.generate(h.subjects.items[index].model.items, pickKind(random, mix));
                 try h.apply(index, op);
             }
 
-            /// Releases the trees one at a time. Each one must leave intact
-            /// what the others still share with it, and the last must leave
-            /// nothing behind.
+            /// Releases the trees one at a time, then the kept range delete
+            /// results, which must outlive the trees they came from. Each one
+            /// must leave intact what the others still share with it, and the
+            /// last must leave nothing behind.
             fn finish(h: *Harness) !void {
                 h.current = null;
-                h.current_budget = null;
+                h.current_fault = null;
                 try h.audit();
                 while (h.subjects.pop()) |popped| {
                     var subject = popped;
@@ -1366,6 +1642,8 @@ fn Suite(comptime spec: Spec) type {
                     subject.model.deinit(aux);
                     try h.checkOwnership();
                 }
+                while (h.results.items.len > 0) try h.releaseResult(h.results.items.len - 1);
+                try h.checkOwnership();
             }
         };
 
@@ -1423,6 +1701,8 @@ fn Suite(comptime spec: Spec) type {
             subject: *Subject,
             descending: bool,
             pool: []NewValue,
+            /// Picks the values to replace.
+            prng: std.Random.DefaultPrng,
             used: usize = 0,
             visited: usize = 0,
 
@@ -1438,7 +1718,7 @@ fn Suite(comptime spec: Spec) type {
                 walk.visited += 1;
 
                 if (comptime !owns_values) return;
-                if (walk.used == walk.pool.len or h.prng.random().uintLessThan(u8, 4) != 0) return;
+                if (walk.used == walk.pool.len or walk.prng.random().uintLessThan(u8, 4) != 0) return;
                 const fresh = walk.pool[walk.used];
                 walk.used += 1;
                 const n = items[index].key;
@@ -1454,14 +1734,14 @@ fn Suite(comptime spec: Spec) type {
             try items.append(aux, itemOf(key, value));
         }
 
-        fn runCase(seed: u64, profile: Profile) !void {
+        fn runCase(seeds: Seeds, profile: Profile) !void {
             // `testing.allocator` records a stack trace for every allocation,
             // which is too slow for this many. The tracking allocator reports
             // leaks and double frees itself, so the trees only need the
             // checks for writes to freed memory.
             var memory: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
             defer _ = memory.deinit();
-            var h: Harness = .init(memory.allocator(), seed);
+            var h: Harness = .init(memory.allocator(), seeds);
             defer h.deinit();
             errdefer h.report();
 
@@ -1469,16 +1749,16 @@ fn Suite(comptime spec: Spec) type {
             h.faults = profile.fill_faults;
             try h.fill(h.pickSize(profile.max_items));
             h.faults = true;
-            const mix = if (ordered) withKeyOps(profile.mix) else profile.mix;
-            for (0..profile.steps) |_| try h.step(mix);
+            const mix = if (is_map) forMaps(profile.mix) else if (key_ops) withKeyOps(profile.mix) else profile.mix;
+            for (0..profile.steps) |_| try h.generateStep(mix);
             try h.finish();
         }
 
         /// `salt` gives each test its own cases for the same seed.
         fn check(salt: u16, profile: Profile) !void {
             for (0..profile.cases) |case| {
-                const seed = @as(u64, testing.random_seed) << 32 | @as(u64, salt) << 16 | case;
-                runCase(seed, profile) catch |err| {
+                const seeds: Seeds = .of(@as(u64, testing.random_seed) << 32 | @as(u64, salt) << 16 | case);
+                runCase(seeds, profile) catch |err| {
                     std.debug.print("  case {d}; rerun with: zig build test --seed=0x{x}\n", .{ case, testing.random_seed });
                     return err;
                 };
@@ -1512,6 +1792,8 @@ const range_mix: Mix = .initDefault(0, .{
     .delete_range_at = 6,
     .delete_range = 3,
     .delete_all_at = 1,
+    .delete_range_by_rank = 3,
+    .release_result = 2,
 });
 
 const copy_point_mix: Mix = blk: {
@@ -1576,4 +1858,16 @@ test "values that break ties between equal keys match a model" {
 
 test "void values match a model" {
     try checkConfiguration(.{ .value = .none }, 50);
+}
+
+test "enum and float keys match a model" {
+    try checkConfiguration(.{ .key = .enumeration, .ordering = .ordered_key }, 60);
+    try checkConfiguration(.{ .key = .float, .ordering = .ordered_key }, 62);
+    // Binary search on float keys takes the branchless path.
+    try checkConfiguration(.{ .key = .float, .ordering = .ordered_key, .search_mode = .binary }, 64);
+}
+
+test "maps match a model" {
+    try checkConfiguration(.{ .container = .map, .ordering = .ordered_key }, 70);
+    try checkConfiguration(.{ .container = .map, .ordering = .ordered_key, .key = .string, .prefix = true }, 72);
 }
