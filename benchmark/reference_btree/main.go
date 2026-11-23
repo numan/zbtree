@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -28,14 +29,14 @@ func main() {
 	flag.IntVar(items, "n", *items, "items per benchmark run")
 	flag.IntVar(runs, "r", *runs, "number of benchmark runs; median is reported")
 	keyType := flag.String("type", "", "only run this key type, such as uint64")
-	bench := flag.String("bench", "", "only run this benchmark row, such as get(rand)")
+	bench := flag.String("bench", "", "only run these comma-separated benchmark rows, such as get(rand)")
 	flag.Parse()
 	if *items <= 0 || *runs <= 0 {
 		panic("items and runs must be greater than zero")
 	}
 
 	fmt.Println("tidwall/btree/v2 (Go, btree.Map)")
-	fmt.Printf("config: go=%s GOMAXPROCS=%d warmups=%d\n", runtime.Version(), runtime.GOMAXPROCS(0), warmupRuns)
+	fmt.Printf("config: go=%s GOMAXPROCS=%d values=%s warmups=%d\n", runtime.Version(), runtime.GOMAXPROCS(0), mapValueName, warmupRuns)
 	rows := benchMap[int32](*items, *runs, *keyType, *bench)
 	rows += benchMap[uint64](*items, *runs, *keyType, *bench)
 	rows += benchMap[string](*items, *runs, *keyType, *bench)
@@ -56,7 +57,7 @@ func benchMap[T keyType](items, runs int, onlyType, onlyBench string) int {
 	rows := 0
 	ctx := benchContext[T]{items: items, copyBatchOps: copyBatchCount(items)}
 	run := func(label string, ops int, pre, op func()) {
-		if onlyBench != "" && onlyBench != label {
+		if onlyBench != "" && !slices.Contains(strings.Split(onlyBench, ","), label) {
 			return
 		}
 		rows++
@@ -100,22 +101,22 @@ func benchMap[T keyType](items, runs int, onlyType, onlyBench string) int {
 type benchContext[T keyType] struct {
 	rng          *rand.Rand
 	items        int
-	tree         *btree.Map[T, int]
+	tree         *btree.Map[T, mapValue]
 	keys         []T
 	indices      []int
-	copiedTrees  []*btree.Map[T, int]
+	copiedTrees  []*btree.Map[T, mapValue]
 	copyBatchOps int
 	checksum     int
 }
 
 func (c *benchContext[T]) preInsertSeq() {
-	c.tree = btree.NewMap[T, int]()
+	c.tree = btree.NewMap[T, mapValue]()
 	c.keys = randKeys[T](c.rng, c.items)
 	slices.SortFunc(c.keys, cmp.Compare[T])
 }
 
 func (c *benchContext[T]) preInsertRand() {
-	c.tree = btree.NewMap[T, int]()
+	c.tree = btree.NewMap[T, mapValue]()
 	c.keys = randKeys[T](c.rng, c.items)
 	shuffle(c.rng, c.keys)
 }
@@ -139,7 +140,7 @@ func (c *benchContext[T]) preFullRand() {
 
 func (c *benchContext[T]) preReleaseCopies() {
 	c.fillTree(false)
-	c.copiedTrees = make([]*btree.Map[T, int], c.copyBatchOps)
+	c.copiedTrees = make([]*btree.Map[T, mapValue], c.copyBatchOps)
 	for i := range c.copiedTrees {
 		c.copiedTrees[i] = c.tree.Clone()
 	}
@@ -192,7 +193,7 @@ func (c *benchContext[T]) getAll() {
 	for _, key := range c.keys {
 		value, ok := c.tree.Lookup(key)
 		assert(ok)
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 	}
 	c.record(digest)
 }
@@ -202,7 +203,7 @@ func (c *benchContext[T]) getMutAll() {
 	for _, key := range c.keys {
 		value, ok := c.tree.LookupMut(key)
 		assert(ok)
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 	}
 	c.record(digest)
 }
@@ -213,7 +214,7 @@ func (c *benchContext[T]) setAll() {
 		newValue := valueForOrdinal(c.items + i)
 		oldValue, replaced := c.tree.Set(key, newValue)
 		assert(replaced)
-		digest += keyDigest(key) ^ oldValue ^ newValue
+		digest += keyDigest(key) ^ valueDigest(oldValue) ^ valueDigest(newValue)
 	}
 	c.record(digest + c.tree.Len())
 }
@@ -224,7 +225,7 @@ func (c *benchContext[T]) replaceAll() {
 		newValue := valueForOrdinal(c.items*2 + i)
 		oldValue, ok := c.tree.Replace(key, newValue)
 		assert(ok)
-		digest += keyDigest(key) ^ oldValue ^ newValue
+		digest += keyDigest(key) ^ valueDigest(oldValue) ^ valueDigest(newValue)
 	}
 	c.record(digest)
 }
@@ -234,7 +235,7 @@ func (c *benchContext[T]) seekAll() {
 	for _, key := range c.keys {
 		foundKey, value, ok := c.tree.Seek(key)
 		assert(ok)
-		digest += keyDigest(foundKey) ^ value
+		digest += keyDigest(foundKey) ^ valueDigest(value)
 	}
 	c.record(digest)
 }
@@ -244,7 +245,7 @@ func (c *benchContext[T]) seekNextAll() {
 	for _, key := range c.keys {
 		foundKey, value, ok := c.tree.SeekNext(key)
 		if ok {
-			digest += keyDigest(foundKey) ^ value
+			digest += keyDigest(foundKey) ^ valueDigest(value)
 		}
 	}
 	c.record(digest)
@@ -255,7 +256,7 @@ func (c *benchContext[T]) seekPrevAll() {
 	for _, key := range c.keys {
 		foundKey, value, ok := c.tree.SeekPrev(key)
 		if ok {
-			digest += keyDigest(foundKey) ^ value
+			digest += keyDigest(foundKey) ^ valueDigest(value)
 		}
 	}
 	c.record(digest)
@@ -276,7 +277,7 @@ func (c *benchContext[T]) getAtAll() {
 	for _, index := range c.indices {
 		key, value, ok := c.tree.LookupAt(index)
 		assert(ok)
-		digest += keyDigest(key) ^ value ^ index
+		digest += keyDigest(key) ^ valueDigest(value) ^ index
 	}
 	c.record(digest)
 }
@@ -286,7 +287,7 @@ func (c *benchContext[T]) getAtMutAll() {
 	for _, index := range c.indices {
 		key, value, ok := c.tree.LookupAtMut(index)
 		assert(ok)
-		digest += keyDigest(key) ^ value ^ index
+		digest += keyDigest(key) ^ valueDigest(value) ^ index
 	}
 	c.record(digest)
 }
@@ -294,7 +295,7 @@ func (c *benchContext[T]) getAtMutAll() {
 func (c *benchContext[T]) ascentMutAll() {
 	digest := 0
 	for key, value := range c.tree.AllMut() {
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 	}
 	c.record(digest + c.tree.Len())
 }
@@ -302,7 +303,7 @@ func (c *benchContext[T]) ascentMutAll() {
 func (c *benchContext[T]) descentMutAll() {
 	digest := 0
 	for key, value := range c.tree.BackwardMut() {
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 	}
 	c.record(digest + c.tree.Len())
 }
@@ -312,7 +313,7 @@ func (c *benchContext[T]) deleteAll() {
 	for _, key := range c.keys {
 		value, ok := c.tree.Delete(key)
 		assert(ok)
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 	}
 	c.record(digest)
 }
@@ -325,7 +326,7 @@ func (c *benchContext[T]) deleteAtFrontAll() {
 		if !ok {
 			break
 		}
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 		deleted++
 	}
 	assert(deleted == c.items)
@@ -340,7 +341,7 @@ func (c *benchContext[T]) popFrontAll() {
 		if !ok {
 			break
 		}
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 		deleted++
 	}
 	assert(deleted == c.items)
@@ -355,7 +356,7 @@ func (c *benchContext[T]) popBackAll() {
 		if !ok {
 			break
 		}
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 		deleted++
 	}
 	assert(deleted == c.items)
@@ -370,7 +371,7 @@ func (c *benchContext[T]) deleteRangeAtReturning() {
 	assert(c.tree.Len() == c.items-count)
 	digest := 0
 	for key, value := range removed.All() {
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 	}
 	c.record(digest + count)
 }
@@ -384,7 +385,7 @@ func (c *benchContext[T]) deleteRangeReturning() {
 	assert(c.tree.Len() == c.items-count)
 	digest := 0
 	for key, value := range removed.All() {
-		digest += keyDigest(key) ^ value
+		digest += keyDigest(key) ^ valueDigest(value)
 	}
 	c.record(digest + count)
 }
@@ -467,10 +468,6 @@ func mixSeed(seed uint64, text string) uint64 {
 
 func partialRangeCount(items int) int {
 	return max(1, items/10)
-}
-
-func valueForOrdinal(index int) int {
-	return index + 1
 }
 
 func keyDigest[T keyType](key T) int {

@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const zbtree_ds = @import("zbtree_ds");
 const map = zbtree_ds.map;
-const order = zbtree_ds.order;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -13,8 +12,14 @@ const warmup_runs = 2;
 /// Node search the benchmarked maps use, set with `-Dsearch-mode`.
 const search_mode: map.SearchMode = switch (build_options.search_mode) {
     .auto => .auto,
-    .binary => .binary,
     .linear => .linear,
+};
+
+/// What the benchmarked maps store per key. `void` makes them key-only, as
+/// the sets and `Map[K, struct{}]` in upstream btree-bench are.
+const Value = switch (build_options.values) {
+    .usize => usize,
+    .none => void,
 };
 
 const AllocatorChoice = enum { smp, arena };
@@ -35,7 +40,7 @@ const Options = struct {
     allocator: AllocatorChoice = .smp,
     /// Limits the run to one key type, such as `uint64`.
     key_type: ?[]const u8 = null,
-    /// Limits the run to one benchmark row, such as `get(rand)`.
+    /// Limits the run to benchmark rows, such as `get(rand)` or a comma-separated list.
     bench: ?[]const u8 = null,
     /// Internal; users should not pass `--child`.
     role: Role = .parent,
@@ -52,11 +57,12 @@ pub fn main(init: std.process.Init) !void {
 
     if (options.role == .parent) {
         try stdout.print("\nzbtree_ds (Zig)\n", .{});
-        try stdout.print("config: optimize={s} safety={s} allocator={s} search={s} warmups={d}\n", .{
+        try stdout.print("config: optimize={s} safety={s} allocator={s} search={s} values={s} warmups={d}\n", .{
             optimizeName(builtin.mode),
             if (std.debug.runtime_safety) "on" else "off",
             @tagName(options.allocator),
             @tagName(search_mode),
+            @typeName(Value),
             warmup_runs,
         });
     }
@@ -65,9 +71,9 @@ pub fn main(init: std.process.Init) !void {
         .child => "",
     };
     var rows: usize = 0;
-    rows += try benchType(order.OrderedKey(i32, void), "int32", options, exe_path, allocator, init.io, stdout);
-    rows += try benchType(order.OrderedKey(u64, void), "uint64", options, exe_path, allocator, init.io, stdout);
-    rows += try benchType(order.OrderedKey([]const u8, void), "string", options, exe_path, allocator, init.io, stdout);
+    rows += try benchType(i32, "int32", options, exe_path, allocator, init.io, stdout);
+    rows += try benchType(u64, "uint64", options, exe_path, allocator, init.io, stdout);
+    rows += try benchType([]const u8, "string", options, exe_path, allocator, init.io, stdout);
     if (rows == 0) return error.NoMatchingBenchmark;
 }
 
@@ -146,7 +152,7 @@ fn envUsize(init: std.process.Init, name: []const u8, default: usize) !usize {
 /// freed nodes back in last-in-first-out order, so in a shared process the
 /// node layout a row sees would depend on which rows ran before it.
 fn benchType(
-    comptime Order: type,
+    comptime K: type,
     comptime key_name: []const u8,
     options: Options,
     exe_path: []const u8,
@@ -154,8 +160,7 @@ fn benchType(
     io: Io,
     stdout: *Io.Writer,
 ) !usize {
-    const K = Order.Key;
-    const Map = map.Map(K, usize, .{ .use_string_prefix = Order.use_string_prefix, .search_mode = search_mode });
+    const Map = map.Map(K, Value, .{ .search_mode = search_mode });
     const Ctx = BenchContext(K, Map);
 
     // How many operations one timed sample performs, used to compute ns/op.
@@ -203,7 +208,7 @@ fn benchType(
 
     var rows: usize = 0;
     inline for (benchmarks) |bench| {
-        if (options.bench == null or std.mem.eql(u8, options.bench.?, bench.label)) {
+        if (isSelected(options.bench, bench.label)) {
             rows += 1;
             switch (options.role) {
                 .parent => {
@@ -224,6 +229,14 @@ fn benchType(
     }
     if (options.role == .parent) try stdout.print("\n", .{});
     return rows;
+}
+
+fn isSelected(wanted: ?[]const u8, label: []const u8) bool {
+    var labels = std.mem.splitScalar(u8, wanted orelse return true, ',');
+    while (labels.next()) |candidate| {
+        if (std.mem.eql(u8, candidate, label)) return true;
+    }
+    return false;
 }
 
 fn runRowInChild(
@@ -391,7 +404,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             var digest: usize = 0;
             for (self.keys) |key| {
                 const value = self.tree.get(key) orelse return error.BenchmarkMissingKey;
-                digest +%= digestKey(key) ^ value;
+                digest +%= digestKey(key) ^ valueDigest(value);
             }
             self.record(digest);
         }
@@ -400,7 +413,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             var digest: usize = 0;
             for (self.keys) |key| {
                 const value = (try self.tree.getMut(self.allocator, key)) orelse return error.BenchmarkMissingKey;
-                digest +%= digestKey(key) ^ value.*;
+                digest +%= digestKey(key) ^ valueDigest(value.*);
             }
             self.record(digest);
         }
@@ -410,7 +423,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             for (self.keys, 0..) |key, i| {
                 const new_value = valueForOrdinal(self.items + i);
                 const old_value = try self.tree.set(self.allocator, key, new_value) orelse return error.BenchmarkMissingKey;
-                digest +%= digestKey(key) ^ old_value ^ new_value;
+                digest +%= digestKey(key) ^ valueDigest(old_value) ^ valueDigest(new_value);
             }
             self.record(digest +% self.tree.len());
         }
@@ -420,7 +433,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             for (self.keys, 0..) |key, i| {
                 const new_value = valueForOrdinal(self.items * 2 + i);
                 const old_value = try self.tree.replace(self.allocator, key, new_value) orelse return error.BenchmarkMissingKey;
-                digest +%= digestKey(key) ^ old_value ^ new_value;
+                digest +%= digestKey(key) ^ valueDigest(old_value) ^ valueDigest(new_value);
             }
             self.record(digest);
         }
@@ -473,7 +486,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             var digest: usize = 0;
             for (self.indices) |index| {
                 const entry = (try self.tree.getAtMut(self.allocator, index)) orelse return error.BenchmarkMissingKey;
-                digest +%= digestKey(entry.key) ^ entry.value.* ^ index;
+                digest +%= digestKey(entry.key) ^ valueDigest(entry.value.*) ^ index;
             }
             self.record(digest);
         }
@@ -492,7 +505,7 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             var digest: usize = 0;
             for (self.keys) |key| {
                 const value = try self.tree.delete(self.allocator, key) orelse return error.BenchmarkMissingKey;
-                digest +%= digestKey(key) ^ value;
+                digest +%= digestKey(key) ^ valueDigest(value);
             }
             self.record(digest);
         }
@@ -584,16 +597,16 @@ fn BenchContext(comptime K: type, comptime Map: type) type {
             self.record(digest);
         }
 
-        fn consumeRemoved(self: *Self, key: K, value: usize) !void {
-            self.checksum +%= digestKey(key) ^ value;
+        fn consumeRemoved(self: *Self, key: K, value: Value) !void {
+            self.checksum +%= digestKey(key) ^ valueDigest(value);
         }
 
-        fn consumeMutEntry(self: *Self, key: K, value: *usize) !void {
-            self.checksum +%= digestKey(key) ^ value.*;
+        fn consumeMutEntry(self: *Self, key: K, value: *Value) !void {
+            self.checksum +%= digestKey(key) ^ valueDigest(value.*);
         }
 
         fn entryDigest(entry: Map.Entry) usize {
-            return digestKey(entry.key) ^ entry.value;
+            return digestKey(entry.key) ^ valueDigest(entry.value);
         }
 
         fn digestKey(key: K) usize {
@@ -624,8 +637,12 @@ fn copyBatchCount(items: usize) usize {
     return @max(@as(usize, 1024), @min(items, 16_384));
 }
 
-fn valueForOrdinal(index: usize) usize {
-    return index +% 1;
+fn valueForOrdinal(index: usize) Value {
+    return if (Value == void) {} else index +% 1;
+}
+
+fn valueDigest(value: Value) usize {
+    return if (Value == void) 0 else value;
 }
 
 fn benchmarkSeed(type_name: []const u8, label: []const u8) u64 {

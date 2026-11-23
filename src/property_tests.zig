@@ -5,8 +5,10 @@
 //! and makes allocations fail at random points inside the operations: either
 //! one allocation and every later one, or one allocation alone. The cases run
 //! against several tree configurations: integer, string, enum, and float
-//! keys, string prefixes, linear and binary search, ordered-key mode, values
-//! that break ties between equal keys, `void` values, and `Map`. String keys
+//! keys, string prefixes, linear and binary search, keys in the built-in
+//! order or in a custom order (descending integers and case-insensitive
+//! strings), items ordered by key and value, values that break ties
+//! between equal keys, `void` values, and `Map`. String keys
 //! include keys shorter than 8 bytes, zero and 0xFF bytes, and long keys that
 //! share their first 8 bytes. Some range delete results are kept while later
 //! operations run, and released after the trees they came from.
@@ -239,7 +241,7 @@ const Op = union(enum) {
     clear,
     copy,
     drop,
-    // Only for trees in ordered-key mode.
+    // Only for trees ordered by key alone.
     insert_key: isize,
     set_key: isize,
     replace_key: isize,
@@ -347,19 +349,30 @@ const Spec = struct {
     /// `Map` wraps an ordered-key tree and takes keys without values.
     container: enum { tree, map } = .tree,
     key: enum { int, string, enumeration, float } = .int,
-    /// Whether string keys keep their first 8 bytes in internal nodes.
+    /// Whether internal nodes route string keys by their first 8 bytes,
+    /// lowercased when the order ignores case. The built-in string order
+    /// always routes by them, so byte-ordered strings without a prefix use a
+    /// custom order that compares bytes.
     prefix: bool = false,
     value: enum {
         /// Each value is an allocation the tree owns, holding a unique tag.
         owned,
         /// Like `owned`, but the value also holds the low part of the model
-        /// key, and the comparator breaks ties between equal tree keys with
+        /// key, and the value order breaks ties between equal tree keys with
         /// it, as an ordered collection with duplicate keys would.
         tie_break,
         /// `void`: there is nothing to own or tag.
         none,
     } = .owned,
-    ordering: btree.Ordering = .compare,
+    order: enum {
+        /// By key and value, through the suite's `orderValues`.
+        items,
+        /// By key alone.
+        keys,
+        /// By key alone, in a custom order: integers in descending order,
+        /// and strings ignoring case.
+        custom_keys,
+    } = .items,
     search_mode: btree.SearchMode = .auto,
 };
 
@@ -375,11 +388,17 @@ const Profile = struct {
 
 fn Suite(comptime spec: Spec) type {
     comptime {
-        if (spec.value == .tie_break and (spec.key != .int or spec.ordering != .compare)) {
-            @compileError("tie-break values need integer keys and a comparator");
+        if (spec.value == .tie_break and (spec.key != .int or spec.order != .items)) {
+            @compileError("tie-break values need integer keys and .order = .items");
         }
-        if (spec.container == .map and spec.ordering != .ordered_key) {
-            @compileError("maps order by key alone, so they need .ordering = .ordered_key");
+        if (spec.container == .map and spec.order == .items) {
+            @compileError("maps order by key alone, so they need .order = .keys or .custom_keys");
+        }
+        if (spec.order == .custom_keys and spec.key != .int and spec.key != .string) {
+            @compileError("custom key orders are for integer and string keys");
+        }
+        if (spec.prefix and spec.key != .string) {
+            @compileError("prefixes are for string keys");
         }
     }
 
@@ -400,22 +419,39 @@ fn Suite(comptime spec: Spec) type {
         const is_map = spec.container == .map;
         /// Whether the type under test has the key-only variants of the
         /// keyed operations. A map's keyed operations are key-only.
-        const key_ops = spec.ordering == .ordered_key and !is_map;
+        const key_ops = spec.order != .items and !is_map;
+        /// Whether string keys ignore case.
+        const ignore_case = spec.order == .custom_keys and spec.key == .string;
 
         /// The type under test.
         const Tree = if (is_map) Map(K, V, .{
-            .use_string_prefix = spec.prefix,
+            .order = key_order,
             .search_mode = spec.search_mode,
             .copy_value = if (owns_values) &copyValue else null,
             .release_value = if (owns_values) &releaseValue else null,
         }) else btree.Tree(K, V, .{
-            .compare = compare,
-            .ordering = spec.ordering,
-            .use_string_prefix = spec.prefix,
+            .order = key_order,
+            .value_order = if (spec.order == .items) orderValues else null,
             .search_mode = spec.search_mode,
             .copy_value = if (owns_values) &copyValue else null,
             .release_value = if (owns_values) &releaseValue else null,
         });
+        /// Whether keys are in the built-in order of the key type.
+        const builtin_keys = spec.order != .custom_keys and (spec.key != .string or spec.prefix);
+        const key_order: ?btree.Order(K) = if (builtin_keys) null else .{
+            .compare = orderKeys,
+            .prefix = if (spec.prefix) lowerPrefix else null,
+        };
+
+        /// The first 8 bytes lowercased, which orders keys the way
+        /// `orderKeys` does when it ignores case.
+        fn lowerPrefix(key: []const u8) u64 {
+            var bytes: [8]u8 = @splat(0);
+            const n = @min(bytes.len, key.len);
+            for (bytes[0..n], key[0..n]) |*byte, c| byte.* = std.ascii.toLower(c);
+            return std.mem.readInt(u64, &bytes, .big);
+        }
+
         /// The tree that holds the nodes.
         const Base = if (is_map) @FieldType(Tree, "tree") else Tree;
 
@@ -429,15 +465,23 @@ fn Suite(comptime spec: Spec) type {
         /// and keeps the remainder in the value.
         const tie_span = 4;
 
-        fn compare(a: K, a_value: V, b: K, b_value: V) std.math.Order {
-            const order = switch (spec.key) {
-                .int, .float => std.math.order(a, b),
-                .string => std.mem.order(u8, a, b),
-                .enumeration => std.math.order(@backingInt(a), @backingInt(b)),
+        /// Orders values that break ties by the low part of the model key.
+        /// Other values are all equal, so the tree keeps one item per key.
+        fn orderValues(a: V, b: V) std.math.Order {
+            if (comptime spec.value != .tie_break) return .eq;
+            return std.math.order(minorOf(a), minorOf(b));
+        }
+
+        /// The key order when it isn't the built-in one: integers in
+        /// descending order and strings ignoring case when it is custom, and
+        /// strings by their bytes otherwise.
+        fn orderKeys(a: K, b: K) std.math.Order {
+            if (comptime spec.order != .custom_keys) return std.mem.order(u8, a, b);
+            return switch (spec.key) {
+                .int => std.math.order(b, a),
+                .string => std.ascii.orderIgnoreCase(a, b),
+                else => comptime unreachable,
             };
-            if (comptime spec.value != .tie_break) return order;
-            if (order != .eq) return order;
-            return std.math.order(minorOf(a_value), minorOf(b_value));
         }
 
         fn copyValue(gpa: Allocator, value: V) anyerror!V {
@@ -463,26 +507,53 @@ fn Suite(comptime spec: Spec) type {
         /// matches numeric order, then the tail for `n % string_tails.len`.
         /// The keys that share their first 2 bytes have tails that tie on
         /// the string prefix as well as tails that it orders.
-        fn encode(gpa: Allocator, n: isize) Allocator.Error![]const u8 {
+        ///
+        /// When the order ignores case, the 2 bytes are written as 4
+        /// lowercase hex digits instead, so that no key holds a capital
+        /// letter of its own, and the bits of `capitals` capitalize some of
+        /// its letters, so that equal keys come in different spellings.
+        fn encode(gpa: Allocator, n: isize, capitals: u64) Allocator.Error![]const u8 {
             const major = std.math.cast(i16, @divFloor(n, string_tails.len)) orelse
                 @panic("model key is outside the range of string keys");
             const tail = string_tails[@intCast(@mod(n, string_tails.len))];
-            const key = try gpa.alloc(u8, 2 + tail.len);
-            std.mem.writeInt(u16, key[0..2], @as(u16, @bitCast(major)) ^ sign_bit, .big);
-            @memcpy(key[2..], tail);
+            const biased = @as(u16, @bitCast(major)) ^ sign_bit;
+            const key = try gpa.alloc(u8, head_len + tail.len);
+            if (comptime ignore_case) {
+                _ = std.fmt.bufPrint(key[0..head_len], "{x:0>4}", .{biased}) catch unreachable;
+            } else {
+                std.mem.writeInt(u16, key[0..head_len], biased, .big);
+            }
+            @memcpy(key[head_len..], tail);
+            if (comptime ignore_case) {
+                var bits = capitals;
+                for (key) |*byte| {
+                    if (!std.ascii.isLower(byte.*)) continue;
+                    if (bits & 1 != 0) byte.* = std.ascii.toUpper(byte.*);
+                    bits >>= 1;
+                }
+            }
             return key;
         }
 
         /// The model key of a string key, or `invalid_key` for a key that
         /// `encode` can't produce.
         fn decode(key: []const u8) isize {
-            if (key.len < 2) return invalid_key;
-            const major: i16 = @bitCast(std.mem.readInt(u16, key[0..2], .big) ^ sign_bit);
-            const minor = std.sort.binarySearch([]const u8, &string_tails, key[2..], orderTail) orelse return invalid_key;
+            if (key.len < head_len) return invalid_key;
+            const biased = if (comptime ignore_case)
+                std.fmt.parseInt(u16, key[0..head_len], 16) catch return invalid_key
+            else
+                std.mem.readInt(u16, key[0..head_len], .big);
+            const major: i16 = @bitCast(biased ^ sign_bit);
+            const minor = std.sort.binarySearch([]const u8, &string_tails, key[head_len..], orderTail) orelse return invalid_key;
             return @as(isize, major) * string_tails.len + @as(isize, @intCast(minor));
         }
 
+        /// The length of the part of a string key before its tail.
+        const head_len = if (ignore_case) 4 else 2;
+
         fn orderTail(tail: []const u8, item: []const u8) std.math.Order {
+            // The tails hold no capitals, so ignoring case keeps them sorted.
+            if (comptime ignore_case) return std.ascii.orderIgnoreCase(tail, item);
             return std.mem.order(u8, tail, item);
         }
 
@@ -503,7 +574,7 @@ fn Suite(comptime spec: Spec) type {
         /// The model key of a tree item whose value is known to be live.
         fn modelKey(key: K, value: V) isize {
             const major: isize = switch (spec.key) {
-                .int => key,
+                .int => if (spec.order == .custom_keys) -key else key,
                 .string => decode(key),
                 .enumeration => @backingInt(key),
                 .float => decodeFloat(key),
@@ -572,6 +643,8 @@ fn Suite(comptime spec: Spec) type {
             current: ?Op = null,
             current_tree: usize = 0,
             current_fault: ?Fault = null,
+            /// Keys the current step has encoded, for `capitals`.
+            encoded: u64 = 0,
 
             fn init(backing: Allocator, seeds: Seeds) Harness {
                 return .{
@@ -616,11 +689,21 @@ fn Suite(comptime spec: Spec) type {
             /// The tree key for model key `n`.
             fn treeKey(h: *Harness, n: isize) Allocator.Error!K {
                 switch (spec.key) {
-                    .int => return if (spec.value == .tie_break) @divFloor(n, tie_span) else n,
-                    .string => return encode(h.keys.allocator(), n),
+                    .int => return if (spec.value == .tie_break) @divFloor(n, tie_span) else if (spec.order == .custom_keys) -n else n,
+                    .string => return encode(h.keys.allocator(), n, if (ignore_case) h.capitals(n) else 0),
                     .enumeration => return @fromBackingInt(std.math.cast(i32, n) orelse @panic("model key is outside the range of enum keys")),
                     .float => return @as(f64, @floatFromInt(n)) * float_step,
                 }
+            }
+
+            /// Which letters of the next string key to capitalize, when the
+            /// order ignores case. It depends on the key, the step, and how
+            /// many keys the step has encoded so far, and not on the checks,
+            /// so that the checks don't change the keys operations use.
+            fn capitals(h: *Harness, n: isize) u64 {
+                h.encoded += 1;
+                var split: std.Random.SplitMix64 = .init(@as(u64, @bitCast(@as(i64, n))) ^ @as(u64, h.steps) << 32 ^ h.encoded);
+                return split.next();
             }
 
             /// The value to look up model key `n` with. Only a tie-break
@@ -1011,6 +1094,7 @@ fn Suite(comptime spec: Spec) type {
             // --------------------------------------------------------- operations
 
             fn apply(h: *Harness, index: usize, op: Op) !void {
+                h.encoded = 0;
                 h.current = op;
                 h.current_tree = index;
                 h.current_fault = null;
@@ -1837,19 +1921,14 @@ fn checkConfiguration(comptime spec: Spec, salt: u16) !void {
     try S.check(salt + 1, .{ .cases = 80, .max_items = 6_000, .fill_faults = false, .steps = 32, .mix = copy_range_mix });
 }
 
-test "trees with binary search match a model" {
-    try checkConfiguration(.{ .search_mode = .binary }, 10);
-}
-
 test "string keys with prefixes match a model" {
     try checkConfiguration(.{ .key = .string, .prefix = true }, 20);
 }
 
 test "ordered-key trees match a model" {
-    try checkConfiguration(.{ .ordering = .ordered_key }, 30);
-    try checkConfiguration(.{ .ordering = .ordered_key, .search_mode = .binary }, 32);
-    try checkConfiguration(.{ .key = .string, .prefix = true, .ordering = .ordered_key, .search_mode = .linear }, 34);
-    try checkConfiguration(.{ .key = .string, .ordering = .ordered_key }, 36);
+    try checkConfiguration(.{ .order = .keys }, 30);
+    try checkConfiguration(.{ .key = .string, .prefix = true, .order = .keys, .search_mode = .linear }, 34);
+    try checkConfiguration(.{ .key = .string, .order = .keys }, 36);
 }
 
 test "values that break ties between equal keys match a model" {
@@ -1861,13 +1940,18 @@ test "void values match a model" {
 }
 
 test "enum and float keys match a model" {
-    try checkConfiguration(.{ .key = .enumeration, .ordering = .ordered_key }, 60);
-    try checkConfiguration(.{ .key = .float, .ordering = .ordered_key }, 62);
-    // Binary search on float keys takes the branchless path.
-    try checkConfiguration(.{ .key = .float, .ordering = .ordered_key, .search_mode = .binary }, 64);
+    try checkConfiguration(.{ .key = .enumeration, .order = .keys }, 60);
+    try checkConfiguration(.{ .key = .float, .order = .keys }, 62);
 }
 
 test "maps match a model" {
-    try checkConfiguration(.{ .container = .map, .ordering = .ordered_key }, 70);
-    try checkConfiguration(.{ .container = .map, .ordering = .ordered_key, .key = .string, .prefix = true }, 72);
+    try checkConfiguration(.{ .container = .map, .order = .keys }, 70);
+    try checkConfiguration(.{ .container = .map, .order = .keys, .key = .string, .prefix = true }, 72);
+    try checkConfiguration(.{ .container = .map, .order = .custom_keys, .key = .string, .prefix = true }, 74);
+}
+
+test "custom key orders match a model" {
+    try checkConfiguration(.{ .order = .custom_keys }, 80);
+    try checkConfiguration(.{ .order = .custom_keys, .key = .string }, 82);
+    try checkConfiguration(.{ .order = .custom_keys, .key = .string, .prefix = true }, 84);
 }

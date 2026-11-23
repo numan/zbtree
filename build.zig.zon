@@ -61,6 +61,11 @@
         //    // actually used.
         //    .lazy = false,
         //},
+        .frozenca_btree = .{
+            .url = "git+https://github.com/frozenca/BTree#924230033c9696758958e7ea6877c21da24ea2da",
+            .hash = "N-V-__8AAEloAgAtkTLjVKWoizTiLxkzBgHXluCXtaG9uzBI",
+            .lazy = true,
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

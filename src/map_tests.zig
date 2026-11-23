@@ -150,7 +150,7 @@ fn refillIntMap(comptime IntMap: type, m: *IntMap, count: usize) !void {
 }
 
 fn runRandomDeleteRangeCase(comptime opts: map.DeleteRangeOptions, seed: u64) !void {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
@@ -262,7 +262,7 @@ test "map re-exports shared btree options and constants" {
     try testing.expectEqual(btree.SearchMode, map.SearchMode);
     try testing.expectEqual(btree.DeleteRangeOptions, map.DeleteRangeOptions);
 
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false, .search_mode = .binary });
+    const IntMap = map.Map(i32, i32, .{ .search_mode = .linear });
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
@@ -278,7 +278,7 @@ test "map re-exports shared btree options and constants" {
 }
 
 test "map facade preserves key-only identity" {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
@@ -295,7 +295,7 @@ test "map facade preserves key-only identity" {
 }
 
 test "map facade forwards ordered traversal and index APIs" {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
@@ -330,7 +330,7 @@ test "map facade forwards ordered traversal and index APIs" {
 }
 
 test "map randomized operations match sorted oracle" {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
@@ -422,7 +422,7 @@ test "map randomized operations match sorted oracle" {
 }
 
 test "map facade forwards mutable accessors and copy-on-write" {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var original = IntMap.init();
     defer original.deinit(testing.allocator);
 
@@ -447,7 +447,7 @@ test "map facade forwards mutable accessors and copy-on-write" {
 }
 
 test "map set inserts into copied tree without mutating original" {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var original = IntMap.init();
     defer original.deinit(testing.allocator);
 
@@ -473,7 +473,7 @@ test "map set inserts into copied tree without mutating original" {
 }
 
 test "map facade forwards range deletion result ownership" {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
@@ -510,7 +510,7 @@ test "map randomized range deletion matches sorted oracle" {
 }
 
 test "map deleteRangeAt covers empty clamped and full ranges" {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
@@ -565,7 +565,7 @@ test "map deleteRangeAt covers empty clamped and full ranges" {
 }
 
 test "map indexed operations return null outside bounds" {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
@@ -586,7 +586,6 @@ test "map indexed operations return null outside bounds" {
 
 test "map facade preserves value ownership hooks" {
     const ByteMap = map.Map(i32, []const u8, .{
-        .use_string_prefix = false,
         .copy_value = copyBytes,
         .release_value = releaseBytes,
     });
@@ -614,7 +613,6 @@ test "map copy-on-write stress isolates generations with value hooks" {
     tracked_release_count = 0;
 
     const IntMap = map.Map(i32, i32, .{
-        .use_string_prefix = false,
         .copy_value = copyTrackedInt,
         .release_value = releaseTrackedInt,
     });
@@ -656,9 +654,13 @@ test "map copy-on-write stress isolates generations with value hooks" {
     try second_copy.checkInvariants();
 }
 
-test "string map defaults to prefix routing but can disable it" {
+fn orderBytes(a: []const u8, b: []const u8) std.math.Order {
+    return std.mem.order(u8, a, b);
+}
+
+test "string map works with prefix routing and with an order that has none" {
     const PrefixMap = map.Map([]const u8, usize, .{});
-    const NoPrefixMap = map.Map([]const u8, usize, .{ .use_string_prefix = false });
+    const NoPrefixMap = map.Map([]const u8, usize, .{ .order = .{ .compare = orderBytes } });
 
     inline for (.{ PrefixMap, NoPrefixMap }) |StringMap| {
         var m = StringMap.init();
@@ -679,7 +681,7 @@ test "string map defaults to prefix routing but can disable it" {
 
 test "string map handles long common-prefix keys and copied deletions" {
     const PrefixMap = map.Map([]const u8, usize, .{});
-    const NoPrefixMap = map.Map([]const u8, usize, .{ .use_string_prefix = false });
+    const NoPrefixMap = map.Map([]const u8, usize, .{ .order = .{ .compare = orderBytes } });
 
     inline for (.{ PrefixMap, NoPrefixMap }) |StringMap| {
         var m = StringMap.init();
@@ -715,7 +717,7 @@ test "string map handles long common-prefix keys and copied deletions" {
 
 test "string map set replaces only the value and keeps the stored key" {
     const PrefixMap = map.Map([]const u8, usize, .{});
-    const NoPrefixMap = map.Map([]const u8, usize, .{ .use_string_prefix = false });
+    const NoPrefixMap = map.Map([]const u8, usize, .{ .order = .{ .compare = orderBytes } });
 
     inline for (.{ PrefixMap, NoPrefixMap }) |StringMap| {
         var m = StringMap.init();
@@ -759,7 +761,7 @@ test "string map set replaces only the value and keeps the stored key" {
 }
 
 test "map traversal callbacks stop early and propagate errors" {
-    const IntMap = map.Map(i32, i32, .{ .use_string_prefix = false });
+    const IntMap = map.Map(i32, i32, .{});
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
@@ -793,7 +795,7 @@ test "map traversal callbacks stop early and propagate errors" {
 }
 
 test "void map facade supports key-only deletion" {
-    const VoidMap = map.Map(i32, void, .{ .use_string_prefix = false });
+    const VoidMap = map.Map(i32, void, .{});
     var m = VoidMap.init();
     defer m.deinit(testing.allocator);
 

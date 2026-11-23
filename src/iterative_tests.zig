@@ -5,17 +5,13 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
 
-fn cmpKey(a: isize, _: isize, b: isize, _: isize) Order {
+fn cmpKey(a: isize, b: isize) Order {
     return std.math.order(a, b);
 }
 
-fn cmpStr(a: []const u8, _: usize, b: []const u8, _: usize) Order {
-    return std.mem.order(u8, a, b);
-}
-
-const IntTree = btree.Tree(isize, isize, .{ .compare = cmpKey, .use_string_prefix = false });
-const KeyTree = btree.Tree(isize, isize, .{ .compare = cmpKey, .ordering = .ordered_key, .use_string_prefix = false });
-const StrTree = btree.Tree([]const u8, usize, .{ .compare = cmpStr, .use_string_prefix = true });
+const IntTree = btree.Tree(isize, isize, .{ .order = .{ .compare = cmpKey } });
+const KeyTree = btree.Tree(isize, isize, .{});
+const StrTree = btree.Tree([]const u8, usize, .{});
 const IntMap = map.Map(isize, isize, .{});
 
 /// 70k sequential keys build a 4-level tree: root, two internal levels, leaves.
@@ -486,8 +482,7 @@ fn releaseCounted(_: Allocator, _: isize) void {
 }
 
 const OwnedTree = btree.Tree(isize, isize, .{
-    .compare = cmpKey,
-    .use_string_prefix = false,
+    .order = .{ .compare = cmpKey },
     .copy_value = copyCounted,
     .release_value = releaseCounted,
 });

@@ -1,6 +1,11 @@
 const std = @import("std");
+const bench_output = @import("bench_output.zig");
 
 const Allocator = std.mem.Allocator;
+const Section = bench_output.Section;
+const parseSectionHeader = bench_output.parseSectionHeader;
+const parseCommaU64 = bench_output.parseCommaU64;
+const isDigit = bench_output.isDigit;
 
 /// A result is a tie when the faster side has less than (100 + tie_percent)% of the slower side's ops/sec.
 const tie_percent = 10;
@@ -9,12 +14,6 @@ const Row = struct {
     key_name: []const u8,
     label: []const u8,
     ops_per_sec: u64,
-};
-
-const Section = struct {
-    items: u64,
-    key_name: []const u8,
-    runs: u64,
 };
 
 const Config = struct {
@@ -259,23 +258,6 @@ fn parseConfigLine(line: []const u8) ?Config {
     return config;
 }
 
-/// Parses `Benchmarking N items, KEY keys, R times, using median`.
-fn parseSectionHeader(line: []const u8) ?Section {
-    const prefix = "Benchmarking ";
-    if (!std.mem.startsWith(u8, line, prefix)) return null;
-    const items_marker = " items, ";
-    const keys_marker = " keys, ";
-    const times_marker = " times";
-    const items_index = std.mem.indexOf(u8, line, items_marker) orelse return null;
-    const items = parseCommaU64(line[prefix.len..items_index]) catch return null;
-    const key_start = items_index + items_marker.len;
-    const key_end = std.mem.indexOf(u8, line[key_start..], keys_marker) orelse return null;
-    const runs_start = key_start + key_end + keys_marker.len;
-    const runs_end = std.mem.indexOf(u8, line[runs_start..], times_marker) orelse return null;
-    const runs = parseCommaU64(line[runs_start .. runs_start + runs_end]) catch return null;
-    return .{ .items = items, .key_name = line[key_start .. key_start + key_end], .runs = runs };
-}
-
 const ParsedBenchmarkLine = struct {
     label: []const u8,
     ops_per_sec: u64,
@@ -297,21 +279,6 @@ fn parseBenchmarkLine(line: []const u8) ?ParsedBenchmarkLine {
     if (label.len == 0) return null;
 
     return .{ .label = label, .ops_per_sec = ops_per_sec };
-}
-
-fn isDigit(byte: u8) bool {
-    return byte >= '0' and byte <= '9';
-}
-
-fn parseCommaU64(raw: []const u8) !u64 {
-    var value: u64 = 0;
-    for (raw) |byte| {
-        if (byte == ',') continue;
-        if (!isDigit(byte)) return error.InvalidBenchmarkNumber;
-        value = try std.math.mul(u64, value, 10);
-        value = try std.math.add(u64, value, byte - '0');
-    }
-    return value;
 }
 
 /// Compares Zig and Go throughput. Ties are decided with exact integer math:
@@ -510,11 +477,6 @@ test "parseConfigLine reads zig and go config lines" {
     try std.testing.expect(parseConfigLine("zbtree_ds (Zig)") == null);
 }
 
-test "parseSectionHeader reads items, key type and runs" {
-    const section = parseSectionHeader("Benchmarking 1,000,000 items, uint64 keys, 50 times, using median").?;
-    try std.testing.expectEqual(@as(u64, 1_000_000), section.items);
-    try std.testing.expectEqualStrings("uint64", section.key_name);
-    try std.testing.expectEqual(@as(u64, 50), section.runs);
-
-    try std.testing.expect(parseSectionHeader("insert(seq)        2,000 ops in 0.000 secs 10.0 ns/op 1 op/sec") == null);
+test {
+    _ = bench_output;
 }

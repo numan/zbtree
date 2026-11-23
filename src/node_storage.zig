@@ -5,7 +5,7 @@ const std = @import("std");
 pub fn NodeStorage(
     comptime K: type,
     comptime V: type,
-    comptime use_string_prefix: bool,
+    comptime use_prefix: bool,
 ) type {
     return struct {
         /// Maximum number of child pointers in an internal node.
@@ -23,7 +23,11 @@ pub fn NodeStorage(
         pub const Node = struct {
             const NodeSelf = @This();
 
-            keys: [max_items]K = undefined,
+            // Aligned so the SIMD read search in btree.zig compares chunks
+            // that start on a 64-byte cache line, whatever field order the
+            // compiler picks and whichever allocator made the node. Not 100%
+            // sure it makes a different, but it seems to for some cases.
+            keys: [max_items]K align(64) = undefined,
             values: [max_items]V = undefined,
             len: u8 = 0,
             branch: ?*Branch = null,
@@ -46,7 +50,7 @@ pub fn NodeStorage(
 
             children: [fanout]?*Node = @splat(null),
             counts: [fanout]usize = @splat(0),
-            prefixes: if (use_string_prefix) [max_items]u64 else void = if (use_string_prefix) @splat(0) else {},
+            prefixes: if (use_prefix) [max_items]u64 else void = if (use_prefix) @splat(0) else {},
 
             pub fn init() BranchSelf {
                 return .{};

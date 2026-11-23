@@ -1,11 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const node_storage = @import("node_storage.zig");
 const testing = std.testing;
 
 pub const SearchMode = enum {
     linear,
-    binary,
     auto,
 };
 
@@ -14,11 +14,33 @@ pub const DeleteRangeOptions = struct {
     max_inclusive: bool = false,
 };
 
-pub const Ordering = enum {
-    compare,
-    ordered_key,
-};
+/// How a tree orders its keys.
+pub fn Order(comptime K: type) type {
+    return struct {
+        compare: fn (K, K) std.math.Order,
+        /// A number made from each key that internal nodes route by, so that
+        /// most comparisons there are one integer compare. Null routes by
+        /// `compare` alone.
+        ///
+        /// It must never put two keys in the opposite order from `compare`:
+        /// when `prefix(a) < prefix(b)`, `a` must sort before `b`. For
+        /// example, the first 8 bytes lowercased for a case-insensitive
+        /// order, or `~bytePrefix(key)` for a descending one.
+        prefix: ?fn (K) u64 = null,
+    };
+}
 
+/// The first 8 bytes of `key`, zero-padded, as a big-endian number. The
+/// built-in order of string keys routes by it.
+pub fn bytePrefix(key: []const u8) u64 {
+    var bytes: [8]u8 = @splat(0);
+    const n = @min(bytes.len, key.len);
+    @memcpy(bytes[0..n], key[0..n]);
+    return mem.readInt(u64, &bytes, .big);
+}
+
+/// Whether keys of type `K` have a built-in order, used when a tree's config
+/// leaves `order` null.
 pub fn orderedKeySupported(comptime K: type) bool {
     if (K == []const u8) return true;
     return switch (@typeInfo(K)) {
@@ -29,9 +51,14 @@ pub fn orderedKeySupported(comptime K: type) bool {
 
 pub fn TreeConfig(comptime K: type, comptime V: type) type {
     return struct {
-        compare: fn (K, V, K, V) std.math.Order,
-        ordering: Ordering = .compare,
-        use_string_prefix: bool = true,
+        /// Orders keys with a custom order, for example case-insensitive
+        /// strings. Null uses the built-in order of the key type: numbers,
+        /// bools, enums by their tags, and strings by their bytes.
+        order: ?Order(K) = null,
+        /// Orders items with equal keys by their values, so that the tree
+        /// keeps one item per key and value. Null keeps one item per key,
+        /// which also enables the key-only methods such as `getKey`.
+        value_order: ?fn (V, V) std.math.Order = null,
 
         search_mode: SearchMode = .auto,
 
@@ -42,28 +69,41 @@ pub fn TreeConfig(comptime K: type, comptime V: type) type {
 
 /// Creates a B-tree type for the given key/value types.
 ///
-/// `compare` defines the sort order. It receives both key and value for each
-/// item, so the tree can be used as either a map-like structure or an ordered
-/// collection where the value helps break ties.
+/// Items are ordered by key: by `config.order` or, when it is null, by the
+/// built-in order of the key type. `config.value_order` then orders items
+/// with equal keys.
 pub fn Tree(
     comptime K: type,
     comptime V: type,
     comptime config: TreeConfig(K, V),
 ) type {
     comptime {
-        if (config.use_string_prefix and K != []const u8) {
-            @compileError("config.use_string_prefix requires key type to be []const u8 (string)");
-        }
-        if (config.ordering == .ordered_key and !orderedKeySupported(K)) {
-            @compileError("ordered_key trees require key type to be one of: int, float, bool, enum, []const u8 (string)");
+        if (config.order == null and !orderedKeySupported(K)) {
+            @compileError("key type " ++ @typeName(K) ++ " has no built-in order; set config.order");
         }
     }
     return struct {
         const Self = @This();
 
-        const compare = config.compare;
+        /// Whether items are ordered by key alone, so that the key-only
+        /// methods apply.
+        const key_only = config.value_order == null;
+        /// Whether keys are in the built-in order of the key type, which the
+        /// fast searches rely on.
+        const builtin_order = config.order == null;
+        /// What internal nodes route keys by, if anything.
+        const key_prefix: ?fn (K) u64 = if (config.order) |order|
+            order.prefix
+        else if (K == []const u8)
+            bytePrefix
+        else
+            null;
+        const use_prefix = key_prefix != null;
+        /// The value a search compares against: nothing when items are
+        /// ordered by key alone.
+        const SearchValue = if (key_only) void else V;
 
-        const storage = node_storage.NodeStorage(K, V, config.use_string_prefix);
+        const storage = node_storage.NodeStorage(K, V, use_prefix);
 
         pub const fanout = storage.fanout;
         pub const max_items = storage.max_items;
@@ -233,6 +273,7 @@ pub fn Tree(
         }
 
         fn orderedKeyCompare(a: K, b: K) std.math.Order {
+            if (comptime config.order) |order| return order.compare(a, b);
             if (comptime K == []const u8) {
                 return mem.order(u8, a, b);
             }
@@ -248,47 +289,42 @@ pub fn Tree(
             };
         }
 
-        inline fn orderedKeyLess(a: K, b: K) bool {
-            if (comptime K == []const u8) return mem.order(u8, a, b) == .lt;
-            return switch (@typeInfo(K)) {
-                .bool => !a and b,
-                .@"enum" => @backingInt(a) < @backingInt(b),
-                else => a < b,
-            };
-        }
-
-        inline fn orderedKeyEqual(a: K, b: K) bool {
-            if (comptime K == []const u8) return mem.eql(u8, a, b);
-            return a == b;
-        }
-
         fn requireOrderedKeyMode() void {
-            if (comptime config.ordering != .ordered_key) {
-                @compileError("this method is only available when TreeConfig.ordering is .ordered_key");
+            if (comptime !key_only) {
+                @compileError("this method orders by key alone, so it needs TreeConfig.value_order to be null");
             }
         }
 
         fn keyCompare(a_key: K, a_value: V, b_key: K, b_value: V) std.math.Order {
-            if (comptime config.ordering == .ordered_key) {
-                return orderedKeyCompare(a_key, b_key);
+            const by_key = orderedKeyCompare(a_key, b_key);
+            if (comptime config.value_order) |value_order| {
+                if (by_key == .eq) return value_order(a_value, b_value);
             }
-            return compare(a_key, a_value, b_key, b_value);
+            return by_key;
         }
 
         fn useBinarySearch() bool {
             return switch (config.search_mode) {
                 .linear => false,
-                .binary => true,
                 .auto => K == []const u8 or @sizeOf(K) > @sizeOf(usize) * 2,
             };
         }
 
-        fn useBranchlessReadSearch() bool {
-            return config.search_mode != .linear and usePrimitiveOrderedKeyFastSearch();
+        fn useSimdReadSearch() bool {
+            if (comptime !usePrimitiveOrderedKeyFastSearch()) return false;
+            const native_lanes = std.simd.suggestVectorLength(K) orelse return false;
+            if (config.search_mode != .auto) return false;
+            return switch (@sizeOf(K)) {
+                1...4 => native_lanes >= 4,
+                8 => isAppleSilicone or
+                    (builtin.cpu.arch.isX86() and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f)),
+                else => false,
+            };
         }
 
+        // The fast searches compare keys with `<` and `==`.
         fn usePrimitiveOrderedKeyFastSearch() bool {
-            if (K == []const u8) return false;
+            if (!key_only or !builtin_order or K == []const u8) return false;
             return switch (@typeInfo(K)) {
                 .int, .comptime_int, .float, .comptime_float => true,
                 else => false,
@@ -296,8 +332,8 @@ pub fn Tree(
         }
 
         pub fn setPrefix(node: *Node, index: usize) void {
-            if (config.use_string_prefix) {
-                if (node.branch) |branch| branch.prefixes[index] = stringPrefix(node.keys[index]);
+            if (use_prefix) {
+                if (node.branch) |branch| branch.prefixes[index] = keyPrefix(node.keys[index]);
             }
         }
 
@@ -411,7 +447,7 @@ pub fn Tree(
             @memcpy(right.keys[0..right.len], node.keys[right_items_start..max_items]);
             @memcpy(right.values[0..right.len], node.values[right_items_start..max_items]);
 
-            if (config.use_string_prefix and right.branch != null) {
+            if (use_prefix and right.branch != null) {
                 for (0..right.len) |prefix_index| setPrefix(right, prefix_index);
             }
 
@@ -453,38 +489,37 @@ pub fn Tree(
         // requested key/value pair.
         //TODO: Should we inline this?
         fn searchNode(node: *const Node, key: K, value: V) SearchResult {
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             return searchNodeWithPrefix(node, key, value, prefix);
         }
 
         inline fn searchNodeWithPrefix(node: *const Node, key: K, value: V, prefix: u64) SearchResult {
-            if (comptime config.ordering == .ordered_key) {
-                return searchKeyOnlyWithPrefix(node, key, prefix);
-            }
+            if (comptime key_only) return searchKeyOnlyWithPrefix(node, key, prefix);
+            return searchOrderedWithPrefix(node, key, value, prefix);
+        }
 
-            if (comptime config.use_string_prefix) {
-                if (!node.isLeaf()) return seachBranchWithPrefixes(node, key, value, prefix);
+        inline fn searchKeyOnlyWithPrefix(node: *const Node, key: K, prefix: u64) SearchResult {
+            comptime requireOrderedKeyMode();
+            if (comptime usePrimitiveOrderedKeyFastSearch() and !useBinarySearch()) return searchPrimitiveOrderedKeyLinear(node, key);
+            return searchOrderedWithPrefix(node, key, {}, prefix);
+        }
+
+        // The search for every order that has no fast search of its own.
+        inline fn searchOrderedWithPrefix(node: *const Node, key: K, value: SearchValue, prefix: u64) SearchResult {
+            if (comptime use_prefix) {
+                if (!node.isLeaf()) return searchBranchByPrefix(node, key, value, prefix);
             }
 
             if (comptime useBinarySearch()) return searchNodeBinary(node, key, value);
             return searchNodeLinear(node, key, value);
         }
 
-        inline fn searchKeyOnlyWithPrefix(node: *const Node, key: K, prefix: u64) SearchResult {
-            if (comptime config.use_string_prefix) {
-                if (!node.isLeaf()) return searchBranchByKeyPrefix(node, key, prefix);
-            }
-
-            if (comptime K == []const u8) {
-                if (comptime useBinarySearch()) return searchStringKeyBinary(node, key);
-                return searchStringKeyLinear(node, key);
-            }
-            if (comptime useBinarySearch()) return searchOrderedKeyBinary(node, key);
-            if (comptime usePrimitiveOrderedKeyFastSearch()) return searchPrimitiveOrderedKeyLinear(node, key);
-            return searchOrderedKeyLinear(node, key);
+        inline fn compareItemAt(node: *const Node, index: usize, key: K, value: SearchValue) std.math.Order {
+            if (comptime key_only) return orderedKeyCompare(node.keys[index], key);
+            return keyCompare(node.keys[index], node.values[index], key, value);
         }
 
-        fn seachBranchWithPrefixes(node: *const Node, key: []const u8, value: V, wanted: u64) SearchResult {
+        fn searchBranchByPrefix(node: *const Node, key: K, value: SearchValue, wanted: u64) SearchResult {
             const branch = node.branch.?;
             if (wanted > branch.prefixes[node.len - 1]) return SearchResult.init(node.len, false);
 
@@ -494,35 +529,18 @@ pub fn Tree(
                 if (prefix < wanted) continue;
                 if (prefix > wanted) return SearchResult.init(i, false);
 
-                const c = keyCompare(node.keys[i], node.values[i], key, value);
+                const c = compareItemAt(node, i, key, value);
                 if (c == .gt or c == .eq) return SearchResult.init(i, c == .eq);
             }
 
             return SearchResult.init(i, false);
         }
 
-        fn searchBranchByKeyPrefix(node: *const Node, key: []const u8, wanted: u64) SearchResult {
-            const branch = node.branch.?;
-            if (wanted > branch.prefixes[node.len - 1]) return SearchResult.init(node.len, false);
-
-            var i: usize = 0;
-            while (i < node.len) : (i += 1) {
-                const prefix = branch.prefixes[i];
-                if (prefix < wanted) continue;
-                if (prefix > wanted) return SearchResult.init(i, false);
-
-                const c = orderedKeyCompare(node.keys[i], key);
-                if (c == .gt or c == .eq) return SearchResult.init(i, c == .eq);
-            }
-
-            return SearchResult.init(i, false);
-        }
-
-        fn searchStringKeyLinear(node: *const Node, key: []const u8) SearchResult {
+        fn searchNodeLinear(node: *const Node, key: K, value: SearchValue) SearchResult {
             if (node.len == 0) return SearchResult.init(0, false);
 
             const last = node.len - 1;
-            switch (mem.order(u8, node.keys[last], key)) {
+            switch (compareItemAt(node, last, key, value)) {
                 .lt => return SearchResult.init(node.len, false),
                 .eq => return SearchResult.init(last, true),
                 .gt => {},
@@ -530,7 +548,7 @@ pub fn Tree(
 
             var i: usize = 0;
             while (true) : (i += 1) {
-                switch (mem.order(u8, node.keys[i], key)) {
+                switch (compareItemAt(node, i, key, value)) {
                     .lt => {},
                     .eq => return SearchResult.init(i, true),
                     .gt => return SearchResult.init(i, false),
@@ -538,69 +556,86 @@ pub fn Tree(
             }
         }
 
-        fn searchStringKeyBinary(node: *const Node, key: []const u8) SearchResult {
+        fn searchNodeBinary(node: *const Node, key: K, value: SearchValue) SearchResult {
             if (node.len == 0) return SearchResult.init(0, false);
 
             const last = node.len - 1;
-            switch (mem.order(u8, node.keys[last], key)) {
+            switch (compareItemAt(node, last, key, value)) {
                 .lt => return SearchResult.init(node.len, false),
                 .eq => return SearchResult.init(last, true),
                 .gt => {},
             }
 
+            // The item at `high` is always greater than the requested one, so
+            // the loop ends on an item that isn't equal to it.
             var low: usize = 0;
             var high: usize = last;
             while (low < high) {
                 const mid = low + (high - low) / 2;
-                switch (mem.order(u8, node.keys[mid], key)) {
+                switch (compareItemAt(node, mid, key, value)) {
                     .lt => low = mid + 1,
                     .eq => return SearchResult.init(mid, true),
                     .gt => high = mid,
                 }
             }
 
-            return SearchResult.init(low, mem.order(u8, node.keys[low], key) == .eq);
+            return SearchResult.init(low, false);
         }
 
-        fn searchOrderedKeyLinear(node: *const Node, key: K) SearchResult {
-            if (node.len == 0) return SearchResult.init(0, false);
-
-            const last = node.len - 1;
-            if (orderedKeyLess(node.keys[last], key)) return SearchResult.init(node.len, false);
-            if (orderedKeyEqual(node.keys[last], key)) return SearchResult.init(last, true);
-
-            var i: usize = 0;
-            while (true) : (i += 1) {
-                if (!orderedKeyLess(node.keys[i], key)) return SearchResult.init(i, orderedKeyEqual(node.keys[i], key));
-            }
-        }
-
-        // Node search for lookups that leave the node's items in place. Insert,
-        // delete and indexOf keep searchKeyOnlyWithPrefix: they branch on the
-        // found index straight after the search, and measured slower when the
-        // search itself was branchless.
+        // Node search for lookups that leave the node's items in place
         inline fn searchKeyOnlyForRead(node: *const Node, key: K, prefix: u64) SearchResult {
-            if (comptime useBranchlessReadSearch()) return searchPrimitiveOrderedKeyBranchless(node, key);
+            if (comptime useSimdReadSearch()) return searchPrimitiveOrderedKeySimd(node, key);
             return searchKeyOnlyWithPrefix(node, key, prefix);
         }
 
-        // Lower-bound binary search whose only branch is the loop count, which
-        // depends on the node length and not on the key.
-        inline fn searchPrimitiveOrderedKeyBranchless(node: *const Node, key: K) SearchResult {
-            const len: usize = node.len;
-            if (len == 0) return SearchResult.init(0, false);
+        const isAppleSilicone = builtin.cpu.arch.isAARCH64() and builtin.os.tag.isDarwin();
 
-            // Every key before `base` is less than `key`; the answer lies in
-            // the `remaining` keys that start at `base`.
-            var base: usize = 0;
-            var remaining: usize = len;
-            while (remaining > 1) {
-                const half = remaining / 2;
-                base = if (node.keys[base + half - 1] < key) base + half else base;
-                remaining -= half;
+        const simd_chunk_bytes = if (isAppleSilicone) 128 else 64;
+
+        const simd_chunk_lanes = @min(16, simd_chunk_bytes / @sizeOf(K), std.math.floorPowerOfTwo(usize, max_items));
+
+        // The scan compares one chunk of keys per step and stops at the first
+        // chunk holding a key that is not below the probe. Two costs decide
+        // the chunk size:
+        //
+        // - Each step pays a vector compare, a lane reduction and a branch,
+        //   which often mispredicts on random lookups. Wider chunks take
+        //   fewer steps, so they pay these costs fewer times per node.
+        //
+        // So a chunk holds as many keys as fit in one 64-byte line, capped at
+        // 16. `Node.keys` is 64-byte aligned, so chunks line up with cache lines.
+        //
+        // Apple cores use 128-byte chunks because they measured fastest.
+        //
+        // Measured with get(rand), random keys, 1k to 4M items:
+        // - Apple M3 NEON: 16 x i32 and 16 x u64 were the fastest widths at
+        //   every tree size. 32 lanes made LLVM emit a slow 32-lane
+        //   reduction on NEON.
+        // - Zen 2 AVX2 (64-byte lines): 16 x i32 was the fastest width at
+        //   every tree size.
+        inline fn searchPrimitiveOrderedKeySimd(node: *const Node, key: K) SearchResult {
+            if (node.len == 0) return SearchResult.init(0, false);
+
+            const last = node.len - 1;
+            if (key > node.keys[last]) return SearchResult.init(node.len, false);
+            if (key == node.keys[last]) return SearchResult.init(last, true);
+
+            // The last key is not below `key`, so the scan stops at or before
+            // it and never decides on the unused slots past `len`.
+            const lanes = simd_chunk_lanes;
+            const Chunk = @Vector(lanes, K);
+            const needle: Chunk = @splat(key);
+            var i: usize = 0;
+            while (true) : (i += lanes) {
+                // The final chunk ends at the last slot and overlaps keys
+                // already found below `key`, whose lanes stay false.
+                const start: usize = @min(i, max_items - lanes);
+                const chunk: Chunk = node.keys[start..][0..lanes].*;
+                if (std.simd.firstTrue(!(needle > chunk))) |lane| {
+                    const index = start + lane;
+                    return SearchResult.init(index, key == node.keys[index]);
+                }
             }
-            base += @intFromBool(node.keys[base] < key);
-            return SearchResult.init(base, base < len and node.keys[base] == key);
         }
 
         inline fn searchPrimitiveOrderedKeyLinear(node: *const Node, key: K) SearchResult {
@@ -614,66 +649,6 @@ pub fn Tree(
             while (key > node.keys[i]) : (i += 1) {}
             return SearchResult.init(i, key == node.keys[i]);
         }
-
-        fn searchOrderedKeyBinary(node: *const Node, key: K) SearchResult {
-            if (node.len == 0) return SearchResult.init(0, false);
-
-            const last = node.len - 1;
-            if (orderedKeyLess(node.keys[last], key)) return SearchResult.init(node.len, false);
-            if (orderedKeyEqual(node.keys[last], key)) return SearchResult.init(last, true);
-
-            var low: usize = 0;
-            var high: usize = last;
-            while (low < high) {
-                const mid = low + (high - low) / 2;
-                if (orderedKeyLess(node.keys[mid], key)) {
-                    low = mid + 1;
-                } else {
-                    high = mid;
-                }
-            }
-
-            return SearchResult.init(low, orderedKeyEqual(node.keys[low], key));
-        }
-
-        fn searchNodeLinear(node: *const Node, key: K, value: V) SearchResult {
-            if (node.len == 0) return SearchResult.init(0, false);
-
-            const last = node.len - 1;
-            const last_cmp = keyCompare(node.keys[last], node.values[last], key, value);
-
-            if (last_cmp == .lt) return SearchResult.init(node.len, false);
-            if (last_cmp == .eq) return SearchResult.init(last, true);
-
-            var i: usize = 0;
-            //TODO: Can we apply SIMD here?
-            while (true) : (i += 1) {
-                const c = keyCompare(node.keys[i], node.values[i], key, value);
-                if (c == .gt or c == .eq) return SearchResult.init(i, c == .eq);
-            }
-        }
-
-        fn searchNodeBinary(node: *const Node, key: K, value: V) SearchResult {
-            if (node.len == 0) return SearchResult.init(0, false);
-
-            const last = node.len - 1;
-            const last_cmp = keyCompare(node.keys[last], node.values[last], key, value);
-            if (last_cmp == .lt) return SearchResult.init(node.len, false);
-            if (last_cmp == .eq) return SearchResult.init(last, true);
-
-            var low: usize = 0;
-            var high: usize = last;
-            while (low < high) {
-                const mid = low + (high - low) / 2;
-                if (keyCompare(node.keys[mid], node.values[mid], key, value) == .lt) {
-                    low = mid + 1;
-                } else {
-                    high = mid;
-                }
-            }
-
-            return SearchResult.init(low, keyCompare(node.keys[low], node.values[low], key, value) == .eq);
-        }
         // Inserts one item into a non-full node by shifting later items right.
         pub fn insertItemAt(node: *Node, index: usize, key: K, value: V) void {
             assertUnique(node);
@@ -682,7 +657,7 @@ pub fn Tree(
             if (index < node.len) {
                 if (comptime @sizeOf(K) != 0) @memmove(node.keys[index + 1 .. node.len + 1], node.keys[index..node.len]);
                 if (comptime @sizeOf(V) != 0) @memmove(node.values[index + 1 .. node.len + 1], node.values[index..node.len]);
-                if (config.use_string_prefix) {
+                if (use_prefix) {
                     if (node.branch) |b| @memmove(b.prefixes[index + 1 .. node.len + 1], b.prefixes[index..node.len]);
                 }
             }
@@ -734,7 +709,7 @@ pub fn Tree(
         // Inserts into a node that is known not to be full. Returns false when
         // the comparator says an equal item already exists.
         fn insertIntoNonFull(self: *Self, gpa: mem.Allocator, node: *Node, key: K, value: V) !bool {
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             return self.insertIntoNonFullWithPrefix(gpa, node, key, value, prefix);
         }
 
@@ -852,7 +827,7 @@ pub fn Tree(
             }
 
             if (self.root.?.len == max_items) try self.splitRoot(gpa);
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             const inserted = try self.insertIntoNonFullWithPrefix(gpa, self.root.?, key, value, prefix);
             if (inserted) self.len += 1;
             return inserted;
@@ -869,7 +844,7 @@ pub fn Tree(
             }
 
             if (self.root.?.len == max_items) try self.splitRoot(gpa);
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             const root = self.root.?;
             if (root.isLeaf()) {
                 const found = searchKeyOnlyWithPrefix(root, key, prefix);
@@ -929,7 +904,7 @@ pub fn Tree(
         /// Returns `null` when no equal item exists.
         pub fn get(self: *const Self, key: K, value: V) ?V {
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             while (true) {
                 const found = searchNodeWithPrefix(node, key, value, prefix);
                 if (found.found) return node.values[found.index];
@@ -940,7 +915,7 @@ pub fn Tree(
         pub fn getKey(self: *const Self, key: K) ?V {
             requireOrderedKeyMode();
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             while (true) {
                 const found = searchKeyOnlyForRead(node, key, prefix);
                 if (found.found) return node.values[found.index];
@@ -955,7 +930,7 @@ pub fn Tree(
         pub fn getMut(self: *Self, gpa: mem.Allocator, key: K, value: V) !?*V {
             try self.makeUniqueRoot(gpa);
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             while (true) {
                 const found = searchNodeWithPrefix(node, key, value, prefix);
                 if (found.found) return writableValue(node, found.index);
@@ -969,7 +944,7 @@ pub fn Tree(
         pub fn getKeyMut(self: *Self, gpa: mem.Allocator, key: K) !?*V {
             try self.makeUniqueRoot(gpa);
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             while (true) {
                 const found = searchKeyOnlyForRead(node, key, prefix);
                 if (found.found) return writableValue(node, found.index);
@@ -1223,7 +1198,7 @@ pub fn Tree(
         /// contains `10, 20, 30`. Returns `null` if all items are smaller.
         pub fn seek(self: *const Self, key: K, val: V) ?Entry {
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             var candidate: ?Entry = null;
             while (true) {
                 const found = searchNodeWithPrefix(node, key, val, prefix);
@@ -1241,7 +1216,7 @@ pub fn Tree(
         /// the first greater item.
         pub fn seekNext(self: *const Self, key: K, val: V) ?Entry {
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             var candidate: ?Entry = null;
 
             while (true) {
@@ -1263,7 +1238,7 @@ pub fn Tree(
         /// than it. Returns `null` when there is no smaller item.
         pub fn seekPrev(self: *const Self, key: K, val: V) ?Entry {
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             var candidate: ?Entry = null;
 
             while (true) {
@@ -1283,7 +1258,7 @@ pub fn Tree(
         pub fn seekKey(self: *const Self, key: K) ?Entry {
             requireOrderedKeyMode();
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             var candidate: ?Entry = null;
             while (true) {
                 const found = searchKeyOnlyForRead(node, key, prefix);
@@ -1296,7 +1271,7 @@ pub fn Tree(
         pub fn seekNextKey(self: *const Self, key: K) ?Entry {
             requireOrderedKeyMode();
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             var candidate: ?Entry = null;
 
             while (true) {
@@ -1315,7 +1290,7 @@ pub fn Tree(
         pub fn seekPrevKey(self: *const Self, key: K) ?Entry {
             requireOrderedKeyMode();
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             var candidate: ?Entry = null;
 
             while (true) {
@@ -1398,7 +1373,7 @@ pub fn Tree(
         /// position at which the item would be inserted.
         pub fn indexOf(self: *const Self, key: K, val: V) RankResult {
             var node = self.root orelse return RankResult.init(0, false);
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             var skipped: usize = 0;
 
             while (true) {
@@ -1419,7 +1394,7 @@ pub fn Tree(
         pub fn indexOfKey(self: *const Self, key: K) RankResult {
             requireOrderedKeyMode();
             var node = self.root orelse return RankResult.init(0, false);
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             var skipped: usize = 0;
 
             while (true) {
@@ -1474,7 +1449,7 @@ pub fn Tree(
         fn findSlotForWrite(self: *Self, gpa: mem.Allocator, key: K, val: V) !?Slot {
             try self.makeUniqueRoot(gpa);
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             while (true) {
                 const found = searchNodeWithPrefix(node, key, val, prefix);
                 if (found.found) return Slot.init(node, found.index);
@@ -1489,7 +1464,7 @@ pub fn Tree(
             requireOrderedKeyMode();
             try self.makeUniqueRoot(gpa);
             var node = self.root orelse return null;
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             while (true) {
                 const found = searchKeyOnlyForRead(node, key, prefix);
                 if (found.found) return Slot.init(node, found.index);
@@ -1545,7 +1520,7 @@ pub fn Tree(
             }
 
             if (self.root.?.len == max_items) try self.splitRoot(gpa);
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             const root = self.root.?;
             if (root.isLeaf()) {
                 const found = searchKeyOnlyWithPrefix(root, key, prefix);
@@ -1569,7 +1544,7 @@ pub fn Tree(
             if (index + 1 < node.len) {
                 if (comptime @sizeOf(K) != 0) @memmove(node.keys[index .. node.len - 1], node.keys[index + 1 .. node.len]);
                 if (comptime @sizeOf(V) != 0) @memmove(node.values[index .. node.len - 1], node.values[index + 1 .. node.len]);
-                if (config.use_string_prefix) {
+                if (use_prefix) {
                     if (node.branch) |b| @memmove(b.prefixes[index .. node.len - 1], b.prefixes[index + 1 .. node.len]);
                 }
             }
@@ -1637,7 +1612,7 @@ pub fn Tree(
         // with their left-subtree predecessor, and rebalances any
         // child that drops below the minimum size.
         fn deleteFromNode(self: *Self, gpa: mem.Allocator, node: *Node, key: K, val: V) !?V {
-            const prefix = if (comptime config.use_string_prefix) stringPrefix(key) else 0;
+            const prefix = if (comptime use_prefix) keyPrefix(key) else 0;
             return self.deleteFromNodeWithPrefix(gpa, node, key, val, prefix);
         }
 
@@ -2224,7 +2199,7 @@ pub fn Tree(
             if (child_index + 1 < node.len) {
                 if (comptime @sizeOf(K) != 0) @memmove(node.keys[child_index .. node.len - 1], node.keys[child_index + 1 .. node.len]);
                 if (comptime @sizeOf(V) != 0) @memmove(node.values[child_index .. node.len - 1], node.values[child_index + 1 .. node.len]);
-                if (config.use_string_prefix) {
+                if (use_prefix) {
                     @memmove(branch.prefixes[child_index .. node.len - 1], branch.prefixes[child_index + 1 .. node.len]);
                 }
             }
@@ -2250,7 +2225,7 @@ pub fn Tree(
             if (index + 1 < node.len) {
                 if (comptime @sizeOf(K) != 0) @memmove(node.keys[index .. node.len - 1], node.keys[index + 1 .. node.len]);
                 if (comptime @sizeOf(V) != 0) @memmove(node.values[index .. node.len - 1], node.values[index + 1 .. node.len]);
-                if (config.use_string_prefix) {
+                if (use_prefix) {
                     @memmove(branch.prefixes[index .. node.len - 1], branch.prefixes[index + 1 .. node.len]);
                 }
             }
@@ -2594,8 +2569,10 @@ pub fn Tree(
 
             var total: usize = node.len;
             for (0..node.len + 1) |i| {
-                if (i < node.len and config.use_string_prefix) {
-                    try expectInvariant(branch.prefixes[i] == stringPrefix(node.keys[i]));
+                if (i < node.len and use_prefix) {
+                    try expectInvariant(branch.prefixes[i] == keyPrefix(node.keys[i]));
+                    // Sorted keys need prefixes that never decrease.
+                    if (i > 0) try expectInvariant(branch.prefixes[i - 1] <= branch.prefixes[i]);
                 }
                 const child = branch.children[i] orelse return error.InvariantViolation;
                 const child_lower = if (i == 0) lower else Bound{ .key = node.keys[i - 1], .value = node.values[i - 1] };
@@ -2647,7 +2624,7 @@ pub fn Tree(
 
             if (node.branch) |branch| {
                 const clone_branch = clone.branch.?;
-                if (comptime config.use_string_prefix) @memcpy(&clone_branch.prefixes, &branch.prefixes);
+                if (comptime use_prefix) @memcpy(&clone_branch.prefixes, &branch.prefixes);
 
                 @memcpy(&clone_branch.counts, &branch.counts);
                 @memcpy(&clone_branch.children, &branch.children);
@@ -2725,11 +2702,8 @@ pub fn Tree(
             try expectInvariant(count == self.len);
         }
 
-        fn stringPrefix(key: []const u8) u64 {
-            var bytes: [8]u8 = @splat(0);
-            const n = @min(bytes.len, key.len);
-            @memcpy(bytes[0..n], key[0..n]);
-            return mem.readInt(u64, &bytes, .big);
+        fn keyPrefix(key: K) u64 {
+            return key_prefix.?(key);
         }
 
         /// Frees every node owned by the tree and resets it to empty.
@@ -2741,16 +2715,12 @@ pub fn Tree(
     };
 }
 
-fn compareTestIntKey(a_key: isize, _: isize, b_key: isize, _: isize) std.math.Order {
-    return if (a_key < b_key) .lt else if (a_key > b_key) .gt else .eq;
+fn orderTestIntKey(a: isize, b: isize) std.math.Order {
+    return std.math.order(a, b);
 }
 
-fn compareTestStringKey(a_key: []const u8, _: usize, b_key: []const u8, _: usize) std.math.Order {
-    return mem.order(u8, a_key, b_key);
-}
-
-fn compareTestIntKeyOwnedValue(a_key: isize, _: []const u8, b_key: isize, _: []const u8) std.math.Order {
-    return if (a_key < b_key) .lt else if (a_key > b_key) .gt else .eq;
+fn testKeyFromInt(comptime T: type, value: usize) T {
+    return if (@typeInfo(T) == .float) @floatFromInt(value) else @intCast(value);
 }
 
 fn copyTestBytes(gpa: mem.Allocator, value: []const u8) ![]const u8 {
@@ -2762,7 +2732,7 @@ fn releaseTestBytes(gpa: mem.Allocator, value: []const u8) void {
 }
 
 test "core nodes allocate and deallocate" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -2773,7 +2743,7 @@ test "core nodes allocate and deallocate" {
 }
 
 test "internal nodes coallocate branch metadata" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
 
     const node = try tree.newNode(testing.allocator, false);
@@ -2785,8 +2755,7 @@ test "internal nodes coallocate branch metadata" {
 
 test "destroyNode releases every value in a full leaf" {
     const ByteTree = Tree(isize, []const u8, .{
-        .compare = compareTestIntKeyOwnedValue,
-        .use_string_prefix = false,
+        .order = .{ .compare = orderTestIntKey },
         .copy_value = copyTestBytes,
         .release_value = releaseTestBytes,
     });
@@ -2804,8 +2773,7 @@ test "destroyNode releases every value in a full leaf" {
 
 test "destroyNode releases the rightmost child of internal nodes" {
     const ByteTree = Tree(isize, []const u8, .{
-        .compare = compareTestIntKeyOwnedValue,
-        .use_string_prefix = false,
+        .order = .{ .compare = orderTestIntKey },
         .copy_value = copyTestBytes,
         .release_value = releaseTestBytes,
     });
@@ -2835,7 +2803,7 @@ test "destroyNode releases the rightmost child of internal nodes" {
 }
 
 test "node local search returns lower bound" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -2857,7 +2825,7 @@ test "node local search returns lower bound" {
 }
 
 test "linear and binary node searches return matching lower bounds" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -2879,8 +2847,8 @@ test "linear and binary node searches return matching lower bounds" {
         .{ .key = 40, .index = 3, .found = true },
         .{ .key = 45, .index = 4, .found = false },
     }) |case| {
-        const linear = IntTree.searchNodeLinear(node, case.key, 0);
-        const binary = IntTree.searchNodeBinary(node, case.key, 0);
+        const linear = IntTree.searchNodeLinear(node, case.key, {});
+        const binary = IntTree.searchNodeBinary(node, case.key, {});
 
         try testing.expectEqual(case.index, linear.index);
         try testing.expectEqual(case.found, linear.found);
@@ -2889,41 +2857,16 @@ test "linear and binary node searches return matching lower bounds" {
     }
 }
 
-test "branchless node search matches linear search at every node length" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
-    var tree = IntTree.init();
-    defer tree.deinit(testing.allocator);
-
-    const node = try tree.newNode(std.testing.allocator, true);
-    defer tree.destroyNode(std.testing.allocator, node);
-
-    for (0..IntTree.max_items + 1) |len| {
-        for (0..len) |i| node.keys[i] = @intCast(10 * (i + 1));
-        node.len = @intCast(len);
-
-        // Covers keys below, equal to, between and above the stored keys.
-        const past_last: isize = @intCast(10 * len + 5);
-        var key: isize = 5;
-        while (key <= past_last) : (key += 5) {
-            const linear = IntTree.searchPrimitiveOrderedKeyLinear(node, key);
-            const branchless = IntTree.searchPrimitiveOrderedKeyBranchless(node, key);
-
-            try testing.expectEqual(linear.index, branchless.index);
-            try testing.expectEqual(linear.found, branchless.found);
-        }
-    }
-}
-
 test "node searches handle empty nodes" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
     const node = try tree.newNode(std.testing.allocator, true);
     defer tree.destroyNode(std.testing.allocator, node);
 
-    const linear = IntTree.searchNodeLinear(node, 10, 0);
-    const binary = IntTree.searchNodeBinary(node, 10, 0);
+    const linear = IntTree.searchNodeLinear(node, 10, {});
+    const binary = IntTree.searchNodeBinary(node, 10, {});
 
     try testing.expectEqual(0, linear.index);
     try testing.expect(!linear.found);
@@ -2931,51 +2874,75 @@ test "node searches handle empty nodes" {
     try testing.expect(!binary.found);
 }
 
-test "explicit linear search mode opts out of the branchless read search" {
-    const AutoTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
-    const BinaryTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false, .search_mode = .binary });
-    const LinearTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false, .search_mode = .linear });
-    const StringTree = Tree([]const u8, usize, .{ .compare = compareTestStringKey, .search_mode = .binary });
+test "auto search mode uses the SIMD read search for 32-bit keys, and for 64-bit keys only on Apple silicon or with AVX-512" {
+    const Int32Tree = Tree(i32, usize, .{});
+    const UInt64Tree = Tree(u64, usize, .{});
+    const LinearTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey }, .search_mode = .linear });
+    const StringTree = Tree([]const u8, usize, .{});
 
-    try testing.expect(AutoTree.useBranchlessReadSearch());
-    try testing.expect(BinaryTree.useBranchlessReadSearch());
-    try testing.expect(!LinearTree.useBranchlessReadSearch());
-    try testing.expect(!StringTree.useBranchlessReadSearch());
+    const apple = builtin.cpu.arch.isAARCH64() and builtin.os.tag.isDarwin();
+    const avx512 = builtin.cpu.arch.isX86() and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f);
+    try testing.expectEqual((std.simd.suggestVectorLength(i32) orelse 0) >= 4, Int32Tree.useSimdReadSearch());
+    try testing.expectEqual(apple or avx512, UInt64Tree.useSimdReadSearch());
+    try testing.expect(!LinearTree.useSimdReadSearch());
+    try testing.expect(!StringTree.useSimdReadSearch());
 }
 
-test "search mode selects linear or binary node search" {
-    const LinearTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false, .search_mode = .linear });
-    const BinaryTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false, .search_mode = .binary });
-    var linear_tree = LinearTree.init();
-    var binary_tree = BinaryTree.init();
-    defer linear_tree.deinit(testing.allocator);
-    defer binary_tree.deinit(testing.allocator);
+test "SIMD chunks hold as many keys as fit in one cache line, up to 16" {
+    const line: usize = if (builtin.cpu.arch.isAARCH64() and builtin.os.tag.isDarwin()) 128 else 64;
+    try testing.expectEqual(16, Tree(u8, usize, .{}).simd_chunk_lanes);
+    try testing.expectEqual(16, Tree(i32, usize, .{}).simd_chunk_lanes);
+    try testing.expectEqual(line / 8, Tree(u64, usize, .{}).simd_chunk_lanes);
+}
 
-    const linear_node = try linear_tree.newNode(std.testing.allocator, true);
-    const binary_node = try binary_tree.newNode(std.testing.allocator, true);
-    defer linear_tree.destroyNode(std.testing.allocator, linear_node);
-    defer binary_tree.destroyNode(std.testing.allocator, binary_node);
+test "SIMD node search matches linear search at every node length" {
+    inline for (.{ i32, u64, isize, f64, u8 }) |T| {
+        const KeyTree = Tree(T, usize, .{});
+        var tree = KeyTree.init();
+        defer tree.deinit(testing.allocator);
 
-    for ([_]isize{ 10, 20, 30 }, 0..) |key, i| {
-        linear_node.keys[i] = key;
-        linear_node.values[i] = -key;
-        binary_node.keys[i] = key;
-        binary_node.values[i] = -key;
+        const node = try tree.newNode(testing.allocator, true);
+        defer tree.destroyNode(testing.allocator, node);
+
+        for (0..KeyTree.max_items + 1) |len| {
+            // Slots past `len` hold a key below every probe, so a search that
+            // counted them would return the wrong index.
+            for (&node.keys, 0..) |*key, i| key.* = testKeyFromInt(T, if (i < len) 2 * (i + 1) else 0);
+            node.len = @intCast(len);
+
+            // Covers keys below, equal to, between and above the stored keys.
+            for (1..2 * len + 4) |probe| {
+                const key = testKeyFromInt(T, probe);
+                const linear = KeyTree.searchPrimitiveOrderedKeyLinear(node, key);
+                const simd = KeyTree.searchPrimitiveOrderedKeySimd(node, key);
+
+                try testing.expectEqual(linear.index, simd.index);
+                try testing.expectEqual(linear.found, simd.found);
+            }
+        }
     }
-    linear_node.len = 3;
-    binary_node.len = 3;
+}
 
-    const linear = LinearTree.searchNode(linear_node, 25, 0);
-    const binary = BinaryTree.searchNode(binary_node, 25, 0);
+test "auto search mode uses binary search for string and large keys" {
+    const LargeKey = [3]usize;
+    const orderLargeKey = struct {
+        fn order(a: LargeKey, b: LargeKey) std.math.Order {
+            return mem.order(usize, &a, &b);
+        }
+    }.order;
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
+    const LargeKeyTree = Tree(LargeKey, usize, .{ .order = .{ .compare = orderLargeKey } });
+    const StringTree = Tree([]const u8, usize, .{});
+    const LinearStringTree = Tree([]const u8, usize, .{ .search_mode = .linear });
 
-    try testing.expectEqual(2, linear.index);
-    try testing.expect(!linear.found);
-    try testing.expectEqual(2, binary.index);
-    try testing.expect(!binary.found);
+    try testing.expect(!IntTree.useBinarySearch());
+    try testing.expect(LargeKeyTree.useBinarySearch());
+    try testing.expect(StringTree.useBinarySearch());
+    try testing.expect(!LinearStringTree.useBinarySearch());
 }
 
 test "prefix branch search uses prefixes before full string compare" {
-    const StringTree = Tree([]const u8, usize, .{ .compare = compareTestStringKey, .use_string_prefix = true });
+    const StringTree = Tree([]const u8, usize, .{});
     var tree = StringTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -2991,10 +2958,10 @@ test "prefix branch search uses prefixes before full string compare" {
     node.len = 3;
     for (0..node.len) |i| StringTree.setPrefix(node, i);
 
-    const before_collision = StringTree.searchNodeWithPrefix(node, "abcdefgh-005", 0, StringTree.stringPrefix("abcdefgh-005"));
-    const collision_match = StringTree.searchNodeWithPrefix(node, "abcdefgh-020", 0, StringTree.stringPrefix("abcdefgh-020"));
-    const between_prefixes = StringTree.searchNodeWithPrefix(node, "abcdefgi", 0, StringTree.stringPrefix("abcdefgi"));
-    const after_all = StringTree.searchNodeWithPrefix(node, "zzzzzzzz", 0, StringTree.stringPrefix("zzzzzzzz"));
+    const before_collision = StringTree.searchNodeWithPrefix(node, "abcdefgh-005", 0, StringTree.keyPrefix("abcdefgh-005"));
+    const collision_match = StringTree.searchNodeWithPrefix(node, "abcdefgh-020", 0, StringTree.keyPrefix("abcdefgh-020"));
+    const between_prefixes = StringTree.searchNodeWithPrefix(node, "abcdefgi", 0, StringTree.keyPrefix("abcdefgi"));
+    const after_all = StringTree.searchNodeWithPrefix(node, "zzzzzzzz", 0, StringTree.keyPrefix("zzzzzzzz"));
 
     try testing.expectEqual(0, before_collision.index);
     try testing.expect(!before_collision.found);
@@ -3007,7 +2974,7 @@ test "prefix branch search uses prefixes before full string compare" {
 }
 
 test "insertItemAt shifts items inside a leaf" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3025,7 +2992,7 @@ test "insertItemAt shifts items inside a leaf" {
 }
 
 test "removeItemAt shifts later items left and returns removed entry" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3061,7 +3028,7 @@ test "removeItemAt shifts later items left and returns removed entry" {
 }
 
 test "splitNode promotes the median" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3083,7 +3050,7 @@ test "splitNode promotes the median" {
 }
 
 test "splitRoot promotes the median into a new root" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3108,7 +3075,7 @@ test "splitRoot promotes the median into a new root" {
 }
 
 test "right edge insert splits a full root and updates child counts" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3129,7 +3096,7 @@ test "right edge insert splits a full root and updates child counts" {
 }
 
 test "right edge insert splits a full rightmost child" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3175,7 +3142,7 @@ test "right edge insert splits a full rightmost child" {
 }
 
 test "maxEntry returns greatest entry from leaf and internal nodes" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3198,7 +3165,7 @@ test "maxEntry returns greatest entry from leaf and internal nodes" {
 }
 
 test "deleteFromNode removes matching leaf entries" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3219,7 +3186,7 @@ test "deleteFromNode removes matching leaf entries" {
 }
 
 test "rotateFromLeft borrows the left sibling maximum through the parent" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3258,7 +3225,7 @@ test "rotateFromLeft borrows the left sibling maximum through the parent" {
 }
 
 test "rotateFromRight borrows the right sibling minimum through the parent" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3297,7 +3264,7 @@ test "rotateFromRight borrows the right sibling minimum through the parent" {
 }
 
 test "mergeChildren joins adjacent leaves and removes the separator" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3336,7 +3303,7 @@ test "mergeChildren joins adjacent leaves and removes the separator" {
 }
 
 test "rebalanceChild merges siblings when their items fit" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3373,7 +3340,7 @@ test "rebalanceChild merges siblings when their items fit" {
 }
 
 test "fitsBetween validates index neighbors" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3393,7 +3360,7 @@ test "fitsBetween validates index neighbors" {
 }
 
 test "replaceAt updates leaf and internal positions without reordering" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3426,7 +3393,7 @@ test "replaceAt updates leaf and internal positions without reordering" {
 }
 
 test "replaceAt refreshes prefixes for internal string keys" {
-    const StringTree = Tree([]const u8, usize, .{ .compare = compareTestStringKey, .use_string_prefix = true });
+    const StringTree = Tree([]const u8, usize, .{});
     var tree = StringTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3443,7 +3410,7 @@ test "replaceAt refreshes prefixes for internal string keys" {
 }
 
 test "deleteAt removes leaf separator and edge entries" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3478,7 +3445,7 @@ test "deleteAt removes leaf separator and edge entries" {
 }
 
 test "deleteAt collapses the root after removing every item" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3499,7 +3466,7 @@ test "deleteAt collapses the root after removing every item" {
 }
 
 test "replaceAt and deleteAt clone copy-on-write paths" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3528,7 +3495,7 @@ test "replaceAt and deleteAt clone copy-on-write paths" {
 }
 
 test "copy retains the root until both trees release it" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3548,7 +3515,7 @@ test "copy retains the root until both trees release it" {
 }
 
 test "makeUniqueRoot clones a retained root" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3569,8 +3536,7 @@ test "makeUniqueRoot clones a retained root" {
 
 test "makeUniqueRoot deep copies owned values" {
     const ByteTree = Tree(isize, []const u8, .{
-        .compare = compareTestIntKeyOwnedValue,
-        .use_string_prefix = false,
+        .order = .{ .compare = orderTestIntKey },
         .copy_value = copyTestBytes,
         .release_value = releaseTestBytes,
     });
@@ -3593,7 +3559,7 @@ test "makeUniqueRoot deep copies owned values" {
 }
 
 test "makeUniqueRoot retains the rightmost child" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 
@@ -3615,7 +3581,7 @@ test "makeUniqueRoot retains the rightmost child" {
 }
 
 test "makeUniqueChild clones a retained child" {
-    const IntTree = Tree(isize, isize, .{ .compare = compareTestIntKey, .use_string_prefix = false });
+    const IntTree = Tree(isize, isize, .{ .order = .{ .compare = orderTestIntKey } });
     var tree = IntTree.init();
     defer tree.deinit(testing.allocator);
 

@@ -6,3 +6,6 @@ zig-pkg/
 # OS files
 .DS_Store
 .worktrees/
+
+# Rust build artifacts
+benchmark/rust_btree/target/

@@ -4,10 +4,13 @@ const btree = @import("btree.zig");
 
 pub const SearchMode = btree.SearchMode;
 pub const DeleteRangeOptions = btree.DeleteRangeOptions;
+pub const Order = btree.Order;
 
 pub fn MapConfig(comptime K: type, comptime V: type) type {
     return struct {
-        use_string_prefix: bool = K == []const u8,
+        /// Orders keys with a custom order, for example case-insensitive
+        /// strings. Null uses the built-in order of the key type.
+        order: ?Order(K) = null,
         search_mode: SearchMode = .auto,
 
         copy_value: ?*const fn (mem.Allocator, V) anyerror!V = null,
@@ -15,8 +18,6 @@ pub fn MapConfig(comptime K: type, comptime V: type) type {
     };
 }
 
-/// tidwall/btree Map-like key/value collection.
-///
 /// Items are ordered and identified by key only. Values never participate in
 /// ordering, so inserting the same key with a different value still addresses
 /// the same map entry. Keys are borrowed; use value hooks in MapConfig when the
@@ -26,34 +27,8 @@ pub fn Map(
     comptime V: type,
     comptime config: MapConfig(K, V),
 ) type {
-    comptime {
-        if (config.use_string_prefix and K != []const u8) {
-            @compileError("config.use_string_prefix requires key type to be []const u8 (string)");
-        }
-        if (!btree.orderedKeySupported(K)) {
-            @compileError("Map requires key type to be one of: int, float, bool, enum, []const u8 (string)");
-        }
-    }
-
-    const OrderedCompare = struct {
-        fn compare(a_key: K, _: V, b_key: K, _: V) std.math.Order {
-            if (comptime K == []const u8) return mem.order(u8, a_key, b_key);
-            return switch (@typeInfo(K)) {
-                .bool => if (a_key == b_key) .eq else if (!a_key and b_key) .lt else .gt,
-                .@"enum" => blk: {
-                    const a = @backingInt(a_key);
-                    const b = @backingInt(b_key);
-                    break :blk if (a == b) .eq else if (a < b) .lt else .gt;
-                },
-                else => if (a_key < b_key) .lt else if (a_key > b_key) .gt else .eq,
-            };
-        }
-    };
-
     const Base = btree.Tree(K, V, .{
-        .compare = OrderedCompare.compare,
-        .ordering = .ordered_key,
-        .use_string_prefix = config.use_string_prefix,
+        .order = config.order,
         .search_mode = config.search_mode,
         .copy_value = config.copy_value,
         .release_value = config.release_value,
