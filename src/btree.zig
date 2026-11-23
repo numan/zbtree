@@ -657,6 +657,7 @@ pub fn Tree(
         pub fn insertItemAt(node: *Node, index: usize, key: K, value: V) void {
             assertUnique(node);
             std.debug.assert(node.len < max_items);
+            std.debug.assert(index <= node.len);
 
             if (index < node.len) {
                 if (comptime @sizeOf(K) != 0) @memmove(node.keys[index + 1 .. node.len + 1], node.keys[index..node.len]);
@@ -819,6 +820,7 @@ pub fn Tree(
                 // branch address needs no load of `node.branch`.
                 const internal: *InternalNode = @fieldParentPtr("node", node);
                 const branch = &internal.branch;
+                std.debug.assert(node.branch == branch);
 
                 var child_index = found.index;
                 try self.makeUniqueChild(gpa, node, child_index);

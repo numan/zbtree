@@ -5,6 +5,13 @@ const max_node_items: usize = 63;
 /// Fewest items a node is cut down to so that it fills a smaller allocation.
 const min_fitted_items: usize = 55;
 
+comptime {
+    // fittedMaxItems steps down by two from max_node_items, so both bounds
+    // must be odd for every node size to stay odd.
+    std.debug.assert(max_node_items % 2 == 1);
+    std.debug.assert(min_fitted_items % 2 == 1 and min_fitted_items <= max_node_items);
+}
+
 /// Shared B-tree node storage layout used by comparator-backed trees and
 /// ordered map-specialized trees.
 pub fn NodeStorage(
@@ -54,6 +61,12 @@ fn SizedStorage(
         /// Upper bound on tree height in levels. A tree taller than this would
         /// have to hold than maxInt(usize) items.
         pub const max_height: usize = 16;
+
+        comptime {
+            // A full node splits into its median and two halves of min_items.
+            std.debug.assert(max_items == 2 * min_items + 1);
+            std.debug.assert(max_items <= std.math.maxInt(@FieldType(Node, "len")));
+        }
 
         // A node stores sorted key/value items. If `branch` is null it is a
         // leaf; otherwise `branch` stores the child pointers between items.
