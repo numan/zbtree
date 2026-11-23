@@ -142,6 +142,10 @@ pub fn Tree(
             pub fn incrementCounts(path: *const Path) void {
                 for (path.slice()) |entry| entry.node.branch.?.counts[entry.child] += 1;
             }
+
+            pub fn decrementCounts(path: *const Path) void {
+                for (path.slice()) |entry| entry.node.branch.?.counts[entry.child] -= 1;
+            }
         };
 
         // Result of searching inside one node. `index` is either the matching
@@ -789,16 +793,32 @@ pub fn Tree(
         fn insertKeyOnlyIntoNonFull(self: *Self, gpa: mem.Allocator, root: *Node, key: K, value: V, prefix: u64) !bool {
             var path: Path = .init();
             var node = root;
+            // Counts go up on the way down, which saves a second walk of the
+            // path after the insert. A duplicate or a failed split takes them
+            // back.
+            errdefer path.decrementCounts();
 
             while (true) {
-                const found = searchKeyOnlyWithPrefix(node, key, prefix);
-                if (found.found) return false;
-
-                const branch = node.branch orelse {
+                if (node.branch == null) {
+                    const found = searchLeafForInsert(node, key, prefix);
+                    if (found.found) {
+                        path.decrementCounts();
+                        return false;
+                    }
                     insertItemAt(node, found.index, key, value);
-                    path.incrementCounts();
                     return true;
-                };
+                }
+
+                const found = searchKeyOnlyWithPrefix(node, key, prefix);
+                if (found.found) {
+                    path.decrementCounts();
+                    return false;
+                }
+
+                // An internal node and its branch are one allocation, so the
+                // branch address needs no load of `node.branch`.
+                const internal: *InternalNode = @fieldParentPtr("node", node);
+                const branch = &internal.branch;
 
                 var child_index = found.index;
                 try self.makeUniqueChild(gpa, node, child_index);
@@ -806,15 +826,26 @@ pub fn Tree(
                     try self.splitChild(gpa, node, child_index);
                     const cmp = orderedKeyCompare(node.keys[child_index], key);
                     switch (cmp) {
-                        .eq => return false,
-                        .lt => child_index += 1,
+                        .eq => {
+                            path.decrementCounts();
+                            return false;
+                        },
+                        .lt => child_index += 1, // optimistically increment counts along the path
                         else => {},
                     }
                 }
 
+                branch.counts[child_index] += 1;
                 path.push(node, child_index);
                 node = branch.children[child_index].?;
             }
+        }
+
+        // Leaf search for inserts. Random inserts of 1M i32 keys measured
+        // faster with SIMD search in the leaf.
+        inline fn searchLeafForInsert(node: *const Node, key: K, prefix: u64) SearchResult {
+            if (comptime @sizeOf(K) <= 4 and useSimdReadSearch()) return searchPrimitiveOrderedKeySimd(node, key);
+            return searchKeyOnlyWithPrefix(node, key, prefix);
         }
 
         pub fn insert(self: *Self, gpa: mem.Allocator, key: K, value: V) !bool {

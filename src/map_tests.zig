@@ -266,9 +266,12 @@ test "map re-exports shared btree options and constants" {
     var m = IntMap.init();
     defer m.deinit(testing.allocator);
 
-    try testing.expectEqual(64, IntMap.fanout);
-    try testing.expectEqual(63, IntMap.max_items);
-    try testing.expectEqual(31, IntMap.min_items);
+    // Node sizes depend on the key and value types, so compare with the tree
+    // the map wraps.
+    const IntTree = btree.Tree(i32, i32, .{ .search_mode = .linear });
+    try testing.expectEqual(IntTree.fanout, IntMap.fanout);
+    try testing.expectEqual(IntTree.max_items, IntMap.max_items);
+    try testing.expectEqual(IntTree.min_items, IntMap.min_items);
     try testing.expect(m.isEmpty());
 
     try testing.expect(try m.insert(testing.allocator, 10, 100));
