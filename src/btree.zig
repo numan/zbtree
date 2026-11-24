@@ -62,6 +62,11 @@ pub fn TreeConfig(comptime K: type, comptime V: type) type {
 
         search_mode: SearchMode = .auto,
 
+        /// How many items a node holds: an odd number from 3 to 255.
+        /// Should be `null` in most cases.
+        /// Mainly useful for tests.
+        max_node_items: ?usize = null,
+
         copy_value: ?*const fn (mem.Allocator, V) anyerror!V = null,
         release_value: ?*const fn (mem.Allocator, V) void = null,
     };
@@ -80,6 +85,11 @@ pub fn Tree(
     comptime {
         if (config.order == null and !orderedKeySupported(K)) {
             @compileError("key type " ++ @typeName(K) ++ " has no built-in order; set config.order");
+        }
+        if (config.max_node_items) |items| {
+            if (items < 3 or items > std.math.maxInt(u8) or items % 2 == 0) {
+                @compileError("config.max_node_items must be an odd number from 3 to 255");
+            }
         }
     }
     return struct {
@@ -103,7 +113,7 @@ pub fn Tree(
         /// ordered by key alone.
         const SearchValue = if (key_only) void else V;
 
-        const storage = node_storage.NodeStorage(K, V, use_prefix);
+        const storage = node_storage.NodeStorage(K, V, use_prefix, config.max_node_items);
 
         pub const fanout = storage.fanout;
         pub const max_items = storage.max_items;

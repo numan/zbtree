@@ -18,8 +18,9 @@ pub fn NodeStorage(
     comptime K: type,
     comptime V: type,
     comptime use_prefix: bool,
+    comptime max_items: ?usize,
 ) type {
-    return SizedStorage(K, V, use_prefix, fittedMaxItems(K, V, use_prefix));
+    return SizedStorage(K, V, use_prefix, max_items orelse fittedMaxItems(K, V, use_prefix));
 }
 
 // How many items a node of these types holds.
@@ -58,9 +59,17 @@ fn SizedStorage(
         pub const fanout: usize = max_items + 1;
         /// Minimum item count for non-root nodes after the tree has split.
         pub const min_items: usize = max_items / 2;
-        /// Upper bound on tree height in levels. A tree taller than this would
-        /// have to hold than maxInt(usize) items.
-        pub const max_height: usize = 16;
+        /// Upper bound on tree height in levels: a tree with one more level
+        /// would hold more than maxInt(usize) items. The smallest tree with
+        /// `height + 1` levels has a root with 2 children, other internal
+        /// nodes with min_items + 1 children, and leaves of min_items items.
+        pub const max_height: usize = height: {
+            const min: comptime_int = min_items;
+            var height: usize = 1;
+            var leaves: comptime_int = 2;
+            while (leaves * min <= std.math.maxInt(usize)) : (height += 1) leaves *= min + 1;
+            break :height height;
+        };
 
         comptime {
             // A full node splits into its median and two halves of min_items.
@@ -119,7 +128,7 @@ fn SizedStorage(
 test "word-sized nodes fit power-of-two allocation sizes" {
     // std.heap.smp_allocator rounds each allocation up to a power of two, so a
     // node one byte over the boundary occupies twice the memory.
-    const Storage = NodeStorage(u64, u64, false);
+    const Storage = NodeStorage(u64, u64, false, null);
     try std.testing.expect(@sizeOf(Storage.Node) <= 1024);
     try std.testing.expect(@sizeOf(Storage.InternalNode) <= 2048);
 }
@@ -127,31 +136,48 @@ test "word-sized nodes fit power-of-two allocation sizes" {
 test "a leaf that would half-fill its allocation holds fewer items and fills a smaller one" {
     // 63 u64 keys make a 576-byte leaf, which a power-of-two allocator puts
     // in a 1024-byte slot. 61 keys fill a 512-byte slot.
-    const Keys64 = NodeStorage(u64, void, false);
+    const Keys64 = NodeStorage(u64, void, false, null);
     try std.testing.expectEqual(61, Keys64.max_items);
     try std.testing.expectEqual(512, @sizeOf(Keys64.Node));
 
-    const Keys32 = NodeStorage(i32, void, false);
+    const Keys32 = NodeStorage(i32, void, false, null);
     try std.testing.expectEqual(59, Keys32.max_items);
     try std.testing.expectEqual(256, @sizeOf(Keys32.Node));
 }
 
 test "a leaf keeps 63 items when it fills its allocation or would give up too many items to fit a smaller one" {
-    try std.testing.expectEqual(63, NodeStorage(u64, u64, false).max_items);
-    try std.testing.expectEqual(63, NodeStorage([]const u8, void, true).max_items);
+    try std.testing.expectEqual(63, NodeStorage(u64, u64, false, null).max_items);
+    try std.testing.expectEqual(63, NodeStorage([]const u8, void, true, null).max_items);
     // These would have to drop to 41 items to fit the smaller slot.
-    try std.testing.expectEqual(63, NodeStorage(i32, usize, false).max_items);
-    try std.testing.expectEqual(63, NodeStorage([]const u8, usize, true).max_items);
+    try std.testing.expectEqual(63, NodeStorage(i32, usize, false, null).max_items);
+    try std.testing.expectEqual(63, NodeStorage([]const u8, usize, true, null).max_items);
 }
 
 test "every node size splits into two valid halves" {
     inline for (.{ u8, u16, i32, u64, [3]usize, []const u8 }) |K| {
         inline for (.{ void, u8, i32, usize }) |V| {
-            const Storage = NodeStorage(K, V, false);
+            const Storage = NodeStorage(K, V, false, null);
             // A full node splits into its median and two halves of
             // min_items, which only an odd item count allows.
             try std.testing.expectEqual(Storage.max_items, 2 * Storage.min_items + 1);
             try std.testing.expectEqual(Storage.max_items + 1, Storage.fanout);
         }
     }
+}
+
+test "max_height is the most levels a tree that fits in usize can have" {
+    inline for (.{ 3, 5, 55, 63 }) |items| {
+        const Storage = SizedStorage(u64, u64, false, items);
+        try std.testing.expect(smallestTreeItems(Storage.min_items, Storage.max_height) <= std.math.maxInt(usize));
+        try std.testing.expect(smallestTreeItems(Storage.min_items, Storage.max_height + 1) > std.math.maxInt(usize));
+    }
+}
+
+/// The items in the leaves of the smallest tree with `levels` levels: a root
+/// with 2 children, other internal nodes with min_items + 1 children, and
+/// leaves of min_items items.
+fn smallestTreeItems(comptime min_items: comptime_int, comptime levels: usize) comptime_int {
+    var leaves: comptime_int = 2;
+    for (2..levels) |_| leaves *= min_items + 1;
+    return leaves * min_items;
 }

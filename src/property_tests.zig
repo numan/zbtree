@@ -8,7 +8,8 @@
 //! keys, string prefixes, linear and binary search, keys in the built-in
 //! order or in a custom order (descending integers and case-insensitive
 //! strings), items ordered by key and value, values that break ties
-//! between equal keys, `void` values, and `Map`. String keys
+//! between equal keys, `void` values, `Map`, and nodes of 3 and 5 items,
+//! which make deep trees from few items. String keys
 //! include keys shorter than 8 bytes, zero and 0xFF bytes, and long keys that
 //! share their first 8 bytes. Some range delete results are kept while later
 //! operations run, and released after the trees they came from.
@@ -33,15 +34,15 @@
 //! * Copies: mutating one tree never changes another, or a kept range delete
 //!   result.
 //!
-//! The seed is `std.testing.random_seed`, which is random on every test run.
-//! A failure prints it, and `zig build test --seed=0x<seed>` reruns the same
-//! cases. `zig build test` caches a passing run until the code changes. To
+//! The seed is `std.testing.random_seed`.
+//! A failure prints the seed and can be rerun with `zig build test --seed=0x<seed>`
+//! `zig build test` caches a passing run until the code changes. To
 //! run these tests again with a new seed, use
 //! `zig test src/root.zig --test-filter property_tests`.
 //!
-//! Each case draws its operations, its allocation failures, and its checks
-//! from separate random streams, so a change to the checks doesn't change
-//! the operations a seed produces.
+//! The fuzz tests run the same cases with the zig fuzzer choosing the
+//! operations and allocation failures, and mix point operations, range
+//! deletes, and copies in one case.
 
 const std = @import("std");
 const btree = @import("btree.zig");
@@ -273,6 +274,67 @@ const Seeds = struct {
     }
 };
 
+/// Where a case draws its operations and allocation failures from: a PRNG
+/// in the property tests, or the fuzzer in the fuzz test. The methods mirror
+/// `std.Random`. They are inline so that each call site asks the fuzzer for
+/// a value of its own, which lets the fuzzer tell the choices apart.
+const Source = union(enum) {
+    prng: std.Random.DefaultPrng,
+    smith: *testing.Smith,
+
+    fn of(seed: u64) Source {
+        return .{ .prng = .init(seed) };
+    }
+
+    inline fn boolean(source: *Source) bool {
+        return switch (source.*) {
+            .prng => |*prng| prng.random().boolean(),
+            .smith => |smith| smith.value(bool),
+        };
+    }
+
+    inline fn int(source: *Source, comptime T: type) T {
+        return switch (source.*) {
+            .prng => |*prng| prng.random().int(T),
+            .smith => |smith| @intCast(smith.value(Fixed(T))),
+        };
+    }
+
+    inline fn uintLessThan(source: *Source, comptime T: type, less_than: T) T {
+        return switch (source.*) {
+            .prng => |*prng| prng.random().uintLessThan(T, less_than),
+            .smith => |smith| @intCast(smith.valueRangeLessThan(Fixed(T), 0, less_than)),
+        };
+    }
+
+    inline fn uintAtMost(source: *Source, comptime T: type, at_most: T) T {
+        return switch (source.*) {
+            .prng => |*prng| prng.random().uintAtMost(T, at_most),
+            .smith => |smith| @intCast(smith.valueRangeAtMost(Fixed(T), 0, at_most)),
+        };
+    }
+
+    inline fn intRangeLessThan(source: *Source, comptime T: type, at_least: T, less_than: T) T {
+        return switch (source.*) {
+            .prng => |*prng| prng.random().intRangeLessThan(T, at_least, less_than),
+            .smith => |smith| @intCast(smith.valueRangeLessThan(Fixed(T), at_least, less_than)),
+        };
+    }
+
+    inline fn intRangeAtMost(source: *Source, comptime T: type, at_least: T, at_most: T) T {
+        return switch (source.*) {
+            .prng => |*prng| prng.random().intRangeAtMost(T, at_least, at_most),
+            .smith => |smith| @intCast(smith.valueRangeAtMost(Fixed(T), at_least, at_most)),
+        };
+    }
+};
+
+/// `T` with a fixed number of bits. The fuzzer takes no `usize` or `isize`.
+fn Fixed(comptime T: type) type {
+    const info = @typeInfo(T).int;
+    return @Int(info.signedness, info.bits);
+}
+
 /// The part of a string key after its first 2 bytes, indexed by the model
 /// key modulo their number. Short tails make keys shorter than the 8-byte
 /// string prefix, so that zero padding ties them. Longer tails share the
@@ -309,8 +371,20 @@ comptime {
 /// How often each kind of operation is picked, relative to the others.
 const Mix = std.enums.EnumArray(Kind, u16);
 
-fn pickKind(random: std.Random, mix: Mix) Kind {
-    return Mix.Indexer.keyForIndex(random.weightedIndex(u16, &mix.values));
+fn pickKind(source: *Source, mix: Mix) Kind {
+    switch (source.*) {
+        .prng => |*prng| return Mix.Indexer.keyForIndex(prng.random().weightedIndex(u16, &mix.values)),
+        .smith => |smith| {
+            var weights: [Mix.len]testing.Smith.Weight = undefined;
+            var count: usize = 0;
+            for (mix.values, 0..) |weight, index| {
+                if (weight == 0) continue;
+                weights[count] = .value(Kind, Mix.Indexer.keyForIndex(index), weight);
+                count += 1;
+            }
+            return smith.valueWeighted(Kind, weights[0..count]);
+        },
+    }
 }
 
 /// Maps don't delete by rank.
@@ -374,6 +448,9 @@ const Spec = struct {
         custom_keys,
     } = .items,
     search_mode: btree.SearchMode = .auto,
+    /// Null for the capacity that trees get by default. Small nodes make
+    /// deep trees from few items.
+    max_node_items: ?usize = null,
 };
 
 const Profile = struct {
@@ -399,6 +476,9 @@ fn Suite(comptime spec: Spec) type {
         }
         if (spec.prefix and spec.key != .string) {
             @compileError("prefixes are for string keys");
+        }
+        if (spec.container == .map and spec.max_node_items != null) {
+            @compileError("maps take the default node capacity");
         }
     }
 
@@ -433,6 +513,7 @@ fn Suite(comptime spec: Spec) type {
             .order = key_order,
             .value_order = if (spec.order == .items) orderValues else null,
             .search_mode = spec.search_mode,
+            .max_node_items = spec.max_node_items,
             .copy_value = if (owns_values) &copyValue else null,
             .release_value = if (owns_values) &releaseValue else null,
         });
@@ -623,9 +704,9 @@ fn Suite(comptime spec: Spec) type {
             /// Holds string keys and lookup values, which the trees borrow.
             keys: std.heap.ArenaAllocator,
             /// Generates the operations.
-            generator: std.Random.DefaultPrng,
+            generator: Source,
             /// Decides which allocations fail.
-            fault_source: std.Random.DefaultPrng,
+            fault_source: Source,
             /// Whether operations run with allocation failures.
             faults: bool = false,
             key_space: isize = 16,
@@ -646,12 +727,12 @@ fn Suite(comptime spec: Spec) type {
             /// Keys the current step has encoded, for `capitals`.
             encoded: u64 = 0,
 
-            fn init(backing: Allocator, seeds: Seeds) Harness {
+            fn init(backing: Allocator, generator: Source, fault_source: Source, check_seed: u64) Harness {
                 return .{
                     .tracker = .{ .backing = backing },
-                    .checker = .init(seeds.check),
-                    .generator = .init(seeds.generate),
-                    .fault_source = .init(seeds.fault),
+                    .checker = .init(check_seed),
+                    .generator = generator,
+                    .fault_source = fault_source,
                     .keys = .init(std.heap.page_allocator),
                 };
             }
@@ -973,7 +1054,7 @@ fn Suite(comptime spec: Spec) type {
             /// so that the call goes on allocating after it.
             fn planFault(h: *Harness, usual: usize) ?Fault {
                 if (!h.faults) return null;
-                const random = h.fault_source.random();
+                const random = &h.fault_source;
                 const budget = switch (random.uintLessThan(u8, 4)) {
                     0 => return null,
                     1, 2 => random.uintLessThan(usize, usual),
@@ -1020,10 +1101,18 @@ fn Suite(comptime spec: Spec) type {
                 return callWithoutFault(T, func, args);
             }
 
-            /// Whether a node may be shared with another tree. With one tree
-            /// left, every reference count is back to zero.
+            /// Whether a node may be shared with another tree, or with a kept
+            /// range delete result: a subtree that a delete detached from
+            /// one copy stays shared with the others, which can be dropped
+            /// before the result is released.
             fn shared(h: *const Harness) bool {
-                return h.subjects.items.len > 1;
+                if (h.subjects.items.len > 1) return true;
+                for (h.results.items) |kept| {
+                    for (kept.result.chunks[0..kept.result.chunk_count]) |chunk| {
+                        if (chunk.node != null) return true;
+                    }
+                }
+                return false;
             }
 
             /// Calls an operation that removes items or updates them in
@@ -1523,19 +1612,19 @@ fn Suite(comptime spec: Spec) type {
             // --------------------------------------------------------- generation
 
             fn anyKey(h: *Harness) isize {
-                return h.generator.random().intRangeLessThan(isize, 0, h.key_space);
+                return h.generator.intRangeLessThan(isize, 0, h.key_space);
             }
 
             /// A key that is in the tree about half of the time.
             fn someKey(h: *Harness, items: []const Item) isize {
-                const random = h.generator.random();
+                const random = &h.generator;
                 if (items.len == 0 or random.boolean()) return h.anyKey();
                 return items[random.uintLessThan(usize, items.len)].key;
             }
 
             /// An index below `len`, or now and then one that is out of range.
             fn someIndex(h: *Harness, len: usize) usize {
-                const random = h.generator.random();
+                const random = &h.generator;
                 if (len == 0 or random.uintLessThan(u8, 16) == 0) return len + random.uintLessThan(usize, 3);
                 return random.uintLessThan(usize, len);
             }
@@ -1543,7 +1632,7 @@ fn Suite(comptime spec: Spec) type {
             /// A key that usually sorts after item `after - 1` and before item
             /// `before`, where those exist.
             fn keyBetween(h: *Harness, items: []const Item, after: usize, before: usize) isize {
-                const random = h.generator.random();
+                const random = &h.generator;
                 if (random.uintLessThan(u8, 8) == 0) return h.anyKey();
                 const low: ?isize = if (after > 0 and after <= items.len) items[after - 1].key else null;
                 const high: ?isize = if (before < items.len) items[before].key else null;
@@ -1557,7 +1646,7 @@ fn Suite(comptime spec: Spec) type {
             /// Half of the range deletes exclude their first item or include
             /// one past their end.
             fn someOptions(h: *Harness) Op.Options {
-                const random = h.generator.random();
+                const random = &h.generator;
                 if (random.boolean()) return .{};
                 return .{ .min_exclusive = random.boolean(), .max_inclusive = random.boolean() };
             }
@@ -1565,7 +1654,7 @@ fn Suite(comptime spec: Spec) type {
             /// A key range whose width ranges from reversed or empty to the
             /// whole key space.
             fn keyRange(h: *Harness, items: []const Item) Op.KeyRange {
-                const random = h.generator.random();
+                const random = &h.generator;
                 const min = h.someKey(items);
                 const width: isize = switch (random.uintLessThan(u8, 4)) {
                     0 => random.intRangeAtMost(isize, -2, 4),
@@ -1580,7 +1669,7 @@ fn Suite(comptime spec: Spec) type {
             /// then a pair that `indexOf` can't return: found past the end,
             /// or reversed.
             fn rankRange(h: *Harness, len: usize) Op.RankRange {
-                const random = h.generator.random();
+                const random = &h.generator;
                 const min = h.someIndex(len + 1);
                 const width = switch (random.uintLessThan(u8, 4)) {
                     0 => random.uintAtMost(usize, 4),
@@ -1599,11 +1688,11 @@ fn Suite(comptime spec: Spec) type {
 
             /// A quarter of the range deletes keep their result for later.
             fn someHold(h: *Harness) bool {
-                return h.generator.random().uintLessThan(u8, 4) == 0;
+                return h.generator.uintLessThan(u8, 4) == 0;
             }
 
             fn generate(h: *Harness, items: []const Item, kind: Kind) Op {
-                const random = h.generator.random();
+                const random = &h.generator;
                 switch (kind) {
                     .insert => return .{ .insert = h.anyKey() },
                     .set => return .{ .set = h.someKey(items) },
@@ -1666,27 +1755,32 @@ fn Suite(comptime spec: Spec) type {
 
             // -------------------------------------------------------------- cases
 
-            /// Mostly small trees, because they are cheap, and some with
-            /// enough items for three levels.
+            /// Mostly small trees, because they are cheap, and a quarter in
+            /// the top tenth of `max_items`. With the default node capacity,
+            /// trees of 3,600 or more items have three levels however they
+            /// were built; smaller sizes would mostly repeat the two-level
+            /// trees below them.
             fn pickSize(h: *Harness, max_items: usize) usize {
-                const random = h.generator.random();
-                const limit: usize = switch (random.uintLessThan(u8, 4)) {
-                    0 => 8,
-                    1 => 150,
-                    2 => 1_000,
-                    else => max_items,
+                const random = &h.generator;
+                return switch (random.uintLessThan(u8, 4)) {
+                    0 => random.uintAtMost(usize, @min(8, max_items)),
+                    1 => random.uintAtMost(usize, @min(150, max_items)),
+                    2 => random.uintAtMost(usize, @min(1_000, max_items)),
+                    else => random.intRangeAtMost(usize, max_items - max_items / 10, max_items),
                 };
-                return random.uintAtMost(usize, @min(limit, max_items));
             }
 
             /// Builds the first tree with about `count` items. Ascending and
             /// descending keys leave every node half full, so that later
             /// deletes rebalance at once. Random keys leave nodes unevenly
-            /// filled.
+            /// filled. The keys come from a seed, so that a large tree costs
+            /// the fuzzer a single value.
             fn fill(h: *Harness, count: usize) !void {
-                const random = h.generator.random();
+                const style = h.generator.uintLessThan(u8, 3);
+                var prng: std.Random.DefaultPrng = .init(h.generator.int(u64));
+                const random = prng.random();
                 h.key_space = @intCast(4 * count + 16);
-                switch (random.uintLessThan(u8, 3)) {
+                switch (style) {
                     0 => {
                         var key: isize = 0;
                         for (0..count) |_| {
@@ -1701,12 +1795,12 @@ fn Suite(comptime spec: Spec) type {
                             try h.apply(0, .{ .push_front = key });
                         }
                     },
-                    else => for (0..count) |_| try h.apply(0, .{ .insert = h.anyKey() }),
+                    else => for (0..count) |_| try h.apply(0, .{ .insert = random.intRangeLessThan(isize, 0, h.key_space) }),
                 }
             }
 
             fn generateStep(h: *Harness, mix: Mix) !void {
-                const random = h.generator.random();
+                const random = &h.generator;
                 const index = random.uintLessThan(usize, h.subjects.items.len);
                 const op = h.generate(h.subjects.items[index].model.items, pickKind(random, mix));
                 try h.apply(index, op);
@@ -1818,14 +1912,14 @@ fn Suite(comptime spec: Spec) type {
             try items.append(aux, itemOf(key, value));
         }
 
-        fn runCase(seeds: Seeds, profile: Profile) !void {
+        fn runCase(generator: Source, fault_source: Source, check_seed: u64, profile: Profile) !void {
             // `testing.allocator` records a stack trace for every allocation,
             // which is too slow for this many. The tracking allocator reports
             // leaks and double frees itself, so the trees only need the
             // checks for writes to freed memory.
             var memory: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
             defer _ = memory.deinit();
-            var h: Harness = .init(memory.allocator(), seeds);
+            var h: Harness = .init(memory.allocator(), generator, fault_source, check_seed);
             defer h.deinit();
             errdefer h.report();
 
@@ -1842,7 +1936,7 @@ fn Suite(comptime spec: Spec) type {
         fn check(salt: u16, profile: Profile) !void {
             for (0..profile.cases) |case| {
                 const seeds: Seeds = .of(@as(u64, testing.random_seed) << 32 | @as(u64, salt) << 16 | case);
-                runCase(seeds, profile) catch |err| {
+                runCase(.of(seeds.generate), .of(seeds.fault), seeds.check, profile) catch |err| {
                     std.debug.print("  case {d}; rerun with: zig build test --seed=0x{x}\n", .{ case, testing.random_seed });
                     return err;
                 };
@@ -1894,7 +1988,84 @@ const copy_range_mix: Mix = blk: {
     break :blk mix;
 };
 
+/// Every operation, so that the fuzzer can combine point operations, range
+/// deletes, and copies. Configurations that have them also get the key-only
+/// variants.
+const fuzz_mix: Mix = blk: {
+    var mix = copy_point_mix;
+    for (std.enums.values(Kind)) |kind| {
+        if (range_mix.get(kind) != 0) mix.set(kind, 10 * range_mix.get(kind));
+    }
+    break :blk mix;
+};
+
 const Default = Suite(.{});
+
+/// Fuzzes one case per input. Trees grow as large as in the range deletion
+/// tests, because some failure paths of a range delete need a node with
+/// more than `min_items` children. Most steps on such a tree audit it after
+/// an allocation failure, so a case has as few steps as the range deletion
+/// tests, and the first tree is built without allocation failures. The
+/// checks draw from a fixed seed, so that an input always runs the same
+/// checks.
+fn fuzzConfiguration(comptime spec: Spec, max_items: usize) !void {
+    const Case = struct {
+        fn run(profile: Profile, smith: *testing.Smith) anyerror!void {
+            try Suite(spec).runCase(.{ .smith = smith }, .{ .smith = smith }, 0, profile);
+        }
+    };
+    const profile: Profile = .{ .cases = 1, .max_items = max_items, .fill_faults = false, .steps = 32, .mix = fuzz_mix };
+    try testing.fuzz(profile, Case.run, .{});
+}
+
+test "fuzz: operations match a model and survive allocation failures" {
+    try fuzzConfiguration(.{}, 6_000);
+}
+
+// The other fuzz tests each reach code that the default configuration
+// doesn't: deep trees, the searches and key-only methods of trees ordered
+// by key alone, and the routing of string keys by their prefixes.
+
+test "fuzz: deep trees of small nodes match a model" {
+    try fuzzConfiguration(.{ .max_node_items = 5 }, 2_000);
+}
+
+test "fuzz: ordered-key trees match a model" {
+    try fuzzConfiguration(.{ .order = .keys }, 6_000);
+}
+
+test "fuzz: string keys with prefixes match a model" {
+    try fuzzConfiguration(.{ .key = .string, .prefix = true }, 6_000);
+}
+
+test "updates in place may clone nodes that a kept range delete result shares" {
+    // A range delete on a copy keeps the subtrees it detached, which the
+    // original still holds. Once the copy is dropped, the original is the
+    // only tree but still shares those subtrees, so updating an item in
+    // them clones nodes. The harness once took that for a bug.
+    var memory: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer _ = memory.deinit();
+    var h: Default.Harness = .init(memory.allocator(), .of(0), .of(0), 0);
+    defer h.deinit();
+    errdefer h.report();
+
+    try h.subjects.append(aux, .{});
+    for (0..2_000) |key| try h.apply(0, .{ .push_back = @intCast(key) });
+    try h.apply(0, .copy);
+    try h.apply(1, .{ .delete_range_at = .{ .index = 100, .count = 1_500, .options = .{}, .hold = true } });
+    try h.apply(1, .drop);
+
+    const kept = h.results.items[0].result;
+    var shared_nodes: usize = 0;
+    for (kept.chunks[0..kept.chunk_count]) |chunk| {
+        if (chunk.node) |node| shared_nodes += @intFromBool(node.rc.load(.monotonic) > 0);
+    }
+    try testing.expect(shared_nodes > 0);
+
+    var key: isize = 100;
+    while (key < 1_600) : (key += 25) try h.apply(0, .{ .get_mut = key });
+    try h.finish();
+}
 
 test "point operations match a model and survive allocation failures" {
     try Default.check(1, .{ .cases = 120, .max_items = 4_000, .fill_faults = true, .steps = 400, .mix = point_mix });
@@ -1948,6 +2119,23 @@ test "maps match a model" {
     try checkConfiguration(.{ .container = .map, .order = .keys }, 70);
     try checkConfiguration(.{ .container = .map, .order = .keys, .key = .string, .prefix = true }, 72);
     try checkConfiguration(.{ .container = .map, .order = .custom_keys, .key = .string, .prefix = true }, 74);
+}
+
+/// Nodes of 3 and 5 items make trees of 150 to 2,000 items four to ten
+/// levels deep, so that splits, merges, and range deletes pass through
+/// internal nodes whose parents are internal nodes too. The default
+/// capacity needs about 60,000 items for that, which is too slow here.
+fn checkSmallNodes(comptime spec: Spec, salt: u16) !void {
+    const S = Suite(spec);
+    try S.check(salt, .{ .cases = 32, .max_items = 2_000, .fill_faults = true, .steps = 300, .mix = copy_point_mix });
+    try S.check(salt + 1, .{ .cases = 80, .max_items = 2_000, .fill_faults = false, .steps = 32, .mix = copy_range_mix });
+}
+
+test "deep trees of small nodes match a model" {
+    try checkSmallNodes(.{ .max_node_items = 3 }, 90);
+    try checkSmallNodes(.{ .max_node_items = 5 }, 92);
+    try checkSmallNodes(.{ .key = .string, .prefix = true, .max_node_items = 5 }, 94);
+    try checkSmallNodes(.{ .order = .keys, .max_node_items = 5 }, 96);
 }
 
 test "custom key orders match a model" {
