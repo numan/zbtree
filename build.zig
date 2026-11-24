@@ -2,7 +2,7 @@ const std = @import("std");
 
 const SearchMode = enum { auto, linear };
 
-/// What the benchmarked zbtree_ds maps store per key.
+/// What the benchmarked zbtree maps store per key.
 const BenchValues = enum { usize, none };
 
 pub fn build(b: *std.Build) void {
@@ -15,13 +15,13 @@ pub fn build(b: *std.Build) void {
         "Node search of the benchmarked maps: auto (default) or linear",
     ) orelse .auto;
 
-    const zbtree_module = b.addModule("zbtree_ds", .{
+    const zbtree_module = b.addModule("zbtree", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
 
     const exe = addExecutable(b, .{
-        .name = "zbtree_ds",
+        .name = "zbtree",
         .root_source_file = "src/main.zig",
         .target = target,
         .optimize = optimize,
@@ -74,7 +74,7 @@ fn addExecutable(b: *std.Build, options: ExecutableOptions) *std.Build.Step.Comp
             .target = options.target,
             .optimize = options.optimize,
             .imports = &.{
-                .{ .name = "zbtree_ds", .module = options.zbtree_module },
+                .{ .name = "zbtree", .module = options.zbtree_module },
             },
         }),
     });
@@ -105,8 +105,8 @@ fn addBenchExecutable(
 ) *std.Build.Step.Compile {
     const bench_exe = addExecutable(b, .{
         .name = switch (values) {
-            .usize => "zbtree_ds-bench",
-            .none => "zbtree_ds-bench-key-only",
+            .usize => "zbtree-bench",
+            .none => "zbtree-bench-key-only",
         },
         .root_source_file = "benchmark/bench.zig",
         .target = target,
@@ -127,7 +127,7 @@ fn addBenchStep(
 ) void {
     const bench_step = b.step(
         "bench",
-        "Benchmark zbtree_ds against tidwall/btree (needs -Doptimize=safe|fast)",
+        "Benchmark zbtree against tidwall/btree (needs -Doptimize=safe|fast)",
     );
 
     const bench_exe = bench_exe_or_null orelse {
@@ -136,7 +136,7 @@ fn addBenchStep(
     };
 
     const compare_exe = b.addExecutable(.{
-        .name = "zbtree_ds-bench-compare",
+        .name = "zbtree-bench-compare",
         .root_module = compare_module,
     });
 
@@ -182,7 +182,7 @@ const bench_all_mode_message =
 /// The rows from the tidwall/btree README benchmark that every implementation runs.
 const readme_rows = "insert(seq),insert(rand),get(seq),get(rand)";
 
-/// Compares zbtree_ds with the B-trees from the tidwall/btree README on its four rows.
+/// Compares zbtree with the B-trees from the tidwall/btree README on its four rows.
 /// Every implementation stores keys only, as in upstream btree-bench.
 /// The harnesses run one at a time; only the summary is printed.
 fn addBenchAllStep(
@@ -193,7 +193,7 @@ fn addBenchAllStep(
 ) void {
     const bench_all_step = b.step(
         "bench-all",
-        "Benchmark zbtree_ds, tidwall/btree, google/btree, Rust BTreeSet and frozenca/btree (needs -Doptimize=safe|fast)",
+        "Benchmark zbtree, tidwall/btree, google/btree, Rust BTreeSet and frozenca/btree (needs -Doptimize=safe|fast)",
     );
 
     const bench_exe = bench_exe_or_null orelse {
@@ -233,13 +233,13 @@ fn addBenchAllStep(
     const frozenca_cmd = b.addRunArtifact(frozenca_exe);
 
     const summary_exe = b.addExecutable(.{
-        .name = "zbtree_ds-bench-all-summary",
+        .name = "zbtree-bench-all-summary",
         .root_module = summary_module,
     });
     const summary_cmd = b.addRunArtifact(summary_exe);
 
     const commands = [_]struct { *std.Build.Step.Run, []const u8 }{
-        .{ zig_cmd, "zbtree_ds.txt" },
+        .{ zig_cmd, "zbtree.txt" },
         .{ tidwall_cmd, "tidwall_btree.txt" },
         .{ google_cmd, "google_btree.txt" },
         .{ rust_cmd, "rust_btree.txt" },

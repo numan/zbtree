@@ -1,4 +1,4 @@
-# zbtree_ds
+# zbtree
 
 An fast B-tree written in Zig.
 
@@ -18,7 +18,7 @@ Requires Zig 0.17.1 or later.
 
 ```zig
 const std = @import("std");
-const zbtree_ds = @import("zbtree_ds");
+const zbtree = @import("zbtree");
 
 fn printUser(_: void, key: []const u8, name: []const u8) !void {
     std.debug.print("{s} {s}\n", .{ key, name });
@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     // Create a map
-    const Users = zbtree_ds.map.Map([]const u8, []const u8, .{});
+    const Users = zbtree.map.Map([]const u8, []const u8, .{});
     var users: Users = .init();
     defer users.deinit(gpa);
 
@@ -88,7 +88,7 @@ The benchmarks need an explicit release mode: `-Doptimize=safe` or
 the median of 50 runs. Use `--items`/`-n` and `--runs`/`-r` after `--` to change
 this, or set the `N` and `R` environment variables.
 
-### zbtree_ds against tidwall/btree
+### zbtree against tidwall/btree
 
 Requires Go.
 
@@ -103,7 +103,7 @@ Runs every operation for `int32`, `uint64`, and string keys against the
 To use linear search instead of the default node search, add
 `-Dsearch-mode=linear`.
 
-### zbtree_ds against other B-trees
+### zbtree against other B-trees
 
 Requires Go and Cargo. The first run downloads [frozenca/BTree](https://github.com/frozenca/BTree).
 
@@ -112,7 +112,7 @@ zig build bench-all -Doptimize=safe
 zig build bench-all -Doptimize=safe -- --items 100000 --runs 10
 ```
 
-Compares zbtree_ds with [tidwall/btree](https://github.com/tidwall/btree),
+Compares zbtree with [tidwall/btree](https://github.com/tidwall/btree),
 [google/btree](https://github.com/google/btree), Rust's [`BTreeSet`](https://github.com/rust-lang/rust/blob/main/library/alloc/src/collections/btree/set.rs),
 and [frozenca/btree](https://github.com/frozenca/BTree) on `insert(seq)`, `insert(rand)`, `get(seq)`, and `get(rand)`,
 using key-only collections.
@@ -143,13 +143,13 @@ All results below are from an Apple M3 Max (14 cores) with:
 > safety checks on. `-Doptimize=fast` gives faster results but turns those
 > checks off.
 
-### zbtree_ds vs tidwall/btree
+### zbtree vs tidwall/btree
 
 Results of `zig build bench`:
 
 ```text
 ❯ zig build bench -Doptimize=safe -- --items 200000 --runs 10
-zbtree_ds (Zig) vs tidwall/btree (Go)
+zbtree (Zig) vs tidwall/btree (Go)
 200,000 items · median of 10 runs · 2 warmups
   Zig        ReleaseSafe · runtime safety ON · std.heap.smp_allocator · search mode auto
   Zig arena  same build · per-sample ArenaAllocator (reference only, not scored)
@@ -249,7 +249,7 @@ string                   23     2           0
 all                      62    11           2
 ```
 
-### zbtree_ds vs other B-trees
+### zbtree vs other B-trees
 
 Results of `zig build bench-all`, using the operations and key-only collections
 from the [tidwall/btree-bench](https://github.com/tidwall/btree-bench) comparison.
@@ -258,7 +258,7 @@ from the [tidwall/btree-bench](https://github.com/tidwall/btree-bench) compariso
 ❯ zig build bench-all -Doptimize=safe
 Benchmarking 1,000,000 items, 50 runs, using the median
 
-zbtree_ds (Zig)
+zbtree (Zig)
   optimize=ReleaseSafe safety=on allocator=smp search=auto values=void warmups=2
 tidwall/btree/v2 (Go, btree.Map)
   go=go1.27.4 GOMAXPROCS=14 values=struct{} warmups=2
@@ -271,7 +271,7 @@ frozenca/btree (C++, frozenca::BTreeSet)
 
 ### int32 keys
 
-zbtree_ds
+zbtree
 insert(seq)        1,000,000 ops in   0.009 secs     8.6 ns/op   115,879,326 op/sec
 insert(rand)       1,000,000 ops in   0.065 secs    65.3 ns/op    15,324,682 op/sec
 get(seq)           1,000,000 ops in   0.012 secs    11.8 ns/op    84,431,826 op/sec
@@ -303,7 +303,7 @@ get(rand)          1,000,000 ops in   0.070 secs    70.2 ns/op    14,235,018 op/
 
 ### uint64 keys
 
-zbtree_ds
+zbtree
 insert(seq)        1,000,000 ops in   0.009 secs     8.7 ns/op   114,551,368 op/sec
 insert(rand)       1,000,000 ops in   0.064 secs    64.4 ns/op    15,537,319 op/sec
 get(seq)           1,000,000 ops in   0.018 secs    17.6 ns/op    56,789,680 op/sec
@@ -335,7 +335,7 @@ get(rand)          1,000,000 ops in   0.075 secs    74.8 ns/op    13,369,691 op/
 
 ### string keys
 
-zbtree_ds
+zbtree
 insert(seq)        1,000,000 ops in   0.021 secs    20.8 ns/op    48,017,286 op/sec
 insert(rand)       1,000,000 ops in   0.166 secs   166.2 ns/op     6,015,783 op/sec
 get(seq)           1,000,000 ops in   0.058 secs    58.4 ns/op    17,126,978 op/sec
@@ -368,28 +368,28 @@ get(rand)          1,000,000 ops in   0.300 secs   299.9 ns/op     3,334,168 op/
 ### ns/op by implementation (lower is better, * marks the fastest)
 
 int32 keys
-operation       zbtree_ds    tidwall/btree/v2    google/btree    rust/btree    frozenca/btree
+operation          zbtree    tidwall/btree/v2    google/btree    rust/btree    frozenca/btree
 insert(seq)           8.6*               12.3            55.9          41.8              69.3
 insert(rand)         65.3*               69.9           155.3          90.7              78.1
 get(seq)             11.8*               34.3            71.0          31.9              34.0
 get(rand)            53.2*               66.0           154.4          87.6              70.2
 
 uint64 keys
-operation       zbtree_ds    tidwall/btree/v2    google/btree    rust/btree    frozenca/btree
+operation          zbtree    tidwall/btree/v2    google/btree    rust/btree    frozenca/btree
 insert(seq)           8.7*               13.2            56.9          42.0              71.9
 insert(rand)         64.4*               75.9           164.0          92.7              85.0
 get(seq)             17.6*               35.2            71.0          31.7              34.0
 get(rand)            61.8*               74.5           161.9          92.9              74.8
 
 string keys
-operation       zbtree_ds    tidwall/btree/v2    google/btree    rust/btree    frozenca/btree
+operation          zbtree    tidwall/btree/v2    google/btree    rust/btree    frozenca/btree
 insert(seq)          20.8*               36.1           115.8         137.1             133.6
 insert(rand)        166.2*              239.0           320.2         255.7             285.7
 get(seq)             58.4*               75.2           120.4          88.1             144.8
 get(rand)           154.4*              220.3           302.8         359.6             299.9
 ```
 
-### Why zbtree_ds is fast
+### Why zbtree is fast
 
 #### Data-oriented node layout
 
@@ -449,7 +449,7 @@ made once by the compiler:
 
 ## Acknowledgements
 
-zbtree_ds is heavily inspired by Josh Baker's [tidwall/btree](https://github.com/tidwall/btree)
+zbtree is heavily inspired by Josh Baker's [tidwall/btree](https://github.com/tidwall/btree)
 for Go. Its API, design, and benchmarks follow [tidwall/btree](https://github.com/tidwall/btree)
 and [tidwall/btree-bench](https://github.com/tidwall/btree-bench).
 

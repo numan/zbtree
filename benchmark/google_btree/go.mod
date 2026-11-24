@@ -1,4 +1,4 @@
-module zbtree_ds/benchmark/google_btree
+module zbtree/benchmark/google_btree
 
 go 1.26
 

@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const zbtree_ds = @import("zbtree_ds");
-const map = zbtree_ds.map;
+const zbtree = @import("zbtree");
+const map = zbtree.map;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
     defer stdout.flush() catch {};
 
     if (options.role == .parent) {
-        try stdout.print("\nzbtree_ds (Zig)\n", .{});
+        try stdout.print("\nzbtree (Zig)\n", .{});
         try stdout.print("config: optimize={s} safety={s} allocator={s} search={s} values={s} warmups={d}\n", .{
             optimizeName(builtin.mode),
             if (std.debug.runtime_safety) "on" else "off",

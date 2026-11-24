@@ -289,7 +289,7 @@ test "parseResultLine reads every harness format" {
 
 const zig_output =
     \\
-    \\zbtree_ds (Zig)
+    \\zbtree (Zig)
     \\config: optimize=ReleaseFast safety=off allocator=smp search=auto warmups=2
     \\Benchmarking 2000 items, int32 keys, 3 times, using median
     \\insert(seq)        2,000 ops in 0.000 secs 10.0 ns/op 100,000,000 op/sec
@@ -317,8 +317,8 @@ test "parseImplementation reads title, config and rows per key type" {
     defer arena.deinit();
     const parsed = try parseImplementation(arena.allocator(), "zig", zig_output);
 
-    try std.testing.expectEqualStrings("zbtree_ds (Zig)", parsed.title);
-    try std.testing.expectEqualStrings("zbtree_ds", parsed.name());
+    try std.testing.expectEqualStrings("zbtree (Zig)", parsed.title);
+    try std.testing.expectEqualStrings("zbtree", parsed.name());
     try std.testing.expectEqualStrings("optimize=ReleaseFast safety=off allocator=smp search=auto warmups=2", parsed.config);
     try std.testing.expectEqual(@as(u64, 2000), parsed.items);
     try std.testing.expectEqual(@as(u64, 3), parsed.runs);
@@ -355,7 +355,7 @@ test "comparison table marks the fastest implementation per row" {
     var output: Writer.Allocating = .init(allocator);
     try writeComparisonTable(&output.writer, &implementations, rowsForKey(implementations[0].rows, 0));
     try std.testing.expectEqualStrings(
-        \\operation      zbtree_ds    google/btree 
+        \\operation         zbtree    google/btree 
         \\insert(seq)         10.0*           70.0 
         \\get(rand)           40.0            20.0*
         \\

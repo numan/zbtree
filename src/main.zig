@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const zbtree_ds = @import("zbtree_ds");
+const zbtree = @import("zbtree");
 
 pub fn main(init: std.process.Init) !void {
     // Prints to stderr, unbuffered, ignoring potential errors.
