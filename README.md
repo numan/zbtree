@@ -455,4 +455,11 @@ and [tidwall/btree-bench](https://github.com/tidwall/btree-bench).
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Apache License, Version 2.0](LICENSE), except for the
+benchmark harnesses adapted from [tidwall/btree-bench](https://github.com/tidwall/btree-bench):
+`benchmark/google_btree/main.go`, `benchmark/reference_btree/main.go`,
+`benchmark/rust_btree/src/main.rs`, and `benchmark/frozenca_btree/bench.cpp`.
+Each of those files credits its source.
+
+`src/btree.zig` is derived from [tidwall/btype](https://github.com/tidwall/btype)
+and also carries its MIT license notice.

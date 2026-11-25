@@ -80,8 +80,6 @@
         "build.zig.zon",
         "benchmark",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "LICENSE",
     },
 }

@@ -1,3 +1,7 @@
+// Adapted from tidwall/btree-bench by Josh Baker:
+//   https://github.com/tidwall/btree-bench/blob/main/rust_btree/src/main.rs
+// Modified for the zbtree benchmarks.
+
 use std::collections::BTreeSet;
 use std::process::exit;
 use std::time::{Duration, Instant};

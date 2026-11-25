@@ -1,3 +1,8 @@
+// Adapted from tidwall/btree-bench by Josh Baker:
+//   https://github.com/tidwall/btree-bench/blob/main/tidwall_btree/main.go
+//   https://github.com/tidwall/btree-bench/blob/main/tools/support/support.go
+// Modified for the zbtree benchmarks.
+
 package main
 
 import (

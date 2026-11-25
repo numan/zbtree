@@ -1,3 +1,8 @@
+// Adapted from tidwall/btree-bench by Josh Baker:
+//   https://github.com/tidwall/btree-bench/blob/main/frozenca_btree/bench.cpp
+//   https://github.com/tidwall/btree-bench/blob/main/frozenca_btree/bench.h
+// Modified for the zbtree benchmarks.
+
 #include <fc/btree.h>
 
 #include <algorithm>
